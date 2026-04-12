@@ -6,7 +6,7 @@
 	import CodegenChatClaudeNotRegistered from "$components/codegen/CodegenChatClaudeNotRegistered.svelte";
 	import CodegenInput from "$components/codegen/CodegenInput.svelte";
 	import CodegenMessageItem from "$components/codegen/CodegenMessageItem.svelte";
-	import PhiLoopProgress from "$components/codegen/PhiLoopProgress.svelte";
+	import ProjectRules from "$components/codegen/ProjectRules.svelte";
 	import CodegenPromptConfigModal from "$components/codegen/CodegenPromptConfigModal.svelte";
 	import CodegenServiceMessageThinking from "$components/codegen/CodegenServiceMessageThinking.svelte";
 	import CodegenServiceMessageUseTool from "$components/codegen/CodegenServiceMessageUseTool.svelte";
@@ -643,6 +643,12 @@
 				</DrawerHeader>
 
 				<div class="chat-container">
+					{#if ringNumber}
+						<div class="ring-context">
+							<span class="ring-context__text">Active Ring: {ringNumber} | t27 PHI LOOP active</span>
+						</div>
+					{/if}
+					<ProjectRules {projectId} />
 					{#if claudeAvailable.status !== "available" && formattedMessages.length === 0}
 						<AppScrollableContainer childrenWrapDisplay="contents">
 							<div class="no-agent-placeholder">
