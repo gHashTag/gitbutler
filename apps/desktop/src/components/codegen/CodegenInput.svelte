@@ -66,10 +66,6 @@
 	let loadingFileSuggestions = $state(false);
 	let fileSuggestions = $state<string[] | undefined>(undefined);
 	let fileSuggestionsQuery = $state<string>("");
-	let atMentions = $state<Set<string>>(new Set());
-
-	// Track @ mentions for automatic file context inclusion
-	const AT_MENTION_REGEX = /@([a-zA-Z0-9._/-]+)/g;
 
 	function selectFileSuggestion(filename: string) {
 		fileSuggestionsPlugin?.selectFileSuggestion(filename);
@@ -94,54 +90,6 @@
 		} else {
 			indexOfSelectedFile = 0;
 		}
-	}
-
-	// Check for @ mentions and handle automatic file context
-	$effect(() => {
-		if (!editorRef) return;
-
-		// Debounce the check to avoid excessive processing
-		const timeoutId = setTimeout(async () => {
-			const currentText = await editorRef?.getPlaintext() || "";
-			const newMentions = new Set<string>();
-			let match: RegExpExecArray | null;
-
-			// Find all @ mentions in the current text
-			while ((match = AT_MENTION_REGEX.exec(currentText)) !== null) {
-				const mention = match[1];
-				if (mention) newMentions.add(mention);
-			}
-
-			// Process new @ mentions
-			for (const mention of newMentions) {
-				if (!atMentions.has(mention)) {
-					// New @ mention detected
-					atMentions.add(mention);
-					await handleAtMention(mention);
-				}
-			}
-
-			// Remove mentions that are no longer in text
-			for (const mention of atMentions) {
-				if (!newMentions.has(mention)) {
-					atMentions.delete(mention);
-				}
-			}
-		}, 300);
-
-		return () => clearTimeout(timeoutId);
-	});
-
-	async function handleAtMention(mention: string) {
-		// Try to find the file via file service
-		const results = await fileService.fetchFiles(projectId, mention, 5);
-
-		if (results && results.length > 0 && results[0]) {
-			// Found matching file(s) - select the first match
-			const matchedFile = results[0];
-			selectFileSuggestion(matchedFile);
-		}
-		// If no results found, the existing file search UI will show "No files found"
 	}
 
 	function handleFileSuggestionsKeyDown(event: KeyboardEvent, fileSuggestions: string[]): boolean {
@@ -192,35 +140,12 @@
 		const text = await editorRef?.getPlaintext();
 		if (!text || text.trim().length === 0) return;
 		const state = editorRef?.save();
-
-		// Build context from @ mentions
-		let contextText = "";
-		if (atMentions.size > 0) {
-			const contexts: string[] = [];
-			for (const mention of atMentions) {
-				const results = await fileService.fetchFiles(projectId, mention, 5);
-				if (results && results.length > 0 && results[0]) {
-					// Read file content and add to context
-					const fileInfo = await fileService.readFromWorkspace(results[0], projectId);
-					if ((fileInfo as any)?.data) {
-						const fileContent = atob((fileInfo as any).data);
-						contexts.push(`\n\n--- File: ${results[0]} ---\n${fileContent}`);
-					}
-				}
-			}
-			if (contexts.length > 0) {
-				contextText = "\n\n[Context from @mentions]\n" + contexts.join("\n\n");
-			}
-		}
-
 		try {
 			// We can't rely on set prompt updating prompt text in `laneState`
-			// for clearing of input, so we do it here to keep them in sync.
+			// for clearing the input, so we do it here to keep them in sync.
 			// TODO: Make it so that updating laneState resets the editor.
 			editorRef?.clear();
-			await onSubmit?.(text + contextText);
-			// Clear mentions after sending
-			atMentions.clear();
+			await onSubmit?.(text);
 		} catch (err) {
 			if (state) {
 				editorRef?.load(state);

@@ -12,13 +12,12 @@
 	import { isWorkspacePath, projectPath } from "$lib/routes/routes.svelte";
 	import { SETTINGS_SERVICE } from "$lib/settings/appSettings";
 	import { SHORTCUT_SERVICE } from "$lib/shortcuts/shortcutService";
+	import { UI_STATE } from "$lib/state/uiState.svelte";
 	import { useCreateAiStack } from "$lib/stacks/createAiStack.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import { reactive } from "@gitbutler/shared/reactiveUtils.svelte";
 	import { Button, Icon, OptionsGroup, Select, SelectItem, TestId, Tooltip } from "@gitbutler/ui";
 	import { focusable } from "@gitbutler/ui/focus/focusable";
-	import OrchestratorToggleButton from "$components/orchestrator/OrchestratorToggleButton.svelte";
-	import { orchestratorOpen } from "$lib/orchestrator";
 
 	type Props = {
 		projectId: string;
@@ -32,6 +31,8 @@
 
 	const projectsService = inject(PROJECTS_SERVICE);
 	const baseBranchService = inject(BASE_BRANCH_SERVICE);
+	const uiState = inject(UI_STATE);
+	const orchestratorOpen = $derived.by(() => uiState.global.orchestratorOpen.current);
 	const settingsService = inject(SETTINGS_SERVICE);
 	const modeService = inject(MODE_SERVICE);
 	const shortcutService = inject(SHORTCUT_SERVICE);
@@ -244,9 +245,16 @@
 
 	<div class="chrome-right" data-tauri-drag-region={useCustomTitleBar}>
 		{#if isOnWorkspacePage}
-			<OrchestratorToggleButton />
-		{/if}
-		{#if isOnWorkspacePage}
+			<Button
+				testId="ChromeHeaderOrchestratorButton"
+				kind="outline"
+				tooltip="Open Orchestrator"
+				icon="ai"
+				reversedDirection
+				onclick={() => {
+					uiState.global.orchestratorOpen.set(!orchestratorOpen.current);
+				}}
+			/>
 			<Button
 				testId={TestId.ChromeHeaderCreateBranchButton}
 				kind="outline"
