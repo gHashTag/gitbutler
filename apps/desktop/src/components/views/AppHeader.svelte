@@ -17,6 +17,8 @@
 	import { reactive } from "@gitbutler/shared/reactiveUtils.svelte";
 	import { Button, Icon, OptionsGroup, Select, SelectItem, TestId, Tooltip } from "@gitbutler/ui";
 	import { focusable } from "@gitbutler/ui/focus/focusable";
+	import OrchestratorToggleButton from "$components/orchestrator/OrchestratorToggleButton.svelte";
+	import { orchestratorOpen } from "$lib/orchestrator";
 
 	type Props = {
 		projectId: string;
@@ -245,6 +247,9 @@
 	</div>
 
 	<div class="chrome-right" data-tauri-drag-region={useCustomTitleBar}>
+		{#if isOnWorkspacePage}
+			<OrchestratorToggleButton />
+		{/if}
 		{#if isOnWorkspacePage}
 			<Button
 				testId={TestId.ChromeHeaderCreateBranchButton}
