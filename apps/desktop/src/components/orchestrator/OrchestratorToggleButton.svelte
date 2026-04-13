@@ -1,25 +1,36 @@
 <script lang="ts">
-  import { orchestratorOpen } from '$lib/orchestrator/orchestratorState';
+	import { orchestratorOpen } from '$lib/orchestrator/orchestratorState';
 
-  export let isOpen = false;
-  export let onClick = () => {};
+	interface Props {
+		onClick: () => void;
+	}
+
+	const { onClick }: Props = $props();
+	const isOpen = $derived(orchestratorOpen);
 </script>
 
 <button
 	class="toggle-btn"
 	class:active={isOpen}
 	onclick={() => {
-		isOpen = !isOpen;
+		orchestratorOpen.set(!isOpen);
 		onClick();
 	}}
 	aria-label="Toggle Orchestrator"
 	title="Orchestrator"
 >
-	<!-- Icon: 3x3 grid dots icon -->
-	<circle cx="2" cy="2" r="1.5" fill="currentColor"/>
-	<circle cx="8" cy="2" r="1.5" fill="currentColor"/>
-	<circle cx="14" cy="2" r="1.5" fill="currentColor"/>
-</svg>
+	<!-- 3x3 grid dots icon -->
+	<svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor">
+		<circle cx="2" cy="2" r="1.5"/>
+		<circle cx="8" cy="2" r="1.5"/>
+		<circle cx="14" cy="2" r="1.5"/>
+		<circle cx="2" cy="8" r="1.5"/>
+		<circle cx="8" cy="8" r="1.5"/>
+		<circle cx="14" cy="8" r="1.5"/>
+		<circle cx="2" cy="14" r="1.5"/>
+		<circle cx="8" cy="14" r="1.5"/>
+		<circle cx="14" cy="14" r="1.5"/>
+	</svg>
 </button>
 
 <style>

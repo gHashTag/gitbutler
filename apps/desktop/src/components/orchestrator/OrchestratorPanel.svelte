@@ -1,9 +1,9 @@
 <script lang="ts">
 	import { slide } from 'svelte/transition';
-	import QueenTrinityChat from './QueenTrinityChat.svelte';
-	import OrchestratorRingMap from './OrchestratorRingMap.svelte';
-	import OrchestratorActivityFeed from './OrchestratorActivityFeed.svelte';
-	import RepoFleet from './RepoFleet.svelte';
+	import QueenTrinityChat from '$components/orchestrator/QueenTrinityChat.svelte';
+	import OrchestratorRingMap from '$components/orchestrator/OrchestratorRingMap.svelte';
+	import OrchestratorActivityFeed from '$components/orchestrator/OrchestratorActivityFeed.svelte';
+	import RepoFleet from '$components/orchestrator/RepoFleet.svelte';
 
 	interface Props {
 		open: boolean;
@@ -21,9 +21,33 @@
 	});
 </script>
 
+<style>
+	.orchestrator-panel {
+		position: fixed;
+		top: 0;
+		right: 0;
+		height: 100vh;
+		width: 320px;
+		z-index: 9999;
+		background: var(--clr-bg-1, #1a1a1a);
+		border-left: 1px solid var(--clr-border-2, #333);
+		box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+		display: flex;
+		flex-direction: column;
+		transform: translateX(100%);
+		transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+		overflow: hidden;
+	}
+
+	.orchestrator-panel.open {
+		transform: translateX(0);
+	}
+</style>
+
 {#if open}
 	<aside
 		class="orchestrator-panel"
+		class:open
 		transition:slide={{ axis: 'x', duration: 200 }}
 	>
 		<header class="orchestrator-panel__header">
@@ -69,55 +93,3 @@
 		</section>
 	</aside>
 {/if}
-
-<style lang="postcss">
-	.orchestrator-panel {
-		position: fixed;
-		right: 0;
-		top: 0;
-		bottom: 0;
-		width: 320px;
-		background: var(--bg-1);
-		border-left: 1px solid var(--border-2);
-		display: flex;
-		flex-direction: column;
-		overflow-y: auto;
-		z-index: 100;
-	}
-	.orchestrator-panel__header {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		padding: 12px 16px;
-		border-bottom: 1px solid var(--border-2);
-		position: sticky;
-		top: 0;
-		background: var(--bg-1);
-	}
-	.orchestrator-section {
-		border-bottom: 1px solid var(--border-2);
-	}
-	.section-toggle {
-		width: 100%;
-		text-align: left;
-		padding: 10px 16px;
-		font-size: 12px;
-		font-weight: 500;
-		color: var(--text-2);
-		background: none;
-		border: none;
-		cursor: pointer;
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-	}
-	.agent-count-badge {
-		margin-left: auto;
-		font-size: 10px;
-		padding: 2px 6px;
-		border-radius: 4px;
-		background: var(--bg-3);
-		color: var(--text-1);
-		font-weight: 500;
-	}
-</style>

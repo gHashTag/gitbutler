@@ -252,7 +252,7 @@
 				icon="ai"
 				reversedDirection
 				onclick={() => {
-					uiState.global.orchestratorOpen.set(!orchestratorOpen.current);
+					uiState.global.orchestratorOpen.set(!orchestratorOpen);
 				}}
 			/>
 			<Button
