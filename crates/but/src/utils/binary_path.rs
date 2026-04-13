@@ -1,5 +1,7 @@
 //! Helpers for resolving binary paths.
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 
 /// Resolve the path to the current executable, assuming it's `but`, such that it can be executed.
 ///

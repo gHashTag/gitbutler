@@ -57,6 +57,7 @@
 		Link,
 		SkeletonBone,
 	} from "@gitbutler/ui";
+	import { showToast } from "$lib/notifications/toasts";
 
 	import VirtualList from "@gitbutler/ui/components/VirtualList.svelte";
 	import { focusable } from "@gitbutler/ui/focus/focusable";
@@ -496,7 +497,12 @@
 			{#snippet loading()}
 				<DrawerHeader {onclose}>
 					{#snippet content()}
-						<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+						<div class="chat-header-content">
+							<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+							{#if ringNumber}
+								<span class="ring-badge">Ring {ringNumber}</span>
+							{/if}
+						</div>
 					{/snippet}
 					{#snippet actions()}
 						<div class="flex gap-4 items-center">
@@ -568,7 +574,12 @@
 				<!-- TODO: remove this header when we move to the workspace layout -->
 				<DrawerHeader {onclose}>
 					{#snippet content()}
-						<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+						<div class="chat-header-content">
+							<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+							{#if ringNumber}
+								<span class="ring-badge">Ring {ringNumber}</span>
+							{/if}
+						</div>
 					{/snippet}
 
 					{#snippet actions()}
@@ -1010,6 +1021,17 @@
 		min-height: 10rem;
 		overflow: hidden;
 	}
+
+	.ring-context {
+		padding: 8px 20px;
+		background: var(--bg-1);
+		border-bottom: 1px solid var(--border-2);
+	}
+
+	.ring-context__text {
+		font-size: 11px;
+		color: var(--text-3);
+	}
 	.chat-view__placeholder {
 		display: flex;
 		flex: 1;
@@ -1119,5 +1141,21 @@
 		justify-content: space-between;
 		padding-top: 12px;
 		border-top: 1px solid var(--border-3);
+	}
+
+	.chat-header-content {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.ring-badge {
+		font-size: 11px;
+		padding: 2px 8px;
+		border-radius: 10px;
+		background: var(--bg-2);
+		color: var(--text-2);
+		font-weight: 500;
+		white-space: nowrap;
 	}
 </style>

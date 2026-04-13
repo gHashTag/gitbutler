@@ -12,6 +12,9 @@
 	import { UI_STATE } from "$lib/state/uiState.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import { TestId } from "@gitbutler/ui";
+	import OrchestratorPanel from "$components/orchestrator/OrchestratorPanel.svelte";
+	import OrchestratorToggleButton from "$components/orchestrator/OrchestratorToggleButton.svelte";
+	import { orchestratorOpen } from "$lib/orchestrator";
 
 	interface Props {
 		projectId: string;
@@ -97,3 +100,11 @@
 		</ReduxResult>
 	{/snippet}
 </MainViewport>
+
+{#if $orchestratorOpen}
+	<OrchestratorPanel
+		open={$orchestratorOpen}
+		onClose={() => orchestratorOpen.set(false)}
+		{projectId}
+	/>
+{/if}
