@@ -6,6 +6,7 @@
 	import CodegenChatClaudeNotRegistered from "$components/codegen/CodegenChatClaudeNotRegistered.svelte";
 	import CodegenInput from "$components/codegen/CodegenInput.svelte";
 	import CodegenMessageItem from "$components/codegen/CodegenMessageItem.svelte";
+	import ProjectRules from "$components/codegen/ProjectRules.svelte";
 	import CodegenPromptConfigModal from "$components/codegen/CodegenPromptConfigModal.svelte";
 	import CodegenServiceMessageThinking from "$components/codegen/CodegenServiceMessageThinking.svelte";
 	import CodegenServiceMessageUseTool from "$components/codegen/CodegenServiceMessageUseTool.svelte";
@@ -16,10 +17,13 @@
 	import ReduxResult from "$components/shared/ReduxResult.svelte";
 	import noClaudeCodeSvg from "$lib/assets/empty-state/claude-disconected.svg?raw";
 	import laneNewSvg from "$lib/assets/empty-state/lane-new.svg?raw";
+	import { BACKEND } from "$lib/backend";
 	import { getEditorUri, URL_SERVICE } from "$lib/backend/url";
 	import { ATTACHMENT_SERVICE } from "$lib/codegen/attachmentService.svelte";
+	import { CLIPBOARD_SERVICE } from "$lib/backend/clipboard";
 	import { CLAUDE_CODE_SERVICE } from "$lib/codegen/claude";
 	import { MessageSender } from "$lib/codegen/messageQueue.svelte";
+	import type { PromptAttachment } from "$lib/codegen/types";
 	import {
 		currentStatus,
 		thinkingOrCompactingStartedAt,
@@ -30,6 +34,9 @@
 		type Message,
 	} from "$lib/codegen/messages";
 	import { parseTemplates } from "$lib/codegen/templateParser";
+	import { splitMessage } from "$lib/commits/commitMessage";
+	import { formatRingNumber, getNextPhase, isRingBranch, parseRingNumber, parsePhaseSuffix, PHASE_ORDER } from "$lib/utils/phiLoop";
+	import { UI_STATE } from "$lib/state/uiState.svelte";
 
 	import { RULES_SERVICE } from "$lib/rules/rulesService.svelte";
 	import { SETTINGS_SERVICE } from "$lib/settings/appSettings";
@@ -74,12 +81,18 @@
 
 	const branchName = $derived(controller.branchName ?? "");
 
+	// Extract ring number from branch name for ring-NNN-* pattern (without leading zeros)
+	const ringNumber = $derived.by(() => parseRingNumber(branchName));
+
+	const backend = inject(BACKEND);
 	const claudeCodeService = inject(CLAUDE_CODE_SERVICE);
+	const clipboardService = inject(CLIPBOARD_SERVICE);
 	const rulesService = inject(RULES_SERVICE);
 	const urlService = inject(URL_SERVICE);
 	const userSettings = inject(SETTINGS);
 	const settingsService = inject(SETTINGS_SERVICE);
 	const attachmentService = inject(ATTACHMENT_SERVICE);
+	const uiState = inject(UI_STATE);
 	const claudeSettings = $derived($settingsService?.claude);
 
 	const isStackActiveQuery = $derived(claudeCodeService.isStackActive(projectId, stackId));
@@ -248,6 +261,155 @@
 	async function handleAnswerQuestion(answers: Record<string, string>) {
 		if (!stackId) return;
 		await claudeCodeService.answerAskUserQuestion({ projectId, stackId, answers });
+	}
+
+	async function insertIntoCommitMessage(content: string) {
+		const laneState = uiState.lane(stackId || "codegen--new-lane");
+
+		// Parse AI response into title and description
+		const message = splitMessage(content);
+
+		// Update the commit message state
+		laneState.newCommitMessage.update({
+			title: message.title,
+			description: message.description,
+		});
+	}
+
+	// Track pinned messages (simple local state)
+	let pinnedMessages = $state<Set<string>>(new Set());
+
+	function togglePin(content: string) {
+		if (pinnedMessages.has(content)) {
+			pinnedMessages.delete(content);
+		} else {
+			pinnedMessages.add(content);
+		}
+	}
+
+	async function regenerateMessage() {
+		// Find the last user message and regenerate the AI response
+		const userMessages = events
+			.filter((e) => e.payload.source === "user")
+			.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+		if (userMessages.length === 0) {
+			showToast({ message: "No message to regenerate", style: "danger" });
+			return;
+		}
+
+		const lastUserMessage = userMessages[userMessages.length - 1];
+		if (!lastUserMessage) return;
+		const userInput = lastUserMessage.payload as { source: "user"; message: string; attachments?: PromptAttachment[] };
+		await messageSender?.sendMessage(userInput.message, attachments);
+	}
+
+	async function handleFeedback(feedback: "up" | "down") {
+		// Save to T27 PHI LOOP experience
+		try {
+			const trinityPath = `${import.meta.env.VITE_TRINITY_HOME || process.env.TRINITY_HOME || "~/.trinity"}/experience/episodes.jsonl`;
+			const lastClaudeMessage = formattedMessages
+				.filter((m) => m.source === "claude")
+				.slice(-1)[0];
+			// formattedMessages have the source at the top level (not in payload)
+			const messageContent = (lastClaudeMessage as { source: "claude"; message: string } | undefined)?.message || "";
+			await fetch(trinityPath, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+						timestamp: new Date().toISOString(),
+						type: "claude-code-chat-feedback",
+						data: {
+								feedback,
+								message: messageContent,
+						},
+				}),
+			});
+		} catch (err) {
+			console.error("Failed to save feedback:", err);
+		}
+	}
+
+	async function exportToMarkdown(content: string) {
+		// Download content as .md file using browser API
+		const fileName = `ring-${Date.now()}-spec.md`;
+		try {
+			const blob = new Blob([content], { type: "text/markdown" });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			a.download = fileName;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+		} catch (err) {
+			showToast({ message: "Failed to export", style: "danger" });
+		}
+	}
+
+	async function openInEditor(content: string) {
+		// Copy to clipboard and notify user to paste in editor
+		try {
+			await clipboardService.write(content, { message: "Copied to clipboard - paste in editor" });
+		} catch (err) {
+			showToast({ message: "Failed to copy", style: "danger" });
+		}
+	}
+
+	async function createBranchFromResponse(content: string) {
+		// Parse ring number from AI response (looks for "ring-NNN" pattern)
+		const ringNum = parseRingNumber(content);
+		const paddedRingNum = ringNum ? formatRingNumber(ringNum) : Date.now().toString();
+		const newBranchName = ringNum
+			? `ring-${paddedRingNum}-spec`
+			: `ring-${paddedRingNum}-spec`;
+
+		try {
+			await backend.invoke("create_virtual_branch", {
+				projectId,
+				branch: { name: newBranchName }
+			});
+			showToast({ message: `Branch ${newBranchName} created`, style: "success" });
+		} catch (err) {
+			showToast({ message: "Failed to create branch", style: "danger" });
+		}
+	}
+
+	async function createNextPhaseBranch(content: string) {
+		// Check if this is a ring branch
+		if (!isRingBranch(branchName)) {
+			showToast({ message: "Not a ring branch", style: "danger" });
+			return;
+		}
+
+		// Extract current ring number and phase from current branch
+		const ringNum = parseRingNumber(branchName);
+		const currentPhase = parsePhaseSuffix(branchName);
+
+		if (!ringNum || !currentPhase) {
+			showToast({ message: "Invalid ring branch format", style: "danger" });
+			return;
+		}
+
+		const nextPhase = getNextPhase(currentPhase);
+		if (!nextPhase) {
+			showToast({ message: "No next phase available", style: "danger" });
+			return;
+		}
+
+		const paddedRingNum = formatRingNumber(ringNum);
+		const newBranchName = `ring-${paddedRingNum}-${nextPhase}`;
+
+		try {
+			await backend.invoke("create_virtual_branch", {
+				projectId,
+				branch: { name: newBranchName }
+			});
+			showToast({ message: `Branch ${newBranchName} created`, style: "success" });
+		} catch (err) {
+			showToast({ message: "Failed to create next phase branch", style: "danger" });
+		}
 	}
 
 	async function retryConfig() {
@@ -481,6 +643,12 @@
 				</DrawerHeader>
 
 				<div class="chat-container">
+					{#if ringNumber}
+						<div class="ring-context">
+							<span class="ring-context__text">Active Ring: {ringNumber} | t27 PHI LOOP active</span>
+						</div>
+					{/if}
+					<ProjectRules {projectId} />
 					{#if claudeAvailable.status !== "available" && formattedMessages.length === 0}
 						<AppScrollableContainer childrenWrapDisplay="contents">
 							<div class="no-agent-placeholder">
@@ -546,6 +714,26 @@
 									{message}
 									{onPermissionDecision}
 									{toolCallExpandedState}
+									onInsertIntoCommitMessage={insertIntoCommitMessage}
+									onRegenerate={regenerateMessage}
+									onFeedback={handleFeedback}
+									onExport={exportToMarkdown}
+									onOpenInEditor={openInEditor}
+									onPin={togglePin}
+									onCreateBranch={createBranchFromResponse}
+									onCreateNextPhaseBranch={createNextPhaseBranch}
+									{branchName}
+									isPinned={
+										"contentBlocks" in message
+											? pinnedMessages.has(
+													JSON.stringify(
+															message.contentBlocks.find(
+																	(b): b is { type: "text"; text: string } => b.type === "text"
+															)?.text || ""
+													)
+												)
+											: false
+									}
 								/>
 							{/snippet}
 							{@const thinkingStatus = currentStatus(events, isStackActive)}

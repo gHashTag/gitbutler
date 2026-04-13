@@ -21,8 +21,18 @@
 			groups: Map<string, boolean>;
 			individual: Map<string, boolean>;
 		};
+		onInsertIntoCommitMessage?: (content: string) => void;
+		onRegenerate?: () => void;
+		onFeedback?: (feedback: "up" | "down") => void;
+		onExport?: (content: string) => void;
+		onOpenInEditor?: (content: string) => void;
+		onPin?: (content: string) => void;
+		onCreateBranch?: (content: string) => void;
+		onCreateNextPhaseBranch?: (content: string) => void;
+		branchName?: string;
+		isPinned?: boolean;
 	};
-	const { projectId, message, onPermissionDecision, toolCallExpandedState }: Props = $props();
+	const { projectId, message, onPermissionDecision, toolCallExpandedState, onInsertIntoCommitMessage, onRegenerate, onFeedback, onExport, onOpenInEditor, onPin, onCreateBranch, onCreateNextPhaseBranch, branchName, isPinned }: Props = $props();
 
 	let expanded = $state(false);
 </script>
@@ -61,7 +71,19 @@
 			{@const firstInGroup = block.type === "toolCall" && prevBlock?.type !== "toolCall"}
 			{@const lastInGroup = block.type === "toolCall" && nextBlock?.type !== "toolCall"}
 			{#if block.type === "text"}
-				<CodegenAssistantMessage content={block.text} />
+				<CodegenAssistantMessage
+					content={block.text}
+					createdAt={message.createdAt}
+					onInsertIntoCommitMessage={onInsertIntoCommitMessage}
+					onRegenerate={onRegenerate}
+					onFeedback={onFeedback}
+					onExport={onExport}
+					onOpenInEditor={onOpenInEditor}
+					onPin={onPin}
+					onCreateBranch={onCreateBranch}
+					onCreateNextPhaseBranch={onCreateNextPhaseBranch}
+					{branchName}
+				/>
 			{:else if block.type === "toolCall"}
 				{#if block.toolCall.name !== "TodoWrite"}
 					<CodegenToolCall

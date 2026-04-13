@@ -29,6 +29,7 @@
 	const selectionId = createWorktreeSelection({ stackId: undefined });
 	const worktreeSelection = $derived(idSelection.getById(selectionId));
 	const stacksQuery = $derived(stackService.stacks(projectId));
+	const orchestratorOpen = $derived.by(() => uiState.global.orchestratorOpen.current);
 
 	const lastAdded = $derived(worktreeSelection.lastAdded);
 	const previewOpen = $derived(!!$lastAdded?.key);

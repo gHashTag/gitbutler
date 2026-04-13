@@ -3,6 +3,7 @@
 	import BranchDividerLine from "$components/branch/BranchDividerLine.svelte";
 	import BranchHeader from "$components/branch/BranchHeader.svelte";
 	import BranchHeaderContextMenu from "$components/branch/BranchHeaderContextMenu.svelte";
+	import PhiLoopProgress from "$components/codegen/PhiLoopProgress.svelte";
 	import CIChecksBadge from "$components/forge/CIChecksBadge.svelte";
 	import CreateReviewBox from "$components/forge/CreateReviewBox.svelte";
 	import PrNumberSync from "$components/forge/PrNumberSync.svelte";
@@ -340,6 +341,10 @@
 	{/if}
 
 	{#if args.type === "stack-branch" || args.type === "normal-branch"}
+		{#if /ring-\d+/i.test(branchName)}
+			<BranchDividerLine {lineColor} short />
+			<PhiLoopProgress {branchName} />
+		{/if}
 		{#if args.branchContent}
 			{@render args.branchContent()}
 		{/if}
