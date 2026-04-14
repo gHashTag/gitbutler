@@ -107,6 +107,12 @@
 	let inputRef = $state<CodegenInput>();
 	let dismissedAskUserQuestions = $state<Record<string, boolean>>({});
 
+	// Toast notifications
+	function showToast({ message, style }: { message: string; style?: string }) {
+		// Simple console.log for now - could be replaced with proper toast UI
+		console.log(`[Toast ${style || 'info'}] ${message}`);
+	}
+
 	// Track expanded state for tool calls by message createdAt timestamp
 	const toolCallExpandedState = {
 		groups: new Map<string, boolean>(),
