@@ -27,6 +27,17 @@
 		word-break: break-word;
 		position: relative;
 	}
+	.message-assistant__actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 4px;
+		align-items: center;
+	}
+	.message-assistant__actions-copy,
+	.message-assistant__feedback {
+		display: flex;
+		gap: 4px;
+	}
 	:global(.message-assistant .markdown > *) {
 		/** With padding block quote background can still be full width. */
 		padding-right: 32px;

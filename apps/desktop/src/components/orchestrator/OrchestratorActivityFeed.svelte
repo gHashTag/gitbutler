@@ -1,128 +1,119 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
-	import { readTextFile, exists } from '@tauri-apps/plugin-fs';
-	import { homeDir, join } from '@tauri-apps/api/path';
-	import { inject } from '@gitbutler/core/context';
-	import { BACKEND } from '$lib/backend';
+	import type { ActivityItem } from '$lib/orchestrator/orchestratorTypes';
 
-	interface ActivityEvent {
-		id: string;
-		timestamp: Date;
-		type: 'commit' | 'branch' | 'push' | 'agent' | 'phi-loop' | 'error';
-		message: string;
-		branch?: string;
-		ring?: number;
-	}
-
-	let events = $state<ActivityEvent[]>([]);
-	let interval: ReturnType<typeof setInterval>;
-
-	export type Props = {
+	interface Props {
 		projectId: string;
 	}
+
 	const { projectId }: Props = $props();
 
-	const backend = inject(BACKEND);
-
-	// Read ~/.trinity/experience/episodes.jsonl
-	async function refreshActivity() {
-		const newEvents: ActivityEvent[] = [];
-
-		try {
-			// Get home directory and construct path to episodes.jsonl
-			const home = await homeDir();
-			const episodesPath = await join(home, '.trinity', 'experience', 'episodes.jsonl');
-
-			if (await exists(episodesPath)) {
-				const raw = await readTextFile(episodesPath);
-				const lines = raw.trim().split('\n');
-				for (const line of lines) {
-					if (!line.trim()) continue;
-					try {
-						const ep = JSON.parse(line);
-						newEvents.push({
-							id: ep.id || crypto.randomUUID(),
-							timestamp: new Date(ep.timestamp),
-							type: ep.feedback === 1 ? 'phi-loop' : 'agent',
-							message: ep.lesson?.slice(0, 80) || ep.content?.slice(0, 80) || 'PHI LOOP event',
-							ring: ep.ring
-						});
-					} catch {
-						// Skip invalid JSON lines
-					}
-				}
-			}
-		} catch (e) {
-			// Silently fail if episodes.jsonl doesn't exist or can't be read
+	const activities: ActivityItem[] = [
+		{
+			id: '1',
+			type: 'agent',
+			message: 'Agent Alpha started task: Implement feature X',
+			timestamp: '2m ago',
+			status: 'info'
+		},
+		{
+			id: '2',
+			type: 'ring',
+			message: 'Ring 7 completed',
+			timestamp: '5m ago',
+			status: 'info'
+		},
+		{
+			id: '3',
+			type: 'system',
+			message: 'Sync completed successfully',
+			timestamp: '10m ago',
+			status: 'info'
+		},
+		{
+			id: '4',
+			type: 'agent',
+			message: 'Agent Beta encountered error: Permission denied',
+			timestamp: '15m ago',
+			status: 'error'
 		}
-
-		events = newEvents.sort((a, b) =>
-			b.timestamp.getTime() - a.timestamp.getTime()
-		).slice(0, 20);
-	}
-
-	onMount(() => {
-		refreshActivity();
-		interval = setInterval(() => refreshActivity(), 5000);
-	});
-
-	onDestroy(() => {
-		if (interval) clearInterval(interval);
-	});
+	];
 </script>
 
 <div class="activity-feed">
-	{#if events.length === 0}
-		<div class="activity-empty">No recent activity</div>
-	{:else}
-		{#each events as event}
-			<div class="activity-item activity-item--{event.type}">
-				<span class="activity-time">
-					{new Intl.RelativeTimeFormat('en', { numeric: 'auto' })}
-					.format(
-						Math.round((event.timestamp.getTime() - Date.now()) / 60000),
-						'minute'
-					)}
+	<h3 class="activity-feed__title">Activity Log</h3>
+	<div class="activity-feed__list">
+		{#each activities as activity (activity.id)}
+			<div
+				class="activity-item"
+				class:info={activity.status === 'info'}
+				class:warning={activity.status === 'warning'}
+				class:error={activity.status === 'error'}
+			>
+				<span class="activity-icon">
+					{#if activity.type === 'agent'}🤖{/if}
+					{#if activity.type === 'ring'}⭕{/if}
+					{#if activity.type === 'system'}⚙️{/if}
 				</span>
-				<span class="activity-message">{event.message}</span>
-				{#if event.ring}
-					<span class="activity-ring">ring-{String(event.ring).padStart(3, '0')}</span>
-				{/if}
+				<div class="activity-content">
+					<p class="activity-message">{activity.message}</p>
+					<span class="activity-time">{activity.timestamp}</span>
+				</div>
 			</div>
 		{/each}
-	{/if}
+	</div>
 </div>
 
-<style lang="postcss">
+<style>
 	.activity-feed {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		padding: 12px;
+	}
+	.activity-feed__title {
+		font-size: 14px;
+		font-weight: 600;
+		margin: 0 0 8px;
+	}
+	.activity-feed__list {
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
 	}
-	.activity-empty {
-		font-size: 11px;
-		color: var(--text-3);
-		padding: 12px 16px;
-		text-align: center;
-	}
 	.activity-item {
 		display: flex;
-		gap: 4px;
+		gap: 8px;
+		padding: 8px;
+		border-radius: 6px;
+		background: var(--bg-2);
+		border-left: 3px solid var(--border-2);
+	}
+	.activity-item.info {
+		border-left-color: var(--info-color);
+	}
+	.activity-item.warning {
+		border-left-color: var(--warning-color);
+	}
+	.activity-item.error {
+		border-left-color: var(--error-color);
+		background: var(--error-color-dimmed);
+	}
+	.activity-icon {
+		font-size: 16px;
+	}
+	.activity-content {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
+	.activity-message {
+		margin: 0;
 		font-size: 12px;
+		line-height: 1.3;
 	}
 	.activity-time {
 		font-size: 10px;
-		color: var(--text-3);
-		min-width: 60px;
-	}
-	.activity-message {
-		flex: 1;
-		font-size: 12px;
-		color: var(--text-1);
-	}
-	.activity-ring {
-		font-size: 10px;
-		color: var(--text-2);
-		padding-left: 4px;
+		opacity: 0.6;
 	}
 </style>

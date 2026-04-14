@@ -248,9 +248,16 @@
 
 	<div class="chrome-right" data-tauri-drag-region={useCustomTitleBar}>
 		{#if isOnWorkspacePage}
-			<OrchestratorToggleButton />
-		{/if}
-		{#if isOnWorkspacePage}
+			<Button
+				testId="ChromeHeaderOrchestratorButton"
+				kind="outline"
+				tooltip="Open Orchestrator"
+				icon="ai"
+				reversedDirection
+				onclick={() => {
+					uiState.global.orchestratorOpen.set(!orchestratorOpen);
+				}}
+			/>
 			<Button
 				testId={TestId.ChromeHeaderCreateBranchButton}
 				kind="outline"

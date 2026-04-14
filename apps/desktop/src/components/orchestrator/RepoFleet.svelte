@@ -1,126 +1,135 @@
 <script lang="ts">
-	import { reposStore, type RepoStatus } from '$lib/orchestrator';
+	import type { RepoInfo } from '$lib/orchestrator/orchestratorTypes';
 
 	interface Props {
 		projectId: string;
 	}
+
 	const { projectId }: Props = $props();
+
+	const repos: RepoInfo[] = [
+		{
+			name: 'gitbutler',
+			path: '/Users/playra/gitbutler',
+			branch: 'main',
+			status: 'clean',
+			lastCommit: '2h ago'
+		},
+		{
+			name: 't27',
+			path: '/Users/playra/t27',
+			branch: 'dev',
+			status: 'dirty',
+			lastCommit: '1d ago'
+		},
+		{
+			name: 'trinity-core',
+			path: '/Users/playra/trinity-core',
+			branch: 'master',
+			status: 'ahead',
+			lastCommit: '3d ago'
+		}
+	];
 </script>
 
 <div class="repo-fleet">
-	{#each $reposStore as repo}
-		<div class="repo-card">
-			<div
-				class="repo-card__dot"
-				class:green={repo.ciStatus === 'passing'}
-				class:red={repo.ciStatus === 'failing'}
-				class:amber={repo.ciStatus === 'running'}
-			></div>
-			<div class="repo-card__info">
-				<span class="repo-name">{repo.name}</span>
-				{#if repo.currentRing}
-					<span class="repo-ring-badge">Ring {repo.currentRing}</span>
-				{/if}
-				{#if repo.activeAgents}
-					<span class="repo-agents">{repo.activeAgents} agents</span>
-				{/if}
+	<h3 class="repo-fleet__title">Repository Fleet</h3>
+	<div class="repo-fleet__list">
+		{#each repos as repo (repo.name + repo.path)}
+			<div class="repo-card" class:{repo.status}>
+				<div class="repo-header">
+					<span class="repo-icon">📦</span>
+					<span class="repo-name">{repo.name}</span>
+					<span class="repo-status-badge">{repo.status}</span>
+				</div>
+				<div class="repo-details">
+					<div class="repo-detail">
+						<span class="detail-label">Branch:</span>
+						<span class="detail-value">{repo.branch}</span>
+					</div>
+					{#if repo.lastCommit}
+						<div class="repo-detail">
+							<span class="detail-label">Last commit:</span>
+							<span class="detail-value">{repo.lastCommit}</span>
+						</div>
+					{/if}
+				</div>
 			</div>
-			{#if repo.lastCommit}
-				<div class="repo-last-commit">{repo.lastCommit}</div>
-			{/if}
-			<span
-				class="state-icon"
-				style:background={
-					repo.ciStatus === 'passing'
-						? 'var(--success-bg)'
-						: repo.ciStatus === 'failing'
-							? 'var(--danger-bg)'
-							: 'var(--pending-bg)'
-				}
-			>
-				{#if repo.ciStatus === 'passing'}
-					✓
-				{:else if repo.ciStatus === 'failing'}
-					✗
-				{:else if repo.ciStatus === 'running'}
-					⏳
-				{:else}
-					?
-				{/if}
-			</span>
-		</div>
-	{/each}
+		{/each}
+	</div>
 </div>
 
-<style lang="postcss">
+<style>
 	.repo-fleet {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-		gap: 12px;
-	}
-	.repo-card {
-		border: 1px solid var(--border-2);
-		border-radius: 6px;
 		display: flex;
 		flex-direction: column;
+		gap: 12px;
 		padding: 12px;
-		background: var(--bg-1);
 	}
-	.repo-card__dot {
-		flex-shrink: 0;
-		width: 8px;
-		height: 8px;
-		border-radius: 50%;
+	.repo-fleet__title {
+		font-size: 14px;
+		font-weight: 600;
+		margin: 0 0 8px;
 	}
-	.repo-card__dot.green {
-		background: var(--success-bg);
-	}
-	.repo-card__dot.red {
-		background: var(--danger-bg);
-	}
-	.repo-card__dot.amber {
-		background: var(--warning-bg);
-	}
-	.repo-card__info {
-		flex: 1;
-		min-width: 0;
-	}
-	.repo-card__header {
+	.repo-fleet__list {
 		display: flex;
-		gap: 4px;
-		font-size: 12px;
-		font-weight: 500;
+		flex-direction: column;
+		gap: 8px;
 	}
-	.repo-name {
-		color: var(--text-1);
+	.repo-card {
+		padding: 10px;
+		border-radius: 6px;
+		background: var(--bg-2);
+		border: 1px solid var(--border-2);
 	}
-	.repo-ring-badge {
-		margin-left: auto;
-		font-size: 10px;
-		padding: 2px 6px;
-		border-radius: 4px;
-		background: var(--bg-3);
-		color: var(--text-1);
-		font-weight: 500;
+	.repo-card.clean {
+		border-left: 3px solid var(--success-color);
 	}
-	.repo-agents {
-		font-size: 10px;
-		color: var(--text-2);
+	.repo-card.dirty {
+		border-left: 3px solid var(--warning-color);
+		background: var(--warning-color-dimmed);
 	}
-	.repo-last-commit {
-		font-size: 10px;
-		color: var(--text-3);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
+	.repo-card.ahead {
+		border-left: 3px solid var(--info-color);
 	}
-	.state-icon {
-		flex-shrink: 0;
-		width: 16px;
-		height: 16px;
-		border-radius: 50%;
+	.repo-card.behind {
+		border-left: 3px solid var(--error-color);
+	}
+	.repo-header {
 		display: flex;
 		align-items: center;
-		justify-content: center;
+		gap: 8px;
+		margin-bottom: 8px;
+	}
+	.repo-icon {
+		font-size: 14px;
+	}
+	.repo-name {
+		flex: 1;
+		font-size: 13px;
+		font-weight: 500;
+	}
+	.repo-status-badge {
+		font-size: 10px;
+		padding: 2px 6px;
+		border-radius: 10px;
+		background: var(--bg-3);
+		text-transform: uppercase;
+	}
+	.repo-details {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.repo-detail {
+		display: flex;
+		gap: 6px;
+		font-size: 11px;
+	}
+	.detail-label {
+		opacity: 0.6;
+	}
+	.detail-value {
+		font-weight: 500;
 	}
 </style>

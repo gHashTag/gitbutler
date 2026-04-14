@@ -1,283 +1,236 @@
-<script lang="ts">
-	import { onMount } from 'svelte';
-	import { writable, derived } from 'svelte/store';
-	import type { ChatMessage } from '$lib/orchestrator/queenChatStore';
+<script lang='ts'>
+  import { writable } from 'svelte/store'
+  import { onMount } from 'svelte'
+  import { runQueenSelfTest } from '$lib/orchestrator/queenSelfTest'
 
-	interface Props {
-		projectId: string;
-	}
-	const { projectId }: Props = $props();
+  interface Msg { id: string; role: 'user'|'queen'; content: string; time: string }
 
-	let chatMessages = $state<ChatMessage[]>([]);
-	let inputText = $state('');
-	let isSending = $state(false);
-	let showCopied = $state(false);
-	let chatContainer = $state<HTMLDivElement>();
+  const messages = writable<Msg[]>([])
+  let loading = false
+  let input = ''
+  let copied = ''
 
-	async function handleSend() {
-		const text = inputText.trim();
-		if (!text || isSending) return;
+  onMount(() => {
+    if (import.meta.env.DEV) {
+      runQueenSelfTest()
+    }
+  })
 
-		isSending = true;
-		inputText = '';
+  async function getKey(): Promise<string | null> {
+    // 1. localStorage
+    if (typeof localStorage !== "undefined") {
+      const k = localStorage.getItem("zai-key")
+      if (k && k.length > 10) return k
+    }
 
-		try {
-			const newMessage: ChatMessage = {
-				id: crypto.randomUUID(),
-				role: 'user',
-				content: text,
-				timestamp: new Date(),
-			};
-			chatMessages = [...chatMessages, newMessage];
+    // 2. Tauri invoke — читаем через backend
+    try {
+      const { invoke } = await import("@tauri-apps/api/core")
+      const content: string = await invoke("read_file_content", {
+        path: "/Users/playra/.claude/.env"
+      })
+      const m = content.match(/ZAI_KEY_1=([^\n\r]+)/)
+      if (m?.[1]) {
+        const key = m[1].trim()
+        localStorage.setItem("zai-key", key)
+        return key
+      }
+    } catch (_) {}
 
-			// TODO: Call GitButler MCP or Claude API here
-			await sendMessageToQueen(text);
-		} catch (e) {
-			console.error('Failed to send:', e);
-			} finally {
-			isSending = false;
-			}
-	}
+    // 3. Попробуй env через import.meta.env (Vite)
+    const envKey = (import.meta as any).env?.VITE_ZAI_KEY
+    if (envKey) {
+      localStorage.setItem("zai-key", envKey)
+      return envKey
+    }
 
-	async function sendMessageToQueen(content: string) {
-		try {
-			// TODO: Replace with actual GitButler MCP call or Claude API
-			console.log('[Queen Trinity]', content);
+    return null
+  }
 
-			// Placeholder response for demo
-			await new Promise(resolve => setTimeout(resolve, 1000));
+  async function send() {
+    if (!input.trim() || loading) return
+    const text = input.trim()
+    input = ''
+    const time = new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'})
+    messages.update(m => [...m, { id: crypto.randomUUID(), role:'user', content:text, time }])
+    loading = true
 
-			// Add a demo response
-			const response: ChatMessage = {
-				id: crypto.randomUUID(),
-				role: 'queen',
-				content: `Echo: ${content}`,
-				timestamp: new Date(),
-			};
-			chatMessages = [...chatMessages, response];
-		} catch (e) {
-			console.error('Queen Trinity error:', e);
-		}
-	}
+    const key = await getKey()
+    let reply = ''
+    if (!key) {
+      reply = '⚠️ Нет ключа z.ai. Добавь ZAI_KEY_1=... в ~/.claude/.env'
+    } else {
+      try {
+        const hist: Msg[] = []
+        messages.subscribe(m => { hist.splice(0); hist.push(...m) })()
+        const res = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions',{
+          method:'POST',
+          headers:{'Authorization':'Bearer '+key,'Content-Type':'application/json'},
+          body: JSON.stringify({
+            model:'glm-4-flash',
+            max_tokens:512,
+            messages:[
+              {role:'system',content:'Ты Queen Trinity — AI оркестратор Trinity S3AI (t27). 27 агентов, 32 rings, PHI LOOP, GitButler. Кратко и технично. φ²+φ⁻²=3|TRINITY'},
+              ...hist.slice(-10).map(m=>({role:m.role==='queen'?'assistant':'user',content:m.content})),
+              {role:'user',content:text}
+            ]
+          })
+        })
+        if (!res.ok) { const e=await res.text(); reply='❌ z.ai '+res.status+': '+e.slice(0,100) }
+        else { const d=await res.json(); reply=d?.choices?.[0]?.message?.content??'⚠️ empty' }
+      } catch(e) { reply='❌ '+String(e).slice(0,100) }
+    }
 
-	function handleKeydown(event: KeyboardEvent) {
-		if (event.key === 'Enter' && !event.shiftKey) {
-			event.preventDefault();
-			handleSend();
-		}
-	}
+    messages.update(m=>[...m,{id:crypto.randomUUID(),role:'queen',content:reply,time:new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'})}])
+    loading=false
+  }
 
-	async function copyToClipboard(text: string) {
-		try {
-			await navigator.clipboard.writeText(text);
-			showCopied = true;
-			setTimeout(() => showCopied = false, 2000);
-		} catch (e) {
-			console.error('Failed to copy:', e);
-		}
-	}
-
-	function formatMessage(content: string): string {
-		return content
-			.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-			.replace(/`([^`]+)`/g, '<code>$1</code>')
-			.replace(/\n/g, '<br>');
-	}
-
-	function scrollToBottom() {
-		if (chatContainer) {
-			chatContainer.scrollTop = chatContainer.scrollHeight;
-		}
-	}
-
-	onMount(() => {
-		scrollToBottom();
-	});
+  function onKey(e:KeyboardEvent){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}}
+  async function copy(id:string,text:string){await navigator.clipboard.writeText(text);copied=id;setTimeout(()=>copied='',2000)}
 </script>
 
-<div class="queen-chat">
-	<div class="queen-chat__messages" bind:this={chatContainer}>
-		{#each chatMessages as msg}
-			<div class="message message--{msg.role}" style="align-items: {msg.role === 'user' ? 'flex-end' : 'flex-start'}">
-				{#if msg.role === 'user'}
-					<div class="message-bubble message-bubble--user">
-						{msg.content}
-					</div>
-				{:else}
-					<div class="message-bubble message-bubble--queen">
-						<div class="message-content">
-							{@html formatMessage(msg.content)}
-						</div>
-						<button
-							class="copy-button"
-							onclick={() => copyToClipboard(msg.content)}
-							title="Copy to clipboard"
-						>
-							{#if showCopied && chatMessages[chatMessages.length - 1] === msg}
-								Copied!
-							{:else}
-								Copy
-							{/if}
-						</button>
-					</div>
-				{/if}
-				<div class="message-time">
-					{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-				</div>
-			</div>
-		{/each}
-		{#if isSending}
-			<div class="message message--queen">
-				<div class="message-bubble message-bubble--queen">
-					<span class="loading-dots">
-						<span>.</span><span>.</span>
-					</span>
-				</div>
-			</div>
-		{/if}
-	</div>
-
-	<div class="queen-chat__input">
-		<input
-			type="text"
-			bind:value={inputText}
-			onkeydown={handleKeydown}
-			placeholder="Ask Queen Trinity..."
-			disabled={isSending}
-			class="queen-chat__input-field"
-		/>
-		<button
-			onclick={handleSend}
-			disabled={!inputText.trim() || isSending}
-			class="queen-chat__send-button"
-		>
-			Send
-		</button>
-	</div>
+<div class='chat'>
+  <div class='msgs'>
+    {#each $messages as m (m.id)}
+      <div class='row {m.role}'>
+        <div class='bubble'>
+          <p>{m.content}</p>
+          <button class='copy' class:copied={copied===m.id} on:click={()=>copy(m.id,m.content)}>{copied===m.id?'✓':'📋'}</button>
+        </div>
+        <span class='meta'>{m.time}</span>
+      </div>
+    {/each}
+    {#if loading}
+      <div class="row queen">
+        <div class="bubble">
+          <div class="typing"><span></span><span></span><span></span></div>
+        </div>
+      </div>
+    {/if}
+  </div>
+  <div class='input-row'>
+    <input bind:value={input} on:keydown={onKey} placeholder='Ask Queen Trinity...' />
+    <button class="send-btn" disabled={!input.trim() || loading}>Send</button>
+  </div>
 </div>
 
 <style>
-	.queen-chat {
-		display: flex;
-		flex-direction: column;
-		height: 400px;
-		border-bottom: 1px solid var(--border-2);
-	}
+.chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: #111;
+}
 
-	.queen-chat__messages {
-		flex: 1;
-		overflow-y: auto;
-		padding: 12px;
-		display: flex;
-		flex-direction: column;
-	}
+.msgs {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scroll-behavior: smooth;
+}
 
-	.message {
-		display: flex;
-		flex-direction: column;
-		gap: 4px;
-	}
+.msgs::-webkit-scrollbar { width: 4px; }
+.msgs::-webkit-scrollbar-track { background: transparent; }
+.msgs::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 
-	.message--user {
-		align-items: flex-end;
-	}
+.row { display: flex; flex-direction: column; max-width: 85%; }
+.row.user { align-self: flex-end; align-items: flex-end; }
+.row.queen { align-self: flex-start; align-items: flex-start; }
 
-	.message--queen {
-		align-items: flex-start;
-	}
+.bubble {
+  border-radius: 16px;
+  padding: 10px 14px;
+  position: relative;
+}
+.row.user .bubble {
+  background: #e8e8e8;
+  color: #111;
+  border-bottom-right-radius: 4px;
+}
+.row.queen .bubble {
+  background: #1e1e1e;
+  color: #e8e8e8;
+  border: 1px solid #2a2a2a;
+  border-bottom-left-radius: 4px;
+}
 
-	.message-bubble {
-		max-width: 80%;
-		padding: 8px 12px;
-		border-radius: 8px;
-		font-size: 12px;
-		line-height: 1.4;
-	}
+.bubble p {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
-	.message-bubble--user {
-		background: var(--color-purple);
-		color: white;
-	}
+.copy {
+  font-size: 12px;
+  background: transparent;
+  color: #666;
+  border: 1px solid transparent;
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.15s;
+}
+.copy:hover { color: #111; background: rgba(0,0,0,0.1); }
+.copy.copied { color: #22c55e; font-weight: 600; }
+.row.queen .copy { color: #999; border: 1px solid #333; }
+.row.queen .copy:hover { color: #fff; background: #3a3a3a; border-color: #555; }
+.row.queen .copy.copied { color: #22c55e; border-color: #22c55e; background: #22c5522; }
 
-	.message-bubble--queen {
-		background: var(--bg-2);
-		color: var(--text-1);
-	}
+.meta { font-size: 10px; color: #444; margin-top: 3px; padding: 0 2px; }
 
-	.message-content code {
-		background: var(--bg-3);
-		padding: 2px 4px;
-		border-radius: 4px;
-		font-family: var(--font-code);
-		font-size: 11px;
-	}
+.typing { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+.typing span {
+  width: 6px; height: 6px; background: #555; border-radius: 50%;
+  animation: bounce 1.2s infinite;
+}
+.typing span:nth-child(2) { animation-delay: 0.2s; }
+.typing span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes bounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-6px); }
+}
 
-	.copy-button {
-		font-size: 9px;
-		padding: 2px 6px;
-		background: var(--bg-3);
-		border: none;
-		border-radius: 4px;
-		color: var(--text-2);
-		cursor: pointer;
-	}
+.input-row {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid #1e1e1e;
+  background: #111;
+  flex-shrink: 0;
+}
 
-	.copy-button:hover {
-		opacity: 1;
-	}
+.input-row input {
+  flex: 1;
+  background: #1e1e1e;
+  border: 1px solid #2a2a2a;
+  border-radius: 20px;
+  padding: 9px 16px;
+  color: #e8e8e8;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.input-row input:focus { border-color: #444; }
+.input-row input::placeholder { color: #444; }
 
-	.copy-button:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.message-time {
-		font-size: 9px;
-		color: var(--text-3);
-		margin-top: 2px;
-	}
-
-	.loading-dots span {
-		animation: blink 1.4s infinite;
-	}
-
-	@keyframes blink {
-		0%, 80%, 100% { opacity: 0.2; }
-		40% { opacity: 1; }
-	}
-
-	.queen-chat__input {
-		display: flex;
-		gap: 8px;
-		padding: 12px;
-	}
-
-	.queen-chat__input-field {
-		flex: 1;
-		padding: 8px 12px;
-		border: 1px solid var(--border-2);
-		border-radius: 6px;
-		background: var(--bg-1);
-		color: var(--text-1);
-		font-size: 12px;
-	}
-
-	.queen-chat__input-field:focus {
-		outline: 2px solid var(--color-purple);
-	}
-
-	.queen-chat__send-button {
-		padding: 8px 16px;
-		background: var(--color-purple);
-		border: none;
-		border-radius: 6px;
-		color: white;
-		font-size: 12px;
-		cursor: pointer;
-	}
-
-	.queen-chat__send-button:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
+.send-btn {
+  background: #fff;
+  color: #111;
+  border: none;
+  border-radius: 20px;
+  padding: 9px 18px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: opacity 0.15s;
+  flex-shrink: 0;
+}
+.send-btn:hover { opacity: 0.85; }
+.send-btn:disabled { opacity: 0.4; cursor: default; }
 </style>

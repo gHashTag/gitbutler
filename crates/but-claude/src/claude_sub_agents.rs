@@ -10,6 +10,11 @@ pub struct SubAgent {
     description: String,
     tools: Option<Vec<String>>,
     model: Option<String>,
+    /// Agent ID (e.g., "V", "C", "Q27") for Trinity Ring-080
+    /// Deterministic mapping: if not set, derive from filename
+    /// e.g., "agent-v-verdict.md" -> "V"
+    #[serde(rename = "agentId")]
+    agent_id: Option<String>,
 }
 
 pub async fn read_claude_sub_agents(project_path: &Path) -> Vec<SubAgent> {
@@ -67,6 +72,7 @@ async fn read_entry(entry: DirEntry) -> Option<SubAgent> {
         description: "".into(),
         tools: None,
         model: None,
+        agent_id: None,
     };
     for line in string.lines() {
         if !in_frontmatter && line == "---" {
@@ -85,9 +91,33 @@ async fn read_entry(entry: DirEntry) -> Option<SubAgent> {
                     agent.tools = Some(value.split(", ").map(Into::into).collect::<Vec<_>>())
                 }
                 "model" => agent.model = Some(value.into()),
+                "agentId" => {
+                    // Parse agent_id from frontmatter (e.g., "V", "C", "Q27")
+                    agent.agent_id = Some(value.trim().into());
+                }
                 _ => {}
             }
         }
     }
+
+    // Deterministic mapping: derive agent_id from filename if not set
+    if agent.agent_id.is_none() {
+        let os_filename = entry.file_name().to_os_string();
+        let filename = os_filename.to_string_lossy();
+        // Extract agent ID from filename like "agent-v-verdict.md" -> "V"
+        if let Some(caps) = filename.strip_prefix("agent-").and_then(|s: &str| s.strip_suffix("-verdict.md")) {
+            if caps.len() == 1 {
+                let c = caps.chars().next().unwrap_or('?');
+                agent.agent_id = Some(c.to_string());
+            }
+        } else if let Some(caps) = filename.strip_prefix("agent-").and_then(|s: &str| s.strip_suffix(".md")) {
+            // For files like "agent-a.md" -> "A" (without -verdict suffix)
+            if caps.len() == 1 {
+                let c = caps.chars().next().unwrap_or('?');
+                agent.agent_id = Some(c.to_string());
+            }
+        }
+    }
+
     Some(agent)
 }
