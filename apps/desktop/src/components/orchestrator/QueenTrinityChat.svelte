@@ -95,7 +95,7 @@
       <div class='row {m.role}'>
         <div class='bubble'>
           <p>{m.content}</p>
-          <button class='copy' class:copied={copied===m.id} on:click={()=>copy(m.id,m.content)}>{copied===m.id?'✓':'📋'}</button>
+          <button class='copy' class:copied={copied===m.id} onclick={()=>copy(m.id,m.content)}>{copied===m.id?'Copied':'Copy'}</button>
         </div>
         <span class='meta'>{m.time}</span>
       </div>
@@ -109,7 +109,7 @@
     {/if}
   </div>
   <div class='input-row'>
-    <input bind:value={input} on:keydown={onKey} placeholder='Ask Queen Trinity...' />
+    <input bind:value={input} onkeydown={onKey} placeholder='Ask Queen Trinity...' />
     <button class="send-btn" disabled={!input.trim() || loading}>Send</button>
   </div>
 </div>
@@ -145,6 +145,7 @@
   border-radius: 16px;
   padding: 10px 14px;
   position: relative;
+  min-height: 24px;
 }
 .row.user .bubble {
   background: #e8e8e8;
@@ -170,17 +171,18 @@
   font-size: 12px;
   background: transparent;
   color: #666;
-  border: 1px solid transparent;
+  border: 1px solid #333;
   padding: 4px 8px;
   cursor: pointer;
   border-radius: 4px;
   transition: all 0.15s;
+  opacity: 1;
+  pointer-events: auto;
 }
 .copy:hover { color: #111; background: rgba(0,0,0,0.1); }
-.copy.copied { color: #22c55e; font-weight: 600; }
-.row.queen .copy { color: #999; border: 1px solid #333; }
-.row.queen .copy:hover { color: #fff; background: #3a3a3a; border-color: #555; }
-.row.queen .copy.copied { color: #22c55e; border-color: #22c55e; background: #22c5522; }
+.row.queen .copy { color: #999; border: 1px solid #444; opacity: 0.9; }
+.row.queen .copy:hover { color: #fff; background: #3a3a3a; border-color: #666; opacity: 1; }
+.copy.copied { color: #22c55e; border-color: #22c55e; background: #22c55e22; opacity: 1; }
 
 .meta { font-size: 10px; color: #444; margin-top: 3px; padding: 0 2px; }
 
