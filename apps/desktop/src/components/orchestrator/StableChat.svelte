@@ -15,6 +15,8 @@ const AGENT_COLORS: Record<string, string> = {
   Y: '#84cc16', Z: '#6366f1', Q27: '#ffffff'
 }
 
+const AGENTS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'Q27']
+
 type AgentMsg = {
   agent: string
   kind: string
@@ -26,6 +28,7 @@ type AgentMsg = {
 let messages: AgentMsg[] = []
 let unlisten: (() => void) | null = null
 let copiedId: string | null = null
+let filterAgent: string | null = null
 
 onMount(async () => {
   // Test message for development
@@ -33,7 +36,7 @@ onMount(async () => {
     const testMsg: AgentMsg = {
       agent: 'Q',
       kind: 'chat',
-      body: 'Ring-080: Test message. Click 📋 to copy.',
+      body: 'Ring-080: Test message. Click Copy button.',
       ring: 80,
       ts: Math.floor(Date.now() / 1000)
     }
@@ -72,10 +75,55 @@ function copyMsg(msg: AgentMsg) {
 function getAgentColor(agent: string): string {
   return AGENT_COLORS[agent] ?? '#888'
 }
+
+function clearMessages() {
+  messages = []
+}
+
+function setFilter(agent: string | null) {
+  filterAgent = agent
+}
+
+$: filteredMessages = filterAgent
+  ? messages.filter(m => m.agent === filterAgent)
+  : messages
+
+$: agentCounts = AGENTS.reduce((acc, a) => {
+  acc[a] = messages.filter(m => m.agent === a).length
+  return acc
+}, {} as Record<string, number>)
 </script>
 
-<div class="stable-chat">
-  {#each messages as msg (msg.ts)}
+<div class="stable-chat-container">
+  <!-- Sidebar with agents -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <span class="sidebar-title">Agents (27)</span>
+      <span class="filter-status">
+        {filterAgent ? `Filter: ${filterAgent}` : 'All'}
+      </span>
+    </div>
+    <div class="agents-list">
+      {#each AGENTS as agent}
+        <button
+          class="agent-item"
+          class:active={filterAgent === agent}
+          onclick={() => setFilter(filterAgent === agent ? null : agent)}
+          style="border-left: 3px solid {AGENT_COLORS[agent]}"
+        >
+          <span class="agent-name">{agent}</span>
+          <span class="agent-count">{agentCounts[agent] ?? 0}</span>
+        </button>
+      {/each}
+    </div>
+    <button class="clear-btn" onclick={clearMessages}>
+      Clear All
+    </button>
+  </aside>
+
+  <!-- Chat messages -->
+  <div class="stable-chat">
+  {#each filteredMessages as msg (msg.ts)}
     <div class="msg" style="border-left: 3px solid {getAgentColor(msg.agent)}">
       <span class="badge" style="color: {getAgentColor(msg.agent)}">[{msg.agent}]</span>
       {#if msg.ring}<span class="ring">ring-{msg.ring}</span>{/if}
@@ -87,17 +135,19 @@ function getAgentColor(agent: string): string {
         onclick={() => copyMsg(msg)}
         title="Copy message"
       >
-        {copiedId === `${msg.agent}-${msg.ts}` ? '✓' : '📋'}
+        {copiedId === `${msg.agent}-${msg.ts}` ? 'Copied' : 'Copy'}
       </button>
     </div>
   {/each}
 
-  {#if messages.length === 0}
+  {#if filteredMessages.length === 0}
     <div class="empty">
-      <p>Waiting for agent events...</p>
+      <p>{filterAgent ? `No messages from ${filterAgent}` : 'Waiting for agent events...'}</p>
     </div>
   {/if}
+  </div>
 </div>
+
 
 <style>
   .stable-chat {
@@ -191,5 +241,104 @@ function getAgentColor(agent: string): string {
     color: #888;
     text-align: center;
     font-style: italic;
+  }
+
+  .stable-chat-container {
+    display: flex;
+    height: 100%;
+  }
+
+  .sidebar {
+    width: 140px;
+    background: #151515;
+    border-right: 1px solid #2a2a2a;
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+  }
+
+  .sidebar-header {
+    padding: 12px;
+    border-bottom: 1px solid #2a2a2a;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .sidebar-title {
+    font-weight: 600;
+    font-size: 12px;
+    color: #e8e8e8;
+  }
+
+  .filter-status {
+    font-size: 10px;
+    color: #888;
+  }
+
+  .agents-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px;
+  }
+
+  .agents-list::-webkit-scrollbar { width: 4px; }
+  .agents-list::-webkit-scrollbar-track { background: #111; }
+  .agents-list::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+
+  .agent-item {
+    background: #1e1e1e;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 8px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transition: all 0.15s;
+  }
+
+  .agent-item:hover {
+    background: #2a2a2a;
+  }
+
+  .agent-item.active {
+    background: #2a2a2a;
+    box-shadow: 0 0 0 2px rgba(255,255,255,0.1);
+  }
+
+  .agent-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: #e8e8e8;
+  }
+
+  .agent-count {
+    font-size: 10px;
+    color: #666;
+  }
+
+  .clear-btn {
+    margin: 8px;
+    padding: 8px 12px;
+    background: #ef4444;
+    border: none;
+    border-radius: 6px;
+    color: white;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+
+  .clear-btn:hover {
+    opacity: 0.85;
+  }
+
+  .stable-chat {
+    flex: 1;
+    overflow-y: auto;
   }
 </style>
