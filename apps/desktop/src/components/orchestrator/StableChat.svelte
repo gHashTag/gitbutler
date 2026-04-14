@@ -329,7 +329,8 @@ $: agentCounts = AGENTS.reduce((acc, a) => {
   }
 
   .stable-chat {
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 0;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
