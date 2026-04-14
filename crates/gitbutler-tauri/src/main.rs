@@ -248,6 +248,42 @@ fn main() -> anyhow::Result<()> {
                 app_handle.manage(app_settings);
                 app_handle.manage(claude);
 
+                // === TRINITY STABLE WATCHER ===
+                // Start file-based agent event watcher for Ring-080
+                //
+                // NOTE: project_id is not available at initialization time (projects load dynamically).
+                // Using "trinity" as default - the frontend wildcard listener (project://*/stable-agent-event)
+                // will match any project prefix. This can be enhanced later for per-project watchers.
+                {
+                    use std::env;
+                    use but_claude::StableWatcher;
+
+                    let trinity_dir = std::path::PathBuf::from(
+                        env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                    ).join("t27/.trinity/experience");
+
+                    // Create directory if needed
+                    let _ = std::fs::create_dir_all(&trinity_dir);
+
+                    // Default project_id - matches frontend wildcard pattern
+                    let project_id = "trinity".to_string();
+
+                    // Create and spawn the watcher
+                    let stable_watcher = Arc::new(StableWatcher::new(
+                        broadcaster.clone(),
+                        trinity_dir,
+                        project_id,
+                    ));
+
+                    let watcher_clone = stable_watcher.clone();
+                    tokio::spawn(async move {
+                        let _ = watcher_clone.watch().await;
+                    });
+
+                    app_handle.manage(stable_watcher);
+                }
+                // END TRINITY STABLE WATCHER
+
                 // Auto-connect IRC connections based on settings (only when feature flag is on).
                 #[cfg(feature = "irc")]
                 if let Ok(settings) = app_handle.state::<AppSettingsWithDiskSync>().get() {
@@ -470,6 +506,7 @@ fn main() -> anyhow::Result<()> {
                 // Debug-only - not for production!
                 #[cfg(debug_assertions)]
                 env::env_vars,
+                env::read_file_content,
                 claude::claude_send_message,
                 claude::claude_get_messages,
                 claude::claude_cancel_session,
@@ -584,6 +621,13 @@ fn main() -> anyhow::Result<()> {
                     let irc_manager = app_handle.state::<IrcManager>();
                     // Note that we can't use `tauri::async_runtime::block_on`  during shutdown as it panics.
                     irc_manager.shutdown_now();
+                }
+
+                // Shutdown StableWatcher on exit
+                if let tauri::RunEvent::Exit = event {
+                    if let Some(watcher) = app_handle.try_state::<Arc<but_claude::StableWatcher>>() {
+                        watcher.shutdown();
+                    }
                 }
             });
     });

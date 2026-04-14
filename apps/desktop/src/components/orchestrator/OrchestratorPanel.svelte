@@ -1,123 +1,47 @@
-<script lang="ts">
-	import { slide } from 'svelte/transition';
-	import QueenTrinityChat from './QueenTrinityChat.svelte';
-	import OrchestratorRingMap from './OrchestratorRingMap.svelte';
-	import OrchestratorActivityFeed from './OrchestratorActivityFeed.svelte';
-	import RepoFleet from './RepoFleet.svelte';
+<script lang='ts'>
+  import QueenTrinityChat from './QueenTrinityChat.svelte'
+  import StableChat from './StableChat.svelte'
 
-	interface Props {
-		open: boolean;
-		onClose: () => void;
-		projectId: string;
-	}
+  interface Props {
+    isOpen: boolean
+    onClose: () => void
+    projectId?: string
+  }
 
-	const { open, onClose, projectId }: Props = $props();
-
-	let sections = $state({
-		agents: true,
-		repos: true,
-		ringMap: false,
-		activity: true,
-	});
+  const { isOpen, onClose, projectId }: Props = $props()
+  let activeTab = 'chat'
 </script>
 
-{#if open}
-	<aside
-		class="orchestrator-panel"
-		transition:slide={{ axis: 'x', duration: 200 }}
-	>
-		<header class="orchestrator-panel__header">
-			<span class="text-14 text-semibold">Orchestrator</span>
-			<button onclick={onClose} aria-label="Close orchestrator">✕</button>
-		</header>
+<div class='panel' class:open={isOpen}>
+  <div class='header'>
+    <span>Orchestrator</span>
+    <button on:click={onClose}>✕</button>
+  </div>
+  <div class='tabs'>
+    <button class:active={activeTab==='chat'} on:click={()=>activeTab='chat'}>Chat</button>
+    <button class:active={activeTab==='stable'} on:click={()=>activeTab='stable'}>Stable</button>
+    <button class:active={activeTab==='repos'} on:click={()=>activeTab='repos'}>Repos</button>
+    <button class:active={activeTab==='rings'} on:click={()=>activeTab='rings'}>Rings</button>
+    <button class:active={activeTab==='activity'} on:click={()=>activeTab='activity'}>Activity</button>
+  </div>
+  <div class='content'>
+    {#if activeTab === 'chat'}<QueenTrinityChat />{/if}
+    {#if activeTab === 'stable'}<StableChat />{/if}
+    {#if activeTab === 'repos'}<p class='empty'>Repositories — coming soon</p>{/if}
+    {#if activeTab === 'rings'}<p class='empty'>Ring Map (0–31) — coming soon</p>{/if}
+    {#if activeTab === 'activity'}<p class='empty'>No recent activity</p>{/if}
+  </div>
+</div>
 
-		<section class="orchestrator-section">
-			<button class="section-toggle" onclick={() => sections.agents = !sections.agents}>
-				<span class="section-icon">👑</span>
-				Queen Trinity <span class="agent-count-badge">Chat</span>
-			</button>
-			{#if sections.agents}
-				<QueenTrinityChat {projectId} />
-			{/if}
-		</section>
-
-		<section class="orchestrator-section">
-			<button class="section-toggle" onclick={() => sections.repos = !sections.repos}>
-				Repositories
-			</button>
-			{#if sections.repos}
-				<RepoFleet {projectId} />
-			{/if}
-		</section>
-
-		<section class="orchestrator-section">
-			<button class="section-toggle" onclick={() => sections.ringMap = !sections.ringMap}>
-				Ring Map (0–31)
-			</button>
-			{#if sections.ringMap}
-				<OrchestratorRingMap />
-			{/if}
-		</section>
-
-		<section class="orchestrator-section">
-			<button class="section-toggle" onclick={() => sections.activity = !sections.activity}>
-				Activity
-			</button>
-			{#if sections.activity}
-				<OrchestratorActivityFeed {projectId} />
-			{/if}
-		</section>
-	</aside>
-{/if}
-
-<style lang="postcss">
-	.orchestrator-panel {
-		position: fixed;
-		right: 0;
-		top: 0;
-		bottom: 0;
-		width: 320px;
-		background: var(--bg-1);
-		border-left: 1px solid var(--border-2);
-		display: flex;
-		flex-direction: column;
-		overflow-y: auto;
-		z-index: 100;
-	}
-	.orchestrator-panel__header {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		padding: 12px 16px;
-		border-bottom: 1px solid var(--border-2);
-		position: sticky;
-		top: 0;
-		background: var(--bg-1);
-	}
-	.orchestrator-section {
-		border-bottom: 1px solid var(--border-2);
-	}
-	.section-toggle {
-		width: 100%;
-		text-align: left;
-		padding: 10px 16px;
-		font-size: 12px;
-		font-weight: 500;
-		color: var(--text-2);
-		background: none;
-		border: none;
-		cursor: pointer;
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-	}
-	.agent-count-badge {
-		margin-left: auto;
-		font-size: 10px;
-		padding: 2px 6px;
-		border-radius: 4px;
-		background: var(--bg-3);
-		color: var(--text-1);
-		font-weight: 500;
-	}
+<style>
+.panel{position:fixed;top:0;right:0;height:100vh;width:340px;z-index:9999;background:#1a1a1a;border-left:1px solid #2a2a2a;box-shadow:-8px 0 32px rgba(0,0,0,.6);display:flex;flex-direction:column;transform:translateX(100%);transition:transform .25s cubic-bezier(.4,0,.2,1);overflow:hidden}
+.panel.open{transform:translateX(0)}
+.header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid #2a2a2a;font-size:16px;font-weight:700;color:#fff;flex-shrink:0}
+.header button{background:none;border:none;color:#888;font-size:18px;cursor:pointer;padding:4px 8px;border-radius:4px}
+.header button:hover{color:#fff;background:#2a2a2a}
+.tabs{display:flex;border-bottom:1px solid #2a2a2a;flex-shrink:0;flex-wrap:wrap}
+.tabs button{flex:1 0 0 20%;background:none;border:none;color:#666;padding:10px 0;font-size:12px;cursor:pointer;border-bottom:2px solid transparent}
+.tabs button.active{color:#fff;border-bottom-color:#fff}
+.content{flex:1;overflow:hidden;display:flex;flex-direction:column;min-height:0}
+.empty{padding:24px;color:#555;font-size:13px;text-align:center}
 </style>

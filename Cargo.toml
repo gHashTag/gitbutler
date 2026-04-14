@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    # What follows is an attempt at crate classification.
     # Moving them up is the goal here.
     # And of course, this classification isn't truly objective,
     # and you should feel free to make adjustments.
@@ -228,6 +227,7 @@ serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0.148"
 thiserror = "2.0.17"
 tokio = { version = "1.50.0", default-features = false }
+tokio-util = { version = "0.7" }
 keyring = { version = "3.6.3", features = [
     "apple-native",
     "windows-native",

@@ -5,6 +5,8 @@
 	import MainViewport from "$components/views/MainViewport.svelte";
 	import MultiStackView from "$components/views/MultiStackView.svelte";
 	import UnassignedView from "$components/views/UnassignedView.svelte";
+	import OrchestratorPanel from "$components/orchestrator/OrchestratorPanel.svelte";
+	import OrchestratorToggleButton from "$components/orchestrator/OrchestratorToggleButton.svelte";
 	import { FILE_SELECTION_MANAGER } from "$lib/selection/fileSelectionManager.svelte";
 	import { createWorktreeSelection } from "$lib/selection/key";
 	import { UNCOMMITTED_SERVICE } from "$lib/selection/uncommittedService.svelte";
@@ -30,6 +32,8 @@
 	const worktreeSelection = $derived(idSelection.getById(selectionId));
 	const stacksQuery = $derived(stackService.stacks(projectId));
 	const orchestratorOpen = $derived.by(() => uiState.global.orchestratorOpen.current);
+
+	let orchestratorOpenLocal = $state(false);
 
 	const lastAdded = $derived(worktreeSelection.lastAdded);
 	const previewOpen = $derived(!!$lastAdded?.key);
@@ -96,5 +100,16 @@
 				<MultiStackView {projectId} {stacks} {selectionId} {scrollToStackId} {onScrollComplete} />
 			{/snippet}
 		</ReduxResult>
+	{/snippet}
+	{#snippet right()}
+		<OrchestratorToggleButton
+			isOpen={orchestratorOpenLocal}
+			onClick={() => orchestratorOpenLocal = !orchestratorOpenLocal}
+		/>
+		<OrchestratorPanel
+			isOpen={orchestratorOpenLocal}
+			onClose={() => orchestratorOpenLocal = false}
+			{projectId}
+		/>
 	{/snippet}
 </MainViewport>
