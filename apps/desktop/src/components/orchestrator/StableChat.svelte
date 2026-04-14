@@ -135,7 +135,7 @@ $: agentCounts = AGENTS.reduce((acc, a) => {
         onclick={() => copyMsg(msg)}
         title="Copy message"
       >
-        {copiedId === `${msg.agent}-${msg.ts}` ? 'Copied' : 'Copy'}
+        {copiedId === `${msg.agent}-${msg.ts}` ? '✓' : '📋'}
       </button>
     </div>
   {/each}
@@ -150,15 +150,6 @@ $: agentCounts = AGENTS.reduce((acc, a) => {
 
 
 <style>
-  .stable-chat {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    font-size: 13px;
-    padding: 12px;
-  }
-
   .msg {
     display: flex;
     align-items: center;
@@ -340,5 +331,11 @@ $: agentCounts = AGENTS.reduce((acc, a) => {
   .stable-chat {
     flex: 1;
     overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    padding: 12px;
   }
 </style>
