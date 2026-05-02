@@ -1,43 +1,49 @@
-//! Discard a commit from the graph.
+//! Discard commits from the graph.
 
-pub(crate) mod function {
-    use anyhow::bail;
-    use but_core::RefMetadata;
-    use but_rebase::graph_rebase::{
-        Editor, Step, SuccessfulRebase, ToCommitSelector,
-        mutate::{SegmentDelimiter, SelectorSet},
-    };
+use anyhow::bail;
+use but_core::RefMetadata;
+use but_rebase::graph_rebase::{
+    Editor, Step, SuccessfulRebase,
+    mutate::{SegmentDelimiter, SelectorSet},
+};
 
-    /// Discard a commit by removing it from history and reconnecting all its
-    /// parents to all of its children.
-    ///
-    /// `subject_commit` - The selector of the commit to discard.
-    ///
-    /// Returns the rebase result.
-    pub fn discard_commit<'ws, 'meta, M: RefMetadata>(
-        mut editor: Editor<'ws, 'meta, M>,
-        subject_commit: impl ToCommitSelector,
-    ) -> anyhow::Result<SuccessfulRebase<'ws, 'meta, M>> {
-        let (subject_commit_selector, subject_commit) =
-            editor.find_selectable_commit(subject_commit)?;
+/// Discard one or more commits in a single rebase operation.
+///
+/// Each commit is removed from history and its parents are reconnected to its
+/// children. All removals share a single editor session so only one rebase
+/// is performed. Duplicate commit IDs are silently deduplicated.
+pub fn discard_commits<'ws, 'meta, M: RefMetadata>(
+    mut editor: Editor<'ws, 'meta, M>,
+    subject_commits: impl IntoIterator<Item = gix::ObjectId>,
+) -> anyhow::Result<SuccessfulRebase<'ws, 'meta, M>> {
+    let mut seen = gix::hashtable::HashSet::default();
+    let mut count = 0usize;
+    for commit_id in subject_commits {
+        if !seen.insert(commit_id) {
+            continue;
+        }
+        count += 1;
+        let (selector, commit) = editor.find_selectable_commit(commit_id)?;
 
-        if subject_commit.clone().attach(editor.repo()).is_conflicted() {
-            bail!("Cannot discard a conflicted commit")
+        if commit.clone().attach(editor.repo()).is_conflicted() {
+            bail!(
+                "Cannot discard conflicted commit {}",
+                commit_id.to_hex_with_len(7)
+            )
         }
 
-        let commit_delimiter = SegmentDelimiter {
-            child: subject_commit_selector,
-            parent: subject_commit_selector,
+        let delimiter = SegmentDelimiter {
+            child: selector,
+            parent: selector,
         };
 
-        editor.disconnect_segment_from(
-            commit_delimiter,
-            SelectorSet::All,
-            SelectorSet::All,
-            false,
-        )?;
-
-        editor.replace(subject_commit_selector, Step::None)?;
-        editor.rebase()
+        editor.disconnect_segment_from(delimiter, SelectorSet::All, SelectorSet::All, false)?;
+        editor.replace(selector, Step::None)?;
     }
+
+    if count == 0 {
+        bail!("no commit IDs provided for discard");
+    }
+
+    editor.rebase()
 }

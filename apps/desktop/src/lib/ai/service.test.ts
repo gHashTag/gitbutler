@@ -28,7 +28,7 @@ import { HttpClient } from "@gitbutler/shared/network/httpClient";
 import { expect, test, describe, vi } from "vitest";
 import type { SecretsService } from "$lib/secrets/secretsService";
 import type { AppDispatch } from "$lib/state/clientState.svelte";
-import type { GitConfigSettings } from "@gitbutler/core/api";
+import type { GitConfigSettings } from "@gitbutler/but-sdk";
 
 const defaultGitConfig = Object.freeze({
 	[GitAIConfigKey.ModelProvider]: ModelKind.OpenAI,
@@ -41,6 +41,7 @@ const defaultGitConfig = Object.freeze({
 const defaultSecretsConfig = Object.freeze({
 	[AISecretHandle.AnthropicKey]: undefined,
 	[AISecretHandle.OpenAIKey]: undefined,
+	[AISecretHandle.OpenRouterKey]: undefined,
 });
 
 class DummyGitConfigService extends GitConfigService {
@@ -244,6 +245,38 @@ describe("AIService", () => {
 				new Error(
 					"When using Anthropic in a bring your own key configuration, you must provide a valid token",
 				),
+			);
+		});
+
+		test("When ai provider is OpenRouter, When an API key is present. It returns OpenAIClient", async () => {
+			const gitConfig = new DummyGitConfigService({
+				...defaultGitConfig,
+				[GitAIConfigKey.ModelProvider]: ModelKind.OpenRouter,
+			});
+			const secretsService = new DummySecretsService({
+				[AISecretHandle.OpenRouterKey]: "sk-or-test-key",
+			});
+			const tokenMemoryService = new TokenMemoryService();
+			const fetchMock = vi.fn();
+			const cloud = new HttpClient(fetchMock, "https://www.example.com", tokenMemoryService.token);
+			const aiService = new AIService(gitConfig, secretsService, cloud, tokenMemoryService);
+
+			expect(await aiService.buildClient()).toBeInstanceOf(OpenAIClient);
+		});
+
+		test("When ai provider is OpenRouter, When an API key is blank. It throws an error", async () => {
+			const gitConfig = new DummyGitConfigService({
+				...defaultGitConfig,
+				[GitAIConfigKey.ModelProvider]: ModelKind.OpenRouter,
+			});
+			const secretsService = new DummySecretsService();
+			const tokenMemoryService = new TokenMemoryService();
+			const fetchMock = vi.fn();
+			const cloud = new HttpClient(fetchMock, "https://www.example.com", tokenMemoryService.token);
+			const aiService = new AIService(gitConfig, secretsService, cloud, tokenMemoryService);
+
+			await expect(aiService.buildClient.bind(aiService)).rejects.toThrowError(
+				new Error("When using OpenRouter, you must provide a valid API key"),
 			);
 		});
 	});

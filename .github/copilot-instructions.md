@@ -9,8 +9,7 @@ They are:
 
 The backend of the Tauri application is found in the `crates` directory.
 It contains different rust packages, with `gitbutler-tauri` for the tauri application,
-and `but-api` for implementing various command-line utilities like `but-testing`
-and `but`.
+and `but-api` for implementing various command-line utilities like `but`.
 
 The `packages` directory contains different self-contained npm packages.
 These are shared between the `desktop` and `web` applications.
@@ -226,8 +225,7 @@ Located in `.github/workflows/`:
 
 - `push.yaml`: Main CI for linting, building, and testing on push
 - `publish.yaml`: Release builds for different platforms
-- `test-e2e-playwright.yml`: E2E tests with Playwright
-- `test-e2e-blackbox.yml`: E2E blackbox tests
+- `test-e2e.yml`: E2E tests (Playwright and blackbox)
 - `test-client-fe-integration.yml`: Frontend integration tests
 
 ### Pre-commit Checks
@@ -337,3 +335,4 @@ corepack prepare pnpm@10.17.0 --activate
 9. **Security**: Check dependencies for vulnerabilities before adding them
 10. **Code marked for refactoring**: Be extra careful with crates in the "Code Hitlist" section
 11. **but CLI happy path testing only**: CLI tests are expensive and should be limited to what really matters.
+12. **COMMIT IMMEDIATELY** — after ANY successful build/test, git add + commit before proceeding. NEVER git reset without prior commit.

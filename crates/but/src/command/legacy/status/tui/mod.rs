@@ -1,93 +1,100 @@
+#![allow(clippy::type_complexity)]
+
 use std::{
     borrow::Cow,
-    cell::RefCell,
     ffi::OsString,
-    iter::once,
     process::Command,
     rc::Rc,
-    sync::{Arc, LazyLock, mpsc::Receiver},
-    time::Duration,
+    sync::{Arc, mpsc::Receiver},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
-use bstr::ByteSlice;
+use bstr::{BString, ByteSlice};
+use but_api::diff::ComputeLineStats;
 use but_core::tree::create_tree::RejectionReason;
 use but_ctx::Context;
 use but_rebase::graph_rebase::mutate::InsertSide;
+use but_workspace::commit::squash_commits::MessageCombinationStrategy;
 use crossterm::event::{self, Event, KeyCode, KeyEvent};
 use gitbutler_operating_modes::OperatingMode;
 use gitbutler_stack::StackId;
-use itertools::Either;
-use ratatui::{
-    Frame,
-    palette::Hsl,
-    prelude::*,
-    widgets::{Block, BorderType, Borders, List, ListItem},
-};
+use gix::refs::FullName;
+use nonempty::NonEmpty;
+use ratatui::prelude::*;
 use ratatui_textarea::{CursorMove, TextArea};
 use tracing::Level;
-use unicode_width::UnicodeWidthStr;
 
 use crate::{
     CliId,
-    args::OutputFormat,
     command::legacy::{
-        rub::{self, RubOperation},
+        reword::get_branch_name_from_editor,
+        rub::RubOperationDiscriminants,
         status::{
-            CommitLineContent, FileLineContent, StatusFlags, StatusOutputLine, TuiLaunchOptions,
-            output::BranchLineContent,
+            StatusFlags, StatusOutputLine, TuiLaunchOptions,
             tui::{
+                branch_picker::{BranchPicker, BranchPickerMessage},
                 confirm::{Confirm, ConfirmMessage},
                 cursor::{Cursor, is_selectable_in_mode},
-                details::{Details, DetailsMessage, DetailsVisibility, RenderNextChunkResult},
+                details::{Details, DetailsMessage, RenderNextChunkResult},
                 event_polling::{CrosstermEventPolling, EventPolling, NoopEventPolling},
                 fps::FpsCounter,
-                graph_extension::{ExtensionDirection, extend_connector_spans},
-                highlight::{Highlights, with_highlight},
-                key_bind::{KeyBinds, confirm_key_binds, default_key_binds},
+                help::{Help, HelpMessage},
+                highlight::Highlights,
+                key_bind::{
+                    KeyBinds, branch_picker_key_binds, confirm_key_binds, default_key_binds,
+                    help_key_binds,
+                },
                 message_on_drop::MessageOnDrop,
                 mode::{
-                    CommandMode, CommitMode, CommitSource, InlineRewordMode, Mode, MoveMode,
-                    MoveSource, RubMode, RubSource,
+                    CommandMode, CommandModeKind, CommitMessageComposer, CommitMode, CommitSource,
+                    InlineRewordMode, Mode, ModeDiscriminant, MoveMode, MoveSource, RubMode,
+                    RubSource, StackCommitSource, UnassignedCommitSource,
                 },
+                operations::stack_has_assigned_changes,
                 toast::{ToastKind, Toasts},
             },
         },
     },
+    id::UNASSIGNED,
+    theme::Theme,
     tui::{CrosstermTerminalGuard, HeadlessTerminalGuard, TerminalGuard},
     utils::{DebugAsType, OutputChannel, binary_path::current_exe_for_but_exec},
 };
 
-use super::{
-    FilesStatusFlag,
-    output::{StatusOutputContent, StatusOutputLineData},
-};
+use super::{FilesStatusFlag, output::StatusOutputLineData};
 
+use render::{details_viewport, ensure_cursor_visible, render_app, status_viewport_height};
+
+mod branch_picker;
 mod confirm;
 mod cursor;
 mod details;
 mod event_polling;
 mod fps;
 mod graph_extension;
+mod help;
 mod highlight;
 mod key_bind;
 mod message_on_drop;
 mod mode;
 mod operations;
-mod rub_api;
+mod render;
+mod rub;
 mod rub_from_detail_view;
 mod toast;
 
 #[cfg(test)]
 mod tests;
 
-static CURSOR_BG: LazyLock<Color> = LazyLock::new(|| Color::Rgb(69, 71, 90));
-
-static DETAILS_CURSOR_BG: LazyLock<Color> =
-    LazyLock::new(|| Color::from_hsl(Hsl::new(236.8, 0.162, 0.229)));
-
 const NOOP: &str = "noop";
 const CURSOR_CONTEXT_ROWS: usize = 3;
+
+/// How much does the detail area grow/shrink with when adjusted
+const DETAILS_SIZE_ADJUSTMENT_PERCENTAGE: u16 = 5;
+
+const DETAILS_MIN_SIZE_PERCENTAGE: u16 = 30;
+const DETAILS_MAX_SIZE_PERCENTAGE: u16 = 90;
 
 pub(super) async fn render_tui(
     ctx: &mut Context,
@@ -155,6 +162,8 @@ where
     anyhow::Error: From<<T::Backend as Backend>::Error>,
     E: EventPolling + Copy,
 {
+    render(app, terminal_guard)?;
+
     loop {
         if app
             .options
@@ -243,7 +252,13 @@ where
     };
     // poll terminal events
     for event in event_polling.poll(event_poll_timeout)? {
-        event_to_messages(event, app.active_key_binds(), &app.mode, messages);
+        event_to_messages(
+            event,
+            app.active_key_binds(),
+            &app.mode,
+            app.branch_picker.as_ref(),
+            messages,
+        );
     }
 
     // check for any out of band messages
@@ -260,12 +275,21 @@ where
         });
 
     // handle messages
+    let mut did_reload = false;
     messages.append(&mut app.delayed_messages);
     loop {
         if messages.is_empty() {
             break;
         }
         for msg in messages.drain(..) {
+            if matches!(msg, Message::Reload(_)) {
+                if did_reload && cfg!(feature = "tui-profiling") && !cfg!(test) {
+                    app.toasts
+                        .insert(ToastKind::Error, "Double reload".to_owned());
+                } else {
+                    did_reload = true;
+                }
+            }
             app.handle_message(ctx, out, mode, terminal_guard, other_messages, msg)
                 .await;
         }
@@ -319,7 +343,7 @@ where
         let _span = tracing::trace_span!("render").entered();
         terminal_guard.terminal_mut().draw(|frame| {
             app.renders += 1;
-            app.render(frame)
+            render_app(app, frame)
         })?;
     }
 
@@ -337,6 +361,8 @@ struct App {
     mode: Mode,
     key_binds: KeyBinds,
     confirm_key_binds: KeyBinds,
+    branch_picker_key_binds: KeyBinds,
+    help_key_binds: KeyBinds,
     toasts: Toasts,
     renders: u64,
     updates: u64,
@@ -348,6 +374,10 @@ struct App {
     incoming_out_of_band_messages: Vec<Rc<Receiver<Message>>>,
     fps: FpsCounter,
     to_be_discarded: Option<Arc<CliId>>,
+    status_width_percentage: u16,
+    branch_picker: Option<BranchPicker>,
+    theme: &'static Theme,
+    help: Option<Help>,
 }
 
 impl App {
@@ -363,10 +393,12 @@ impl App {
             Cursor::new(&status_lines)
         };
 
+        let theme = crate::theme::get();
+
         let details = if options.show_diff {
-            Details::new_visible()
+            Details::new_visible(theme)
         } else {
-            Details::new_hidden()
+            Details::new_hidden(theme)
         };
 
         Self {
@@ -377,8 +409,11 @@ impl App {
             should_quit: false,
             should_render: true,
             mode: Mode::default(),
+            help: None,
             key_binds: default_key_binds(),
             confirm_key_binds: confirm_key_binds(),
+            branch_picker_key_binds: branch_picker_key_binds(),
+            help_key_binds: help_key_binds(),
             toasts: Default::default(),
             renders: 0,
             updates: 0,
@@ -386,107 +421,26 @@ impl App {
             delayed_messages: Default::default(),
             incoming_out_of_band_messages: Default::default(),
             to_be_discarded: Default::default(),
+            branch_picker: Default::default(),
             fps: FpsCounter::new(),
             confirm: None,
             details,
             options,
+            status_width_percentage: 50,
+            theme,
         }
     }
 
     fn active_key_binds(&self) -> &KeyBinds {
         if self.confirm.is_some() {
             &self.confirm_key_binds
+        } else if self.branch_picker.is_some() {
+            &self.branch_picker_key_binds
+        } else if self.help.is_some() {
+            &self.help_key_binds
         } else {
             &self.key_binds
         }
-    }
-
-    fn status_content_area(&self, terminal_area: Rect) -> Rect {
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(terminal_area)[0]
-    }
-
-    fn details_viewport(&self, terminal_area: Rect) -> Rect {
-        let content_area = self.status_content_area(terminal_area);
-        self.status_layout(content_area)
-            .details_area
-            .unwrap_or(content_area)
-    }
-
-    /// Returns the number of terminal rows available for rendering the status list.
-    fn status_viewport_height(&self, terminal_area: Rect) -> usize {
-        let content_area = self.status_content_area(terminal_area);
-        let status_area = self.status_layout(content_area).status_area;
-
-        // The status pane uses a bottom border, so the inner list viewport is one row shorter
-        // than the outer area.
-        usize::from(status_area.height.saturating_sub(1)).max(1)
-    }
-
-    /// Returns the rendered height in terminal rows for the given status line.
-    fn rendered_height_for_status_line(&self, line_idx: usize) -> usize {
-        self.status_lines
-            .get(line_idx)
-            .map(|line| {
-                self.render_status_list_item(line, self.cursor.index() == line_idx)
-                    .into_iter()
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
-    /// Returns the total rendered height of the entire status list.
-    fn total_rendered_height(&self) -> usize {
-        (0..self.status_lines.len())
-            .map(|idx| self.rendered_height_for_status_line(idx))
-            .sum()
-    }
-
-    /// Returns the rendered row range occupied by the selected line.
-    fn selected_row_range(&self) -> Option<std::ops::Range<usize>> {
-        let selected_idx = self.cursor.index();
-        let selected_line = self.status_lines.get(selected_idx)?;
-        let start = (0..selected_idx)
-            .map(|idx| self.rendered_height_for_status_line(idx))
-            .sum();
-        let len = self
-            .render_status_list_item(selected_line, true)
-            .into_iter()
-            .count();
-        Some(start..start.saturating_add(len))
-    }
-
-    /// Clamps the topmost visible rendered row to the available content height.
-    fn clamp_scroll_top(&mut self, visible_height: usize) {
-        let max_scroll_top = self.total_rendered_height().saturating_sub(visible_height);
-        self.scroll_top = self.scroll_top.min(max_scroll_top);
-    }
-
-    /// Adjusts the viewport so the selected line stays visible with context rows above and below
-    /// whenever possible.
-    fn ensure_cursor_visible(&mut self, visible_height: usize) {
-        self.clamp_scroll_top(visible_height);
-
-        let Some(selected_rows) = self.selected_row_range() else {
-            return;
-        };
-
-        let selected_height = selected_rows.end.saturating_sub(selected_rows.start);
-        let context_rows =
-            CURSOR_CONTEXT_ROWS.min(visible_height.saturating_sub(selected_height) / 2);
-
-        let min_scroll_top = selected_rows
-            .end
-            .saturating_add(context_rows)
-            .saturating_sub(visible_height);
-        let max_scroll_top = selected_rows.start.saturating_sub(context_rows);
-
-        if self.scroll_top < min_scroll_top {
-            self.scroll_top = min_scroll_top;
-        } else if self.scroll_top > max_scroll_top {
-            self.scroll_top = max_scroll_top;
-        }
-
-        self.clamp_scroll_top(visible_height);
     }
 
     #[tracing::instrument(level = Level::TRACE, skip(self, ctx, out, mode, terminal_guard, messages))]
@@ -523,9 +477,12 @@ impl App {
         T: TerminalGuard,
         anyhow::Error: From<<T::Backend as Backend>::Error>,
     {
+        let start = Instant::now();
+        let discriminant = MessageDiscriminant::from(&msg);
+
         self.should_render = true;
         let terminal_area: Rect = terminal_guard.terminal_mut().size()?.into();
-        let visible_height = self.status_viewport_height(terminal_area);
+        let visible_height = status_viewport_height(self, terminal_area);
 
         if self.details.needs_update_after_message(&msg) {
             self.details.mark_dirty();
@@ -570,21 +527,63 @@ impl App {
                     self.cursor = new_cursor;
                 }
             }
-            Message::Rub(rub_message) => match rub_message {
-                RubMessage::Start { using_but_api } => {
-                    if using_but_api {
-                        self.handle_start_rub_using_but_api()
+            Message::SelectBranch(branch_name) => {
+                if let Some(new_cursor) =
+                    Cursor::select_branch(&branch_name.shorten().to_str_lossy(), &self.status_lines)
+                {
+                    self.cursor = if matches!(self.mode, Mode::Rub(_)) {
+                        new_cursor
+                            .move_down(&self.status_lines, &self.mode, self.flags.show_files)
+                            .unwrap_or(new_cursor)
                     } else {
-                        self.handle_start_rub()
-                    }
+                        new_cursor
+                    };
                 }
+            }
+            Message::SelectUnassigned => {
+                let new_cursor = Cursor::new(&self.status_lines);
+                if let Some(unassigned_line) = new_cursor.selected_line(&self.status_lines)
+                    && cursor::is_selectable_in_mode(
+                        unassigned_line,
+                        &self.mode,
+                        self.flags.show_files,
+                    )
+                {
+                    self.cursor = new_cursor;
+                }
+            }
+            Message::SelectMergeBase => {
+                let Some(new_cursor) = Cursor::select_merge_base(&self.status_lines) else {
+                    return Ok(());
+                };
+                if let Some(merge_base_line) = new_cursor.selected_line(&self.status_lines)
+                    && cursor::is_selectable_in_mode(
+                        merge_base_line,
+                        &self.mode,
+                        self.flags.show_files,
+                    )
+                {
+                    self.cursor = new_cursor;
+                }
+            }
+            Message::Rub(rub_message) => match rub_message {
+                RubMessage::Start => self.handle_rub_start(),
                 RubMessage::StartWithSource {
                     source,
                     unlock_details,
                 } => {
-                    self.handle_start_rub_with_source(source, unlock_details);
+                    self.handle_rub_start_with_source(source, unlock_details);
                 }
-                RubMessage::Confirm => self.handle_confirm_rub(ctx, messages)?,
+                RubMessage::StartReverse => {
+                    self.handle_rub_start_reverse(ctx)?;
+                }
+                RubMessage::Confirm => self.handle_rub_confirm(ctx, messages)?,
+                RubMessage::UseTargetMessage => {
+                    self.handle_rub_use_target_message();
+                }
+                RubMessage::UseSourceMessage => {
+                    self.handle_rub_use_source_message();
+                }
             },
             Message::EnterNormalMode => {
                 self.handle_enter_normal_mode(messages);
@@ -597,10 +596,10 @@ impl App {
             }
             Message::Files(files_message) => match files_message {
                 FilesMessage::ToggleGlobalFilesList => {
-                    self.handle_toggle_global_files_list(messages)
+                    self.handle_files_toggle_global_files_list(messages)
                 }
                 FilesMessage::ToggleFilesForCommit => {
-                    self.handle_toggle_files_for_commit(ctx, messages)?
+                    self.handle_files_toggle_files_for_commit(ctx, messages)?
                 }
             },
             Message::Reload(select_after_reload) => {
@@ -609,45 +608,38 @@ impl App {
             }
             Message::ShowError(err) => self.handle_show_error(err, messages),
             Message::Commit(commit_message) => match commit_message {
-                CommitMessage::CreateEmpty => self.handle_create_empty_commit(ctx, messages)?,
-                CommitMessage::Start => self.handle_commit_start(ctx),
-                CommitMessage::Confirm { with_message } => {
-                    self.handle_commit_confirm(ctx, messages, with_message)?
-                }
-                CommitMessage::SetInsertSide(insert_side) => {
-                    self.handle_commit_set_insert_side(insert_side);
+                CommitMessage::CreateEmpty => self.handle_commit_create_empty(ctx, messages)?,
+                CommitMessage::Start => self.handle_commit_start(ctx)?,
+                CommitMessage::Confirm => self.handle_commit_confirm(ctx, messages)?,
+                CommitMessage::ToggleMessageComposer(composer) => {
+                    self.handle_commit_toggle_message_composer(composer);
                 }
             },
             Message::Reword(reword_message) => match reword_message {
                 RewordMessage::WithEditor => {
                     self.handle_reword_with_editor(ctx, terminal_guard, messages)?;
                 }
-                RewordMessage::InlineStart => self.handle_start_reword_inline(ctx, messages)?,
+                RewordMessage::InlineStart => self.handle_reword_inline_start(ctx, messages)?,
                 RewordMessage::InlineInput(ev) => self.handle_reword_inline_input(ev),
-                RewordMessage::InlineConfirm => self.handle_confirm_inline_reword(ctx, messages)?,
+                RewordMessage::InlineConfirm => self.handle_reword_inline_confirm(ctx, messages)?,
+                RewordMessage::OpenEditor => {
+                    self.handle_reword_open_editor(ctx, terminal_guard, messages)?;
+                }
             },
             Message::Command(command_message) => match command_message {
-                CommandMessage::Start => self.handle_enter_command_mode(),
+                CommandMessage::Start(kind) => self.handle_command_start(kind),
                 CommandMessage::Input(ev) => self.handle_command_input(ev),
                 CommandMessage::Confirm => {
-                    self.handle_run_command(terminal_guard, out, messages)?
+                    self.handle_command_confirm(terminal_guard, out, messages)?
                 }
             },
             Message::Move(move_message) => match move_message {
-                MoveMessage::Start => self.handle_move_start_message(),
-                MoveMessage::SetInsertSide(insert_side) => {
-                    self.handle_move_set_insert_side(insert_side)
-                }
+                MoveMessage::Start => self.handle_move_start(),
                 MoveMessage::Confirm => self.handle_move_confirm(ctx, messages)?,
             },
-            Message::Branch(branch_message) => match branch_message {
-                BranchMessage::Start => {
-                    self.handle_start_branch_mode(messages);
-                }
-                BranchMessage::New => {
-                    self.handle_create_new_branch(ctx, messages)?;
-                }
-            },
+            Message::NewBranch => {
+                self.handle_new_branch(ctx, messages)?;
+            }
             Message::CopySelection => {
                 self.handle_copy_selection()?;
             }
@@ -658,19 +650,37 @@ impl App {
                 self.confirm = self
                     .confirm
                     .take()
-                    .and_then(|confirm| confirm.handle_message(confirm_message, messages));
+                    .and_then(|confirm| {
+                        confirm
+                            .handle_message(confirm_message, ctx, messages)
+                            .transpose()
+                    })
+                    .transpose()?;
             }
-            Message::RunAfterConfirmation(f) => {
-                if let Some(f) = f.0.try_borrow_mut().ok().and_then(|mut f| f.take()) {
-                    (f)(self, ctx, messages)?;
-                }
+            Message::BranchPicker(branch_picker_message) => {
+                self.branch_picker = self
+                    .branch_picker
+                    .take()
+                    .and_then(|branch_picker| {
+                        branch_picker
+                            .handle_message(branch_picker_message, messages)
+                            .transpose()
+                    })
+                    .transpose()?;
+            }
+            Message::Help(help_message) => {
+                self.help = self
+                    .help
+                    .take()
+                    .and_then(|help| help.handle_message(help_message, terminal_area).transpose())
+                    .transpose()?;
             }
             Message::Details(details_message) => {
-                let details_viewport = self.details_viewport(terminal_area);
+                let details_viewport = details_viewport(self, terminal_area);
                 self.details
                     .try_handle_message(details_message, details_viewport, messages)?;
             }
-            Message::RegisterMessageOnDrop(rx) => {
+            Message::RegisterOutOfBandMessage(rx) => {
                 self.incoming_out_of_band_messages.push(rx);
             }
             Message::WithOneFrameDelay(msg) => {
@@ -688,9 +698,49 @@ impl App {
                 Box::pin(self.try_handle_message(ctx, out, mode, terminal_guard, messages, *rhs))
                     .await?;
             }
+            Message::Debug(text) => {
+                messages.push(Message::ShowToast {
+                    kind: ToastKind::Debug,
+                    text: text.to_owned(),
+                });
+            }
+            Message::GrowDetails => {
+                self.update_status_width_percentage(
+                    self.status_width_percentage
+                        .saturating_sub(DETAILS_SIZE_ADJUSTMENT_PERCENTAGE),
+                    terminal_area,
+                );
+            }
+            Message::ShrinkDetails => {
+                self.update_status_width_percentage(
+                    self.status_width_percentage
+                        .saturating_add(DETAILS_SIZE_ADJUSTMENT_PERCENTAGE),
+                    terminal_area,
+                );
+            }
+            Message::PickAndGotoBranch => {
+                self.handle_pick_and_goto_branch(ctx)?;
+            }
+            Message::ToggleHelp => {
+                self.handle_toggle_help();
+            }
         }
 
-        self.ensure_cursor_visible(visible_height);
+        ensure_cursor_visible(self, visible_height);
+
+        if cfg!(feature = "tui-profiling") && !cfg!(test) {
+            let elapsed_ms = start.elapsed().as_millis();
+            if !matches!(
+                discriminant,
+                MessageDiscriminant::Reload | MessageDiscriminant::Command
+            ) && elapsed_ms > 60
+            {
+                self.toasts.insert(
+                    ToastKind::Debug,
+                    format!("Slow message: {discriminant:?} {elapsed_ms:?} ms"),
+                );
+            }
+        }
 
         Ok(())
     }
@@ -761,47 +811,58 @@ impl App {
         }
     }
 
-    /// Handles transitioning into rub mode and selecting a valid rub target.
-    fn handle_start_rub(&mut self) {
-        if !matches!(self.mode, Mode::Normal) {
-            return;
-        }
-
+    fn handle_rub_start(&mut self) {
         let Some(selected_line) = self.cursor.selected_line(&self.status_lines) else {
             return;
         };
-
         let Some(cli_id) = selected_line.data.cli_id() else {
             return;
         };
-
-        self.handle_start_rub_with_source(RubSource::CliId(Arc::clone(cli_id)), None);
+        self.handle_rub_start_with_source(RubSource::CliId(Arc::clone(cli_id)), None);
     }
 
-    fn handle_start_rub_with_source(
-        &mut self,
-        source: RubSource,
-        unlock_details: Option<MessageOnDrop>,
-    ) {
-        let available_targets = self
-            .status_lines
+    fn available_targets_for_rub_mode(&self, source: &RubSource) -> Vec<Arc<CliId>> {
+        self.status_lines
             .iter()
             .filter_map(|line| line.data.cli_id())
             .filter(|target| {
-                source == ***target
+                *source == ***target
                     || match &source {
-                        RubSource::CliId(source) => rub::route_operation(source, target).is_some(),
+                        RubSource::CliId(source) => rub::route_operation(
+                            source,
+                            target,
+                            MessageCombinationStrategy::KeepBoth,
+                        )
+                        .is_some(),
                         RubSource::CommittedHunk(hunk) => {
                             rub_from_detail_view::route_operation(hunk, target).is_some()
                         }
                     }
             })
             .cloned()
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+    }
+
+    fn handle_rub_start_with_source(
+        &mut self,
+        source: RubSource,
+        unlock_details: Option<MessageOnDrop>,
+    ) {
+        match &source {
+            RubSource::CliId(cli_id) => {
+                if !rub::supports_rubbing(cli_id) {
+                    return;
+                }
+            }
+            RubSource::CommittedHunk(..) => {}
+        }
+
+        let available_targets = self.available_targets_for_rub_mode(&source);
 
         self.mode = Mode::Rub(RubMode {
             source,
             available_targets,
+            how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
             _unlock_details: unlock_details,
         });
 
@@ -828,58 +889,64 @@ impl App {
         }
     }
 
-    fn handle_start_rub_using_but_api(&mut self) {
-        if !matches!(self.mode, Mode::Normal) {
-            return;
-        }
-
-        let Some(selected_line) = self.cursor.selected_line(&self.status_lines) else {
-            return;
+    fn handle_rub_start_reverse(&mut self, ctx: &mut Context) -> anyhow::Result<()> {
+        let Some(selection) = self
+            .cursor
+            .selected_line(&self.status_lines)
+            .and_then(|line| line.data.cli_id())
+        else {
+            return Ok(());
         };
 
-        let Some(cli_id) = selected_line.data.cli_id() else {
-            return;
+        let CliId::Commit { commit_id, .. } = &**selection else {
+            return Ok(());
         };
 
-        let available_targets = self
-            .status_lines
-            .iter()
-            .filter_map(|line| line.data.cli_id())
-            .filter(|target| *target == cli_id || rub::route_operation(cli_id, target).is_some())
-            .cloned()
-            .collect::<Vec<_>>();
+        let stack_id = {
+            let (_guard, _, ws, _) = ctx.workspace_and_db()?;
+            ws.find_commit_and_containers(*commit_id)
+                .and_then(|(stack, _, _)| stack.id)
+        };
 
-        self.mode = Mode::RubButApi(RubMode {
-            source: RubSource::CliId(Arc::clone(cli_id)),
+        let source = if let Some(stack_id) = stack_id
+            && operations::stack_has_assigned_changes(ctx, stack_id)?
+            && let Some(id) = self
+                .status_lines
+                .iter()
+                .filter_map(|line| line.data.cli_id())
+                .find_map(|id| {
+                    if let CliId::Stack { id, stack_id: sid } = &**id
+                        && *sid == stack_id
+                    {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                }) {
+            RubSource::CliId(Arc::new(CliId::Stack {
+                id: id.to_owned(),
+                stack_id,
+            }))
+        } else {
+            RubSource::CliId(Arc::new(CliId::Unassigned {
+                id: UNASSIGNED.to_owned(),
+            }))
+        };
+
+        let available_targets = self.available_targets_for_rub_mode(&source);
+
+        self.mode = Mode::Rub(RubMode {
+            source,
             available_targets,
+            how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
             _unlock_details: None,
         });
 
-        if self
-            .cursor
-            .selected_line(&self.status_lines)
-            .is_some_and(|line| {
-                cursor::is_selectable_in_mode(line, &self.mode, self.flags.show_files)
-            })
-        {
-            return;
-        }
-
-        if let Some(new_cursor) =
-            self.cursor
-                .move_down(&self.status_lines, &self.mode, self.flags.show_files)
-        {
-            self.cursor = new_cursor;
-        } else if let Some(new_cursor) =
-            self.cursor
-                .move_up(&self.status_lines, &self.mode, self.flags.show_files)
-        {
-            self.cursor = new_cursor;
-        }
+        Ok(())
     }
 
     /// Handles toggling file visibility and requests a status reload.
-    fn handle_toggle_global_files_list(&mut self, messages: &mut Vec<Message>) {
+    fn handle_files_toggle_global_files_list(&mut self, messages: &mut Vec<Message>) {
         self.flags.show_files = match self.flags.show_files {
             FilesStatusFlag::None => FilesStatusFlag::All,
             FilesStatusFlag::All | FilesStatusFlag::Commit(_) => FilesStatusFlag::None,
@@ -887,7 +954,7 @@ impl App {
         messages.push(Message::Reload(None));
     }
 
-    fn handle_toggle_files_for_commit(
+    fn handle_files_toggle_files_for_commit(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
@@ -917,8 +984,40 @@ impl App {
         Ok(())
     }
 
+    fn handle_rub_use_target_message(&mut self) {
+        let Mode::Rub(RubMode {
+            how_to_combine_messages,
+            ..
+        }) = &mut self.mode
+        else {
+            return;
+        };
+        *how_to_combine_messages = match *how_to_combine_messages {
+            MessageCombinationStrategy::KeepBoth | MessageCombinationStrategy::KeepSubject => {
+                MessageCombinationStrategy::KeepTarget
+            }
+            MessageCombinationStrategy::KeepTarget => MessageCombinationStrategy::KeepBoth,
+        };
+    }
+
+    fn handle_rub_use_source_message(&mut self) {
+        let Mode::Rub(RubMode {
+            how_to_combine_messages,
+            ..
+        }) = &mut self.mode
+        else {
+            return;
+        };
+        *how_to_combine_messages = match *how_to_combine_messages {
+            MessageCombinationStrategy::KeepBoth | MessageCombinationStrategy::KeepTarget => {
+                MessageCombinationStrategy::KeepSubject
+            }
+            MessageCombinationStrategy::KeepSubject => MessageCombinationStrategy::KeepBoth,
+        };
+    }
+
     /// Handles confirming the currently selected rub operation.
-    fn handle_confirm_rub(
+    fn handle_rub_confirm(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
@@ -926,6 +1025,7 @@ impl App {
         let reload_message = match &self.mode {
             Mode::Rub(RubMode {
                 source,
+                how_to_combine_messages,
                 available_targets: _,
                 _unlock_details: _,
             }) => {
@@ -934,45 +1034,23 @@ impl App {
                 {
                     match source {
                         RubSource::CliId(source) => {
-                            if let Some(operation) = rub::route_operation(source, target) {
-                                with_noop_output(|out| {
-                                    operations::rub_legacy(ctx, out, operation)
-                                })?;
-                            }
-                            None
-                        }
-                        RubSource::CommittedHunk(hunk) => {
                             if let Some(operation) =
-                                rub_from_detail_view::route_operation(hunk, target)
+                                rub::route_operation(source, target, *how_to_combine_messages)
                             {
-                                Some(Message::Reload(Some(operation.execute(ctx)?)))
-                            } else {
-                                None
-                            }
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-            Mode::RubButApi(RubMode {
-                source,
-                available_targets: _,
-                _unlock_details: _,
-            }) => {
-                if let Some(selected_line) = self.cursor.selected_line(&self.status_lines)
-                    && let Some(target) = selected_line.data.cli_id()
-                {
-                    match source {
-                        RubSource::CliId(source) => {
-                            if let Some(operation) = rub::route_operation(source, target) {
-                                if let Some(what_to_select) =
-                                    operations::rub_using_but_api(ctx, &operation)?
-                                {
+                                if let Some(what_to_select) = operations::rub(ctx, &operation)? {
+                                    if self.options.debug {
+                                        messages.push(Message::ShowToast {
+                                            kind: ToastKind::Debug,
+                                            text: format!(
+                                                "Performed `{:?}`",
+                                                RubOperationDiscriminants::from(operation)
+                                            ),
+                                        });
+                                    }
                                     Some(Message::Reload(Some(what_to_select)))
                                 } else {
                                     messages.push(Message::ShowError(Arc::new(
-                                        anyhow::Error::from(rub_api::OperationNotSupported::new(
+                                        anyhow::Error::from(rub::OperationNotSupported::new(
                                             &operation,
                                         )),
                                     )));
@@ -997,7 +1075,6 @@ impl App {
                 }
             }
             Mode::Normal
-            | Mode::Branch
             | Mode::Details
             | Mode::InlineReword(..)
             | Mode::Command(..)
@@ -1030,8 +1107,11 @@ impl App {
                 SelectAfterReload::Commit(commit_id) => {
                     Cursor::select_commit(commit_id, &new_lines)
                 }
-                SelectAfterReload::Branch(branch) => Cursor::select_branch(branch, &new_lines),
+                SelectAfterReload::Branch(branch) => Cursor::select_branch(&branch, &new_lines),
                 SelectAfterReload::Unassigned => Cursor::select_unassigned(&new_lines),
+                SelectAfterReload::UncommittedFile { path, stack_id } => {
+                    Cursor::select_uncommitted_file(path.as_ref(), stack_id, &new_lines)
+                }
                 SelectAfterReload::FirstFileInCommit(commit_id) => {
                     Cursor::select_first_file_in_commit(commit_id, &new_lines)
                 }
@@ -1039,6 +1119,11 @@ impl App {
                 SelectAfterReload::CliId(cli_id) => Cursor::restore(&cli_id, &new_lines),
             }
         } else {
+            let selected_merge_base = self
+                .cursor
+                .selected_line(&self.status_lines)
+                .is_some_and(|line| matches!(line.data, StatusOutputLineData::MergeBase));
+
             let default_restore = || {
                 self.cursor
                     .selection_cli_id_for_reload(&self.status_lines, self.flags.show_files)
@@ -1047,13 +1132,7 @@ impl App {
                     })
             };
 
-            let selected_merge_base_in_branch_mode = matches!(self.mode, Mode::Branch)
-                && self
-                    .cursor
-                    .selected_line(&self.status_lines)
-                    .is_some_and(|line| matches!(line.data, StatusOutputLineData::MergeBase));
-
-            if selected_merge_base_in_branch_mode {
+            if selected_merge_base {
                 Cursor::select_merge_base(&new_lines).or_else(default_restore)
             } else {
                 default_restore()
@@ -1109,12 +1188,13 @@ impl App {
                     message_on_drop::message_on_drop(Message::DropToBeDiscarded, messages);
                 Confirm::new(
                     "Discard unassigned changes?",
-                    run_after_confirmation_msg(move |_, ctx, messages| {
+                    self.theme,
+                    move |ctx, messages| {
                         operations::discard_unassigned_legacy(ctx)?;
                         messages.push(Message::Reload(Some(SelectAfterReload::Unassigned)));
                         drop(drop_to_be_discarded);
                         Ok(())
-                    }),
+                    },
                 )
             }
             CliId::Uncommitted(uncommitted) => {
@@ -1143,7 +1223,8 @@ impl App {
                     message_on_drop::message_on_drop(Message::DropToBeDiscarded, messages);
                 Confirm::new(
                     format!("Discard {}?", uncommitted.describe()),
-                    run_after_confirmation_msg(move |_, ctx, messages| {
+                    self.theme,
+                    move |ctx, messages| {
                         let hunk_assignments = uncommitted
                             .hunk_assignments
                             .iter()
@@ -1153,7 +1234,7 @@ impl App {
                         messages.push(Message::Reload(Some(select_after_reload)));
                         drop(drop_to_be_discarded);
                         Ok(())
-                    }),
+                    },
                 )
             }
             CliId::Stack { stack_id, .. } => {
@@ -1166,12 +1247,13 @@ impl App {
                     message_on_drop::message_on_drop(Message::DropToBeDiscarded, messages);
                 Confirm::new(
                     "Discard staged changes in this stack?",
-                    run_after_confirmation_msg(move |_, ctx, messages| {
+                    self.theme,
+                    move |ctx, messages| {
                         operations::discard_stack(ctx, stack_id)?;
                         messages.push(Message::Reload(Some(select_after_reload)));
                         drop(drop_to_be_discarded);
                         Ok(())
-                    }),
+                    },
                 )
             }
             CliId::Commit { commit_id, .. } => {
@@ -1184,12 +1266,14 @@ impl App {
                     message_on_drop::message_on_drop(Message::DropToBeDiscarded, messages);
                 Confirm::new(
                     format!("Discard commit {}?", commit_id.to_hex_with_len(7)),
-                    run_after_confirmation_msg(move |_, ctx, messages| {
+                    self.theme,
+                    move |ctx, messages| {
                         let discard_result = operations::commit_discard(ctx, commit_id)?;
                         let select_after_reload =
                             select_after_reload.map(|selection| match selection {
                                 SelectAfterReload::Commit(target_commit_id) => {
                                     let remapped_target_commit_id = discard_result
+                                        .workspace
                                         .replaced_commits
                                         .get(&target_commit_id)
                                         .copied()
@@ -1201,7 +1285,7 @@ impl App {
                         messages.push(Message::Reload(select_after_reload));
                         drop(drop_to_be_discarded);
                         Ok(())
-                    }),
+                    },
                 )
             }
             CliId::Branch { name, stack_id, .. } => {
@@ -1218,12 +1302,13 @@ impl App {
                     message_on_drop::message_on_drop(Message::DropToBeDiscarded, messages);
                 Confirm::new(
                     format!("Discard branch {name}?"),
-                    run_after_confirmation_msg(move |_, ctx, messages| {
+                    self.theme,
+                    move |ctx, messages| {
                         operations::remove_branch_legacy(ctx, stack_id, name)?;
                         messages.push(Message::Reload(select_after_reload));
                         drop(drop_to_be_discarded);
                         Ok(())
-                    }),
+                    },
                 )
             }
             CliId::PathPrefix { .. } | CliId::CommittedFile { .. } => return,
@@ -1231,7 +1316,7 @@ impl App {
     }
 
     /// Handles creating an empty commit relative to the current selection.
-    fn handle_create_empty_commit(
+    fn handle_commit_create_empty(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
@@ -1287,49 +1372,85 @@ impl App {
         Ok(())
     }
 
-    fn handle_commit_start(&mut self, ctx: &mut Context) {
-        if !matches!(self.mode, Mode::Normal) {
-            return;
-        }
+    fn handle_commit_start(&mut self, ctx: &mut Context) -> anyhow::Result<()> {
         let Some(selection) = self.cursor.selected_line(&self.status_lines) else {
-            return;
+            return Ok(());
         };
 
         let commit_mode = match &selection.data {
             StatusOutputLineData::UnassignedChanges { cli_id } => {
-                let Ok(has_unassigned_changes) = operations::has_unassigned_changes(ctx) else {
-                    return;
-                };
-                if !has_unassigned_changes {
-                    return;
-                }
-                let Ok(source) = CommitSource::try_from(Arc::unwrap_or_clone(Arc::clone(cli_id)))
+                let Some(source) = CommitSource::try_new(Arc::unwrap_or_clone(Arc::clone(cli_id)))
                 else {
-                    return;
+                    return Ok(());
                 };
                 CommitMode {
                     source: Arc::new(source),
                     scope_to_stack: None,
-                    insert_side: InsertSide::Above,
+                    message_composer: CommitMessageComposer::default(),
                 }
             }
             StatusOutputLineData::UnassignedFile { cli_id }
             | StatusOutputLineData::StagedChanges { cli_id }
             | StatusOutputLineData::StagedFile { cli_id } => {
-                let Ok(source) = CommitSource::try_from(Arc::unwrap_or_clone(Arc::clone(cli_id)))
+                let Some(source) = CommitSource::try_new(Arc::unwrap_or_clone(Arc::clone(cli_id)))
                 else {
-                    return;
+                    return Ok(());
                 };
                 CommitMode {
                     source: Arc::new(source),
                     scope_to_stack: cli_id.stack_id(),
-                    insert_side: InsertSide::Above,
+                    message_composer: CommitMessageComposer::default(),
+                }
+            }
+            StatusOutputLineData::Commit { stack_id, .. } => {
+                let (source, scope_to_stack) = if let Some(stack_id) = *stack_id
+                    && stack_has_assigned_changes(ctx, stack_id)?
+                {
+                    (
+                        CommitSource::Stack(StackCommitSource { stack_id }),
+                        Some(stack_id),
+                    )
+                } else {
+                    (
+                        CommitSource::Unassigned(UnassignedCommitSource {
+                            id: UNASSIGNED.to_string(),
+                        }),
+                        None,
+                    )
+                };
+                CommitMode {
+                    scope_to_stack,
+                    message_composer: CommitMessageComposer::default(),
+                    source: Arc::new(source),
+                }
+            }
+            StatusOutputLineData::Branch { cli_id } => {
+                let CliId::Branch { stack_id, .. } = &**cli_id else {
+                    return Ok(());
+                };
+                let (source, scope_to_stack) = if let Some(stack_id) = *stack_id
+                    && stack_has_assigned_changes(ctx, stack_id)?
+                {
+                    (
+                        CommitSource::Stack(StackCommitSource { stack_id }),
+                        Some(stack_id),
+                    )
+                } else {
+                    (
+                        CommitSource::Unassigned(UnassignedCommitSource {
+                            id: UNASSIGNED.to_string(),
+                        }),
+                        None,
+                    )
+                };
+                CommitMode {
+                    source: Arc::new(source),
+                    scope_to_stack,
+                    message_composer: CommitMessageComposer::default(),
                 }
             }
             StatusOutputLineData::UpdateNotice
             | StatusOutputLineData::Connector
-            | StatusOutputLineData::Branch { .. }
-            | StatusOutputLineData::Commit { .. }
             | StatusOutputLineData::CommitMessage
             | StatusOutputLineData::EmptyCommitMessage
             | StatusOutputLineData::File { .. }
@@ -1337,22 +1458,23 @@ impl App {
             | StatusOutputLineData::UpstreamChanges
             | StatusOutputLineData::Warning
             | StatusOutputLineData::Hint
-            | StatusOutputLineData::NoAssignmentsUnstaged => return,
+            | StatusOutputLineData::NoAssignmentsUnstaged => return Ok(()),
         };
 
         self.mode = Mode::Commit(commit_mode);
+
+        Ok(())
     }
 
     fn handle_commit_confirm(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
-        with_message: bool,
     ) -> anyhow::Result<()> {
         let Mode::Commit(CommitMode {
             source,
             scope_to_stack,
-            insert_side,
+            message_composer,
         }) = &self.mode
         else {
             return Ok(());
@@ -1392,8 +1514,13 @@ impl App {
             }
         };
 
-        let Some(commit_create_result) =
-            operations::create_commit_legacy(ctx, target, source, *scope_to_stack, *insert_side)?
+        let Some(commit_create_result) = operations::create_commit_legacy(
+            ctx,
+            target,
+            source,
+            *scope_to_stack,
+            InsertSide::Below,
+        )?
         else {
             return Ok(());
         };
@@ -1453,10 +1580,19 @@ impl App {
             // TODO(david): don't use a separate reword step, instead get message before creating
             // commit. However that requires computing the diff which I haven't yet figured out how
             // to do
-            .chain(
-                (with_message && commit_create_result.new_commit.is_some())
-                    .then_some(Message::Reword(RewordMessage::WithEditor)),
-            )
+            .chain(if commit_create_result.new_commit.is_some() {
+                match message_composer {
+                    CommitMessageComposer::Editor => {
+                        Some(Message::Reword(RewordMessage::WithEditor))
+                    }
+                    CommitMessageComposer::Inline => {
+                        Some(Message::Reword(RewordMessage::InlineStart))
+                    }
+                    CommitMessageComposer::Empty => None,
+                }
+            } else {
+                None
+            })
             .chain(rejected_specs_error_msg.map(|text| Message::ShowToast {
                 kind: ToastKind::Error,
                 text,
@@ -1466,13 +1602,33 @@ impl App {
         Ok(())
     }
 
-    fn handle_commit_set_insert_side(&mut self, insert_side: InsertSide) {
+    fn handle_commit_toggle_message_composer(&mut self, composer: CommitMessageComposer) {
         if let Mode::Commit(mode) = &mut self.mode {
-            mode.insert_side = insert_side;
+            match composer {
+                CommitMessageComposer::Editor => {
+                    // you can't toggle the editor composer, that is always the default
+                }
+                CommitMessageComposer::Empty => {
+                    mode.message_composer = match mode.message_composer {
+                        CommitMessageComposer::Editor | CommitMessageComposer::Inline => {
+                            CommitMessageComposer::Empty
+                        }
+                        CommitMessageComposer::Empty => CommitMessageComposer::Editor,
+                    };
+                }
+                CommitMessageComposer::Inline => {
+                    mode.message_composer = match mode.message_composer {
+                        CommitMessageComposer::Editor | CommitMessageComposer::Empty => {
+                            CommitMessageComposer::Inline
+                        }
+                        CommitMessageComposer::Inline => CommitMessageComposer::Editor,
+                    };
+                }
+            }
         }
     }
 
-    fn handle_move_start_message(&mut self) {
+    fn handle_move_start(&mut self) {
         let Some(selection) = self.cursor.selected_line(&self.status_lines) else {
             return;
         };
@@ -1486,7 +1642,6 @@ impl App {
                 };
                 MoveMode {
                     source: Arc::new(source),
-                    insert_side: InsertSide::Above,
                 }
             }
             StatusOutputLineData::UpdateNotice
@@ -1508,22 +1663,12 @@ impl App {
         self.mode = Mode::Move(move_mode);
     }
 
-    fn handle_move_set_insert_side(&mut self, insert_side: InsertSide) {
-        if let Mode::Move(mode) = &mut self.mode {
-            mode.insert_side = insert_side;
-        }
-    }
-
     fn handle_move_confirm(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
     ) -> anyhow::Result<()> {
-        let Mode::Move(MoveMode {
-            source,
-            insert_side,
-        }) = &self.mode
-        else {
+        let Mode::Move(MoveMode { source }) = &self.mode else {
             return Ok(());
         };
 
@@ -1591,12 +1736,13 @@ impl App {
                         ctx,
                         *source_commit_id,
                         target_commit_id,
-                        *insert_side,
+                        InsertSide::Below,
                     )?,
                     MoveTarget::MergeBase => return Ok(()),
                 };
 
                 commit_move_result
+                    .workspace
                     .replaced_commits
                     .get(source_commit_id)
                     .copied()
@@ -1632,51 +1778,11 @@ impl App {
         Ok(())
     }
 
-    fn handle_start_branch_mode(&mut self, messages: &mut Vec<Message>) {
-        let Some(new_cursor) = self.cursor.closest_branch_cursor(&self.status_lines) else {
-            return;
-        };
-
-        let Some(selection) = new_cursor.selected_line(&self.status_lines) else {
-            return;
-        };
-
-        match &selection.data {
-            StatusOutputLineData::Branch { .. } | StatusOutputLineData::MergeBase => {}
-            StatusOutputLineData::UpdateNotice
-            | StatusOutputLineData::Connector
-            | StatusOutputLineData::StagedChanges { .. }
-            | StatusOutputLineData::StagedFile { .. }
-            | StatusOutputLineData::UnassignedChanges { .. }
-            | StatusOutputLineData::UnassignedFile { .. }
-            | StatusOutputLineData::Commit { .. }
-            | StatusOutputLineData::CommitMessage
-            | StatusOutputLineData::EmptyCommitMessage
-            | StatusOutputLineData::File { .. }
-            | StatusOutputLineData::UpstreamChanges
-            | StatusOutputLineData::Warning
-            | StatusOutputLineData::Hint
-            | StatusOutputLineData::NoAssignmentsUnstaged => return,
-        }
-
-        self.cursor = new_cursor;
-        self.mode = Mode::Branch;
-
-        if !self.flags.show_files.is_none() {
-            self.flags.show_files = FilesStatusFlag::None;
-            messages.push(Message::Reload(None));
-        }
-    }
-
-    fn handle_create_new_branch(
+    fn handle_new_branch(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
     ) -> anyhow::Result<()> {
-        if !matches!(self.mode, Mode::Branch) {
-            return Ok(());
-        }
-
         let Some(selection) = self.cursor.selected_line(&self.status_lines) else {
             return Ok(());
         };
@@ -1688,12 +1794,13 @@ impl App {
                 };
                 operations::create_branch_anchored_legacy(ctx, name.to_owned())?
             }
-            StatusOutputLineData::MergeBase => operations::create_branch_legacy(ctx)?,
+            StatusOutputLineData::UnassignedChanges { .. } | StatusOutputLineData::MergeBase => {
+                operations::create_branch_legacy(ctx)?
+            }
             StatusOutputLineData::UpdateNotice
             | StatusOutputLineData::Connector
             | StatusOutputLineData::StagedChanges { .. }
             | StatusOutputLineData::StagedFile { .. }
-            | StatusOutputLineData::UnassignedChanges { .. }
             | StatusOutputLineData::UnassignedFile { .. }
             | StatusOutputLineData::Commit { .. }
             | StatusOutputLineData::CommitMessage
@@ -1705,10 +1812,7 @@ impl App {
             | StatusOutputLineData::NoAssignmentsUnstaged => return Ok(()),
         };
 
-        messages.extend([
-            Message::EnterNormalMode,
-            Message::Reload(Some(SelectAfterReload::Branch(new_name))),
-        ]);
+        messages.push(Message::Reload(Some(SelectAfterReload::Branch(new_name))));
 
         Ok(())
     }
@@ -1775,7 +1879,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_start_reword_inline(
+    fn handle_reword_inline_start(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
@@ -1796,7 +1900,7 @@ impl App {
                     return Ok(());
                 };
                 let mut textarea = TextArea::from([name]);
-                textarea.set_cursor_line_style(Style::default().green());
+                textarea.set_cursor_line_style(self.theme.local_branch);
                 textarea.move_cursor(CursorMove::End);
 
                 InlineRewordMode::Branch {
@@ -1815,7 +1919,7 @@ impl App {
 
                 let first_line = current_message.lines().next().unwrap_or("").to_string();
                 let mut textarea = TextArea::from([first_line]);
-                textarea.set_cursor_line_style(Style::default());
+                textarea.set_cursor_line_style(self.theme.default);
                 textarea.move_cursor(CursorMove::End);
 
                 InlineRewordMode::Commit {
@@ -1862,7 +1966,7 @@ impl App {
         }
     }
 
-    fn handle_confirm_inline_reword(
+    fn handle_reword_inline_confirm(
         &mut self,
         ctx: &mut Context,
         messages: &mut Vec<Message>,
@@ -1884,7 +1988,7 @@ impl App {
         match inline_reword_mode {
             InlineRewordMode::Commit { commit_id, .. } => {
                 let Some(reword_result) =
-                    operations::reword_commit_inline_legacy(ctx, *commit_id, first_line)?
+                    operations::reword_commit_legacy(ctx, *commit_id, first_line)?
                 else {
                     messages.push(Message::EnterNormalMode);
                     return Ok(());
@@ -1896,7 +2000,7 @@ impl App {
                 ]);
             }
             InlineRewordMode::Branch { name, stack_id, .. } => {
-                let new_name = operations::reword_branch_inline_legacy(
+                let new_name = operations::reword_branch_legacy(
                     ctx,
                     *stack_id,
                     name.to_owned(),
@@ -1913,23 +2017,77 @@ impl App {
         Ok(())
     }
 
-    fn handle_enter_command_mode(&mut self) {
+    fn handle_reword_open_editor<T>(
+        &mut self,
+        ctx: &mut Context,
+        terminal_guard: &mut T,
+        messages: &mut Vec<Message>,
+    ) -> anyhow::Result<()>
+    where
+        T: TerminalGuard,
+        anyhow::Error: From<<T::Backend as Backend>::Error>,
+    {
+        let Mode::InlineReword(inline_reword_mode) = &self.mode else {
+            return Ok(());
+        };
+
+        let textarea = inline_reword_mode.textarea();
+        let Some(line) = textarea.lines().first() else {
+            return Ok(());
+        };
+
+        let _suspend_guard = terminal_guard.suspend()?;
+        let what_to_select = match inline_reword_mode {
+            InlineRewordMode::Commit { commit_id, .. } => {
+                let commit_details =
+                    but_api::diff::commit_details(ctx, *commit_id, ComputeLineStats::No)?;
+                if let Some(reword_result) =
+                    operations::reword_commit_with_editor_with_message_legacy(
+                        ctx,
+                        commit_details,
+                        line.to_owned(),
+                    )?
+                {
+                    SelectAfterReload::Commit(reword_result.new_commit)
+                } else {
+                    SelectAfterReload::Commit(*commit_id)
+                }
+            }
+            InlineRewordMode::Branch { name, stack_id, .. } => {
+                let new_name = get_branch_name_from_editor(line)?;
+                let normalized_name =
+                    operations::reword_branch_legacy(ctx, *stack_id, name.clone(), new_name)?;
+                SelectAfterReload::Branch(normalized_name)
+            }
+        };
+        drop(_suspend_guard);
+
+        messages.extend([
+            Message::EnterNormalMode,
+            Message::Reload(Some(what_to_select)),
+        ]);
+
+        Ok(())
+    }
+
+    fn handle_command_start(&mut self, kind: CommandModeKind) {
         let mut textarea = TextArea::default();
-        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_line_style(self.theme.default);
         textarea.move_cursor(CursorMove::End);
 
         self.mode = Mode::Command(CommandMode {
             textarea: Box::new(textarea),
+            kind,
         });
     }
 
     fn handle_command_input(&mut self, ev: Event) {
-        if let Mode::Command(CommandMode { textarea }) = &mut self.mode {
+        if let Mode::Command(CommandMode { textarea, .. }) = &mut self.mode {
             textarea.input(ev);
         }
     }
 
-    fn handle_run_command<T>(
+    fn handle_command_confirm<T>(
         &mut self,
         terminal_guard: &mut T,
         out: &mut OutputChannel,
@@ -1939,7 +2097,7 @@ impl App {
         T: TerminalGuard,
         anyhow::Error: From<<T::Backend as Backend>::Error>,
     {
-        let Mode::Command(CommandMode { textarea }) = &self.mode else {
+        let Mode::Command(CommandMode { textarea, kind }) = &self.mode else {
             messages.push(Message::EnterNormalMode);
             return Ok(());
         };
@@ -1948,18 +2106,31 @@ impl App {
             return Ok(());
         };
 
-        let binary_path = current_exe_for_but_exec()?;
-        let args = shell_words::split(input)?.into_iter().map(OsString::from);
-
-        let mut cmd = Command::new(binary_path);
-        cmd.args(args);
-
         let _suspend_guard = terminal_guard.suspend()?;
+
+        let mut cmd = match kind {
+            CommandModeKind::But => {
+                let binary_path = current_exe_for_but_exec()?;
+                let args = shell_words::split(input)?.into_iter().map(OsString::from);
+                let mut cmd = Command::new(binary_path);
+                cmd.args(args);
+                cmd
+            }
+            CommandModeKind::Shell => {
+                let mut args = shell_words::split(input)?.into_iter().map(OsString::from);
+                let Some(binary) = args.next() else {
+                    messages.push(Message::EnterNormalMode);
+                    return Ok(());
+                };
+                let mut cmd = Command::new(binary);
+                cmd.args(args);
+                cmd
+            }
+        };
+
         let status = cmd.spawn()?.wait()?;
 
         self.prompt_to_continue(out)?;
-
-        drop(_suspend_guard);
 
         if status.success() {
             messages.extend([Message::EnterNormalMode, Message::Reload(None)]);
@@ -1969,6 +2140,8 @@ impl App {
                 format_exit_status(status)
             )));
         }
+
+        drop(_suspend_guard);
 
         Ok(())
     }
@@ -2009,711 +2182,120 @@ impl App {
         Some(*commit_id)
     }
 
-    fn render(&self, frame: &mut Frame) {
-        let content_layout =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(frame.area());
-        let main_content_area = content_layout[0];
-
-        let (main_content_area, debug_area) = if self.options.debug {
-            let layout =
-                Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
-                    .split(main_content_area);
-            (layout[0], Some(layout[1]))
-        } else {
-            (main_content_area, None)
-        };
-
-        let hotbar_area = content_layout[1];
-
-        let status_layout = self.status_layout(main_content_area);
-
-        let dimmed_block = Block::bordered()
-            .border_style(Style::default().dark_gray())
-            .border_type(BorderType::Plain)
-            .borders(Borders::BOTTOM);
-        let focused_block = Block::bordered()
-            .border_style(Style::default().fg(self.mode.bg()))
-            .border_type(BorderType::Thick)
-            .borders(Borders::BOTTOM);
-
-        let (status_block, details_block) = if matches!(self.mode, Mode::Details) {
-            (dimmed_block, focused_block)
-        } else {
-            (focused_block, dimmed_block)
-        };
-
-        {
-            let inner_area = status_block.inner(status_layout.status_area);
-            frame.render_widget(status_block, status_layout.status_area);
-            self.render_status(inner_area, frame);
+    fn update_status_width_percentage(&mut self, new: u16, terminal_area: Rect) {
+        if !self.details.is_visible() {
+            return;
         }
 
-        if let Some(details_area) = status_layout.details_area {
-            let inner_area = details_block.inner(details_area);
-            frame.render_widget(details_block, details_area);
-            self.details.render(inner_area, frame);
-        }
+        self.status_width_percentage = new.clamp(
+            100 - DETAILS_MAX_SIZE_PERCENTAGE,
+            100 - DETAILS_MIN_SIZE_PERCENTAGE,
+        );
 
-        if let Some(debug_area) = debug_area {
-            let outer_block = Block::bordered()
-                .border_style(Style::default().dark_gray())
-                .border_type(BorderType::Thick)
-                .borders(Borders::LEFT);
-            let inner_area = outer_block.inner(debug_area);
-            frame.render_widget(outer_block, debug_area);
-            self.render_debug(inner_area, frame);
-        }
-
-        self.render_hotbar(hotbar_area, frame);
+        let details_viewport = details_viewport(self, terminal_area);
+        self.details.ensure_selection_visible(details_viewport);
     }
 
-    fn status_layout(&self, area: Rect) -> StatusLayout {
-        let (status_area, details_area) = match self.details.visibility() {
-            DetailsVisibility::Hidden => (area, None),
-            DetailsVisibility::VisibleVertical => {
-                let layout =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(area);
-                (layout[0], Some(layout[1]))
-            }
+    fn handle_pick_and_goto_branch(&mut self, ctx: &mut Context) -> anyhow::Result<()> {
+        match self.flags.show_files {
+            FilesStatusFlag::None | FilesStatusFlag::All => {}
+            FilesStatusFlag::Commit(_) => return Ok(()),
+        }
+
+        let head_info = {
+            let meta = ctx.meta()?;
+            but_workspace::head_info(
+                &*ctx.repo.get()?,
+                &meta,
+                but_workspace::ref_info::Options::default(),
+            )?
         };
 
-        StatusLayout {
-            status_area,
-            details_area,
-        }
-    }
-
-    fn render_status(&self, content_area: Rect, frame: &mut Frame) {
-        let visible_height = content_area.height as usize;
-        let items = self
-            .status_lines
+        let branch_names = head_info
+            .stacks
             .iter()
-            .enumerate()
-            .flat_map(|(idx, tui_line)| {
-                self.render_status_list_item(tui_line, self.cursor.index() == idx)
+            .flat_map(|stack| &stack.segments)
+            .filter_map(|segment| {
+                let ref_info = segment.ref_info.as_ref()?;
+                Some(&ref_info.ref_name)
             })
-            .skip(self.scroll_top)
-            .take(visible_height);
-        let list = List::new(items);
+            .filter(|name| {
+                if matches!(self.mode, Mode::Rub(_)) {
+                    true
+                } else {
+                    // not all branches are selectable all the time, for example if we're committing
+                    // changes assigned to a stack then we cannot select branches outside the stack
+                    self.status_lines
+                        .iter()
+                        .find(|line| {
+                            if let Some(id) = line.data.cli_id()
+                                && let CliId::Branch {
+                                    name: name_on_line, ..
+                                } = &**id
+                                && name_on_line == name.shorten()
+                            {
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .is_none_or(|line| {
+                            is_selectable_in_mode(line, &self.mode, self.flags.show_files)
+                        })
+                }
+            })
+            .map(|name| name.to_owned())
+            .collect::<Vec<_>>();
 
-        frame.render_widget(list, content_area);
-
-        self.render_inline_reword(content_area, frame);
-
-        self.render_toasts(content_area, frame);
-
-        if let Some(confirm) = &self.confirm {
-            confirm.render(content_area, frame);
-        }
-    }
-
-    fn render_status_list_item(
-        &self,
-        tui_line: &StatusOutputLine,
-        is_selected: bool,
-    ) -> StatusListItem {
-        let StatusOutputLine {
-            connector,
-            content,
-            data,
-        } = tui_line;
-
-        let mut line = Line::default();
-
-        if let Some(connector) = connector {
-            line.extend(connector.clone());
-        }
-
-        let line_is_to_be_discarded =
-            self.to_be_discarded
-                .as_ref()
-                .is_some_and(|to_be_discarded| {
-                    data.cli_id()
-                        .is_some_and(|selection| to_be_discarded == selection)
+        if let Some(branch_names) = NonEmpty::from_vec(branch_names) {
+            let include_unassigned = Cursor::select_unassigned(&self.status_lines)
+                .and_then(|cursor| cursor.selected_line(&self.status_lines))
+                .is_some_and(|unassigned| {
+                    is_selectable_in_mode(unassigned, &self.mode, self.flags.show_files)
                 });
 
-        if line_is_to_be_discarded {
-            line.extend([Span::raw("<< discard >>").black().on_red(), Span::raw(" ")]);
-        } else if is_selected {
-            match &self.mode {
-                Mode::Normal | Mode::InlineReword(..) | Mode::Command(..) | Mode::Details => {}
-                Mode::Rub(RubMode {
-                    source,
-                    available_targets: _,
-                    _unlock_details: _,
-                }) => {
-                    self.render_rub_inline_labels_for_selected_line(data, source, &mut line);
-                }
-                Mode::RubButApi(RubMode {
-                    source,
-                    available_targets: _,
-                    _unlock_details: _,
-                }) => {
-                    self.render_rub_api_inline_labels_for_selected_line(data, source, &mut line);
-                }
-                Mode::Commit(commit_mode) => {
-                    if data
-                        .cli_id()
-                        .is_some_and(|target| *commit_mode.source == **target)
-                        // only target branches here, and not commits. Commits are handled at the
-                        // end of this function because they require [`extend_connector_spans`]
-                        || matches!(data, StatusOutputLineData::Branch { .. })
-                    {
-                        self.render_commit_labels_for_selected_line(data, commit_mode, &mut line);
-                    }
-                }
-                Mode::Move(move_mode) => {
-                    if data
-                        .cli_id()
-                        .is_some_and(|target| *move_mode.source == **target)
-                        // only target branches here, and not commits. Commits are handled at the
-                        // end of this function because they require [`extend_connector_spans`]
-                        || matches!(data, StatusOutputLineData::Branch { .. })
-                        || matches!(data, StatusOutputLineData::MergeBase)
-                    {
-                        self.render_move_labels_for_selected_line(data, move_mode, &mut line);
-                    }
-                }
-                Mode::Branch => {
-                    self.render_branch_labels_for_selected_line(data, &mut line);
-                }
-            }
-        } else {
-            match &self.mode {
-                Mode::Normal
-                | Mode::InlineReword(..)
-                | Mode::Command(..)
-                | Mode::Branch
-                | Mode::Details => {}
-                Mode::Rub(RubMode {
-                    source,
-                    available_targets: _,
-                    _unlock_details: _,
-                })
-                | Mode::RubButApi(RubMode {
-                    source,
-                    available_targets: _,
-                    _unlock_details: _,
-                }) => {
-                    if let Some(cli_id) = data.cli_id()
-                        && source == &**cli_id
-                    {
-                        line.extend([source_span(), Span::raw(" ")]);
-                    }
-                }
-                Mode::Commit(CommitMode { source, .. }) => {
-                    if let Some(cli_id) = data.cli_id()
-                        && **source == **cli_id
-                    {
-                        line.extend([source_span(), Span::raw(" ")]);
-                    }
-                }
-                Mode::Move(MoveMode { source, .. }) => {
-                    if let Some(cli_id) = data.cli_id()
-                        && **source == **cli_id
-                    {
-                        line.extend([source_span(), Span::raw(" ")]);
-                    }
-                }
-            }
-        }
-
-        let mut content_spans = match content {
-            StatusOutputContent::Plain(spans) => spans.clone(),
-            StatusOutputContent::Commit(CommitLineContent {
-                sha,
-                author,
-                message,
-                suffix,
-            }) => {
-                let mut spans =
-                    Vec::with_capacity(sha.len() + author.len() + message.len() + suffix.len());
-                if data.cli_id().is_some_and(|id| self.highlight.contains(id)) {
-                    spans.extend(sha.iter().cloned().map(with_highlight));
-                } else {
-                    spans.extend(sha.iter().cloned());
-                }
-                spans.extend(author.iter().cloned());
-                spans.extend(message.iter().cloned());
-                spans.extend(suffix.iter().cloned());
-                spans
-            }
-            StatusOutputContent::Branch(BranchLineContent {
-                id,
-                decoration_start,
-                branch_name,
-                decoration_end,
-                suffix,
-            }) => {
-                let mut spans = Vec::with_capacity(
-                    id.len()
-                        + decoration_start.len()
-                        + branch_name.len()
-                        + decoration_end.len()
-                        + suffix.len(),
-                );
-                spans.extend(id.iter().cloned());
-                spans.extend(decoration_start.iter().cloned());
-                if data.cli_id().is_some_and(|id| self.highlight.contains(id)) {
-                    spans.extend(branch_name.iter().cloned().map(with_highlight));
-                } else {
-                    spans.extend(branch_name.iter().cloned());
-                }
-                spans.extend(decoration_end.iter().cloned());
-                spans.extend(suffix.iter().cloned());
-                spans
-            }
-            StatusOutputContent::File(FileLineContent { id, status, path }) => {
-                let mut spans = Vec::with_capacity(id.len() + status.len() + path.len());
-                spans.extend(id.iter().cloned());
-                spans.extend(status.iter().cloned());
-                if data.cli_id().is_some_and(|id| self.highlight.contains(id)) {
-                    spans.extend(path.iter().cloned().map(with_highlight));
-                } else {
-                    spans.extend(path.iter().cloned());
-                }
-                spans
-            }
-        };
-
-        if line_is_to_be_discarded {
-            content_spans = content_spans
-                .into_iter()
-                .map(|span| span.crossed_out())
-                .collect();
-        }
-
-        match &self.mode {
-            Mode::InlineReword(inline_reword_mode) => {
-                if is_selected {
-                    match inline_reword_mode {
-                        InlineRewordMode::Commit { .. } => {
-                            if let StatusOutputContent::Commit(commit_content) = content {
-                                line.extend(commit_content.sha.iter().cloned());
-                            }
+            self.branch_picker = Some(BranchPicker::new(
+                branch_names,
+                self.theme,
+                include_unassigned,
+                |item, messages| {
+                    match item {
+                        branch_picker::Item::Branch(branch_name) => {
+                            messages.push(Message::SelectBranch(branch_name));
                         }
-                        InlineRewordMode::Branch { textarea, .. } => {
-                            if let StatusOutputContent::Branch(branch_content) = content {
-                                line.extend(branch_content.id.iter().cloned());
-                                line.extend(branch_content.decoration_start.iter().cloned());
-
-                                let len = textarea
-                                    .lines()
-                                    .first()
-                                    .map(|line| line.width())
-                                    .unwrap_or(0);
-                                line.push_span(Span::raw(" ".repeat(len + 1)));
-
-                                line.extend(branch_content.decoration_end.iter().cloned());
-                                line.extend(branch_content.suffix.iter().cloned());
-                            }
+                        branch_picker::Item::Unassigned => {
+                            messages.push(Message::SelectUnassigned);
                         }
                     }
-                } else {
-                    line.extend(content_spans);
-                }
-            }
-            Mode::Normal
-            | Mode::Branch
-            | Mode::Details
-            | Mode::Move(..)
-            | Mode::Command(..)
-            | Mode::Rub(..)
-            | Mode::RubButApi(..)
-            | Mode::Commit(..) => {
-                if is_selectable_in_mode(tui_line, &self.mode, self.flags.show_files) {
-                    line.extend(content_spans);
-                } else {
-                    line.extend(
-                        content_spans
-                            .into_iter()
-                            .map(|span| span.style(Style::default().dim())),
-                    );
-                }
-            }
+                    Ok(())
+                },
+            ));
         }
 
-        if is_selected {
-            line = line.bg(*CURSOR_BG);
-        }
-
-        if is_selected {
-            match &self.mode {
-                Mode::Commit(commit_mode)
-                    if matches!(data, StatusOutputLineData::Commit { .. }) =>
-                {
-                    let mut extension_line = Line::default().bg(*CURSOR_BG);
-                    extend_connector_spans(
-                        connector.as_deref().unwrap_or_default(),
-                        match commit_mode.insert_side {
-                            InsertSide::Above => ExtensionDirection::Above,
-                            InsertSide::Below => ExtensionDirection::Below,
-                        },
-                        &mut extension_line,
-                    );
-                    self.render_commit_labels_for_selected_line(
-                        data,
-                        commit_mode,
-                        &mut extension_line,
-                    );
-                    return match commit_mode.insert_side {
-                        InsertSide::Above => StatusListItem::Double(extension_line, line),
-                        InsertSide::Below => StatusListItem::Double(line, extension_line),
-                    };
-                }
-                Mode::Move(move_mode) => {
-                    if let StatusOutputLineData::Commit { cli_id: target, .. } = data
-                        && *move_mode.source != **target
-                    {
-                        let mut extension_line = Line::default().bg(*CURSOR_BG);
-                        extend_connector_spans(
-                            connector.as_deref().unwrap_or_default(),
-                            match move_mode.insert_side {
-                                InsertSide::Above => ExtensionDirection::Above,
-                                InsertSide::Below => ExtensionDirection::Below,
-                            },
-                            &mut extension_line,
-                        );
-                        self.render_move_labels_for_selected_line(
-                            data,
-                            move_mode,
-                            &mut extension_line,
-                        );
-                        return match move_mode.insert_side {
-                            InsertSide::Above => StatusListItem::Double(extension_line, line),
-                            InsertSide::Below => StatusListItem::Double(line, extension_line),
-                        };
-                    }
-                }
-                Mode::Commit(..)
-                | Mode::Branch
-                | Mode::Normal
-                | Mode::Details
-                | Mode::Rub(..)
-                | Mode::RubButApi(..)
-                | Mode::InlineReword(..)
-                | Mode::Command(..) => {}
-            }
-        }
-
-        StatusListItem::Single(line)
+        Ok(())
     }
 
-    fn render_rub_inline_labels_for_selected_line(
-        &self,
-        data: &StatusOutputLineData,
-        source: &RubSource,
-        line: &mut Line<'static>,
-    ) {
-        let Some(target) = data.cli_id() else {
-            return;
-        };
-
-        if source == &**target {
-            line.extend([source_span(), Span::raw(" ")]);
-        }
-
-        let rub_operation_display = match source {
-            RubSource::CliId(source) => {
-                rub_operation_display_legacy(source, target).unwrap_or("invalid")
-            }
-            RubSource::CommittedHunk(hunk) => {
-                rub_from_detail_view::rub_operation_display(hunk, target).unwrap_or("invalid")
-            }
-        };
-        line.extend([
-            Span::raw("<< ").mode_colors(&self.mode),
-            Span::raw(rub_operation_display).mode_colors(&self.mode),
-            Span::raw(" >>").mode_colors(&self.mode),
-            Span::raw(" "),
-        ]);
-    }
-
-    fn render_rub_api_inline_labels_for_selected_line(
-        &self,
-        data: &StatusOutputLineData,
-        source: &RubSource,
-        line: &mut Line<'static>,
-    ) {
-        let Some(target) = data.cli_id() else {
-            return;
-        };
-
-        if source == &**target {
-            line.extend([source_span(), Span::raw(" ")]);
-        }
-
-        let display = match source {
-            RubSource::CliId(source) => {
-                Cow::Borrowed(rub_api::rub_operation_display(source, target).unwrap_or("invalid"))
-            }
-            RubSource::CommittedHunk(hunk) => Cow::Borrowed(
-                rub_from_detail_view::rub_operation_display(hunk, target).unwrap_or("invalid"),
-            ),
-        };
-        line.extend([
-            Span::raw("<< ").mode_colors(&self.mode),
-            Span::raw(display).mode_colors(&self.mode),
-            Span::raw(" >>").mode_colors(&self.mode),
-            Span::raw(" "),
-        ]);
-    }
-
-    fn render_commit_labels_for_selected_line(
-        &self,
-        data: &StatusOutputLineData,
-        mode: &CommitMode,
-        line: &mut Line<'static>,
-    ) {
-        let Some(target) = data.cli_id() else {
-            return;
-        };
-
-        if *mode.source == **target {
-            line.extend([source_span(), Span::raw(" ")]);
-            line.extend([
-                Span::raw("<< ").mode_colors(&self.mode),
-                Span::raw(NOOP).mode_colors(&self.mode),
-                Span::raw(" >>").mode_colors(&self.mode),
-                Span::raw(" "),
-            ]);
-        } else if let Some(display) = commit_operation_display(data, mode) {
-            line.extend([
-                Span::raw("<< ").mode_colors(&self.mode),
-                Span::raw(display).mode_colors(&self.mode),
-                Span::raw(" >>").mode_colors(&self.mode),
-                Span::raw(" "),
-            ]);
-        }
-    }
-
-    fn render_move_labels_for_selected_line(
-        &self,
-        data: &StatusOutputLineData,
-        mode: &MoveMode,
-        line: &mut Line<'static>,
-    ) {
-        if data.cli_id().is_some_and(|target| *mode.source == **target) {
-            line.extend([source_span(), Span::raw(" ")]);
-            line.extend([
-                Span::raw("<< ").mode_colors(&self.mode),
-                Span::raw(NOOP).mode_colors(&self.mode),
-                Span::raw(" >>").mode_colors(&self.mode),
-                Span::raw(" "),
-            ]);
-        } else if let Some(display) = move_operation_display(data, mode) {
-            line.extend([
-                Span::raw("<< ").mode_colors(&self.mode),
-                Span::raw(display).mode_colors(&self.mode),
-                Span::raw(" >>").mode_colors(&self.mode),
-                Span::raw(" "),
-            ]);
-        }
-    }
-
-    fn render_branch_labels_for_selected_line(
-        &self,
-        data: &StatusOutputLineData,
-        line: &mut Line<'static>,
-    ) {
-        let Some(display) = branch_operation_display(data) else {
-            return;
-        };
-        line.extend([
-            Span::raw("<< ").mode_colors(&self.mode),
-            Span::raw(display).mode_colors(&self.mode),
-            Span::raw(" >>").mode_colors(&self.mode),
-            Span::raw(" "),
-        ]);
-    }
-
-    fn render_hotbar(&self, area: Rect, frame: &mut Frame) {
-        let mode_span = Span::raw(format!(
-            "  {}  ",
-            match self.mode {
-                Mode::Normal => "normal",
-                Mode::Rub(..) => "rub (legacy)",
-                Mode::RubButApi(..) => "rub",
-                Mode::InlineReword(..) => "reword",
-                Mode::Command(..) => "command",
-                Mode::Commit(..) => "commit",
-                Mode::Move(..) => "move",
-                Mode::Branch => "branch",
-                Mode::Details => "details",
-            }
-        ))
-        .mode_colors(&self.mode);
-
-        let layout = Layout::horizontal([
-            Constraint::Length(mode_span.width() as _),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
-        .split(area);
-
-        frame.render_widget(mode_span, layout[0]);
-
-        frame.render_widget(" ", layout[1]);
-
-        match &self.mode {
-            Mode::Normal
-            | Mode::Branch
-            | Mode::Details
-            | Mode::Rub(..)
-            | Mode::RubButApi(..)
-            | Mode::Commit(..)
-            | Mode::Move(..)
-            | Mode::InlineReword(..) => {
-                let mut line = Line::default();
-                let mut key_binds_iter = self
-                    .active_key_binds()
-                    .iter_key_binds_available_in_mode(&self.mode)
-                    .filter(|key_bind| !key_bind.hide_from_hotbar())
-                    .peekable();
-                while let Some(key_bind) = key_binds_iter.next() {
-                    line.extend([
-                        Span::styled(key_bind.chord_display(), Style::default().blue()),
-                        Span::raw(" "),
-                        Span::styled(key_bind.short_description(), Style::default().dim()),
-                    ]);
-
-                    if key_binds_iter.peek().is_some() {
-                        line.push_span(Span::styled(" • ", Style::default().dim()));
-                    }
-                }
-
-                frame.render_widget(line, layout[2]);
-            }
-            Mode::Command(CommandMode { textarea }) => {
-                let command_layout =
-                    Layout::horizontal([Constraint::Length(4), Constraint::Min(1)])
-                        .split(layout[2]);
-
-                frame.render_widget("but ", command_layout[0]);
-                frame.render_widget(&**textarea, command_layout[1]);
-            }
-        }
-    }
-
-    /// Renders transient toasts stacked in the content area.
-    fn render_toasts(&self, area: Rect, frame: &mut Frame) {
-        toast::render_toasts(frame, area, &self.toasts);
-    }
-
-    fn render_inline_reword(&self, area: Rect, frame: &mut Frame) {
-        let inline_reword_mode = if let Mode::InlineReword(inline_reword_mode) = &self.mode {
-            inline_reword_mode
+    fn handle_toggle_help(&mut self) {
+        if self.help.is_some() {
+            self.help = None;
         } else {
-            return;
-        };
-
-        let selected_idx = self.cursor.index();
-        let Some(selected_rows) = self.selected_row_range() else {
-            return;
-        };
-        if selected_rows.start < self.scroll_top {
-            return;
+            self.help = Some(Help::new([&self.key_binds], self.theme));
         }
-        let idx = selected_rows.start - self.scroll_top;
-        if idx >= area.height as usize {
-            return;
-        }
-        let Some(line) = self.status_lines.get(selected_idx) else {
-            return;
-        };
-
-        match inline_reword_mode {
-            InlineRewordMode::Commit { textarea, .. } => {
-                let StatusOutputLineData::Commit { .. } = &line.data else {
-                    return;
-                };
-                let Some(connector) = &line.connector else {
-                    return;
-                };
-                let StatusOutputContent::Commit(commit_content) = &line.content else {
-                    return;
-                };
-                let connector_and_prefix = connector
-                    .iter()
-                    .chain(&commit_content.sha)
-                    .map(|span| span.width() as u16)
-                    .sum::<u16>();
-                let padding = 1;
-
-                let start_x = connector_and_prefix + padding;
-                let x = area.x.saturating_add(start_x);
-                let width = area.right().saturating_sub(x);
-                let area = Rect::new(x, area.y.saturating_add(idx as u16), width, 1);
-                frame.render_widget(&**textarea, area);
-            }
-            InlineRewordMode::Branch { textarea, .. } => {
-                let StatusOutputLineData::Branch { .. } = &line.data else {
-                    return;
-                };
-                let Some(connector) = &line.connector else {
-                    return;
-                };
-                let StatusOutputContent::Branch(branch_content) = &line.content else {
-                    return;
-                };
-
-                let connector_and_prefix = connector
-                    .iter()
-                    .chain(&branch_content.id)
-                    .chain(&branch_content.decoration_start)
-                    .map(|span| span.width() as u16)
-                    .sum::<u16>();
-
-                let padding = 0;
-
-                let start_x = connector_and_prefix + padding;
-                let x = area.x.saturating_add(start_x);
-                let width = area.right().saturating_sub(x);
-                let area = Rect::new(x, area.y.saturating_add(idx as u16), width, 1);
-                frame.render_widget(&**textarea, area);
-            }
-        }
-    }
-
-    fn render_debug(&self, area: Rect, frame: &mut Frame) {
-        let renders = once(ListItem::new("FPS").black().on_blue()).chain(once(ListItem::new(
-            format!("{} FPS ({} renders)", self.fps.fps(), self.renders),
-        )));
-
-        let details_selection = format!("{:#?}", self.details.selection());
-        let details_selection = once(ListItem::new("Details selection").black().on_blue()).chain(
-            details_selection
-                .lines()
-                .take(100)
-                .map(|line| ListItem::new(line.to_owned())),
-        );
-
-        let status_selection = format!("{:#?}", self.cursor.selected_line(&self.status_lines));
-        let status_selection = once(ListItem::new("Status selection").black().on_blue()).chain(
-            status_selection
-                .lines()
-                .take(100)
-                .map(|line| ListItem::new(line.to_owned())),
-        );
-
-        let list = List::new(
-            renders
-                .chain(once(ListItem::new("")))
-                .chain(details_selection)
-                .chain(once(ListItem::new("")))
-                .chain(status_selection),
-        );
-
-        frame.render_widget(list, area);
     }
 }
 
-fn event_to_messages(ev: Event, key_binds: &KeyBinds, mode: &Mode, messages: &mut Vec<Message>) {
+fn event_to_messages(
+    ev: Event,
+    key_binds: &KeyBinds,
+    mode: &Mode,
+    branch_picker: Option<&BranchPicker>,
+    messages: &mut Vec<Message>,
+) {
     match ev {
         Event::Key(key) => {
             let mut handled = false;
-            for key_bind in key_binds.iter_key_binds_available_in_mode(mode) {
+            for key_bind in key_binds.iter_key_binds_available_in_mode(ModeDiscriminant::from(mode))
+            {
                 if key_bind.matches(&key) {
                     messages.push(key_bind.message());
                     handled = true;
@@ -2721,20 +2303,22 @@ fn event_to_messages(ev: Event, key_binds: &KeyBinds, mode: &Mode, messages: &mu
             }
 
             if !handled {
-                match mode {
-                    Mode::InlineReword(..) => {
-                        messages.push(Message::Reword(RewordMessage::InlineInput(ev)));
+                if branch_picker.is_some() {
+                    messages.push(Message::BranchPicker(BranchPickerMessage::Input(ev)));
+                } else {
+                    match mode {
+                        Mode::InlineReword(..) => {
+                            messages.push(Message::Reword(RewordMessage::InlineInput(ev)));
+                        }
+                        Mode::Command(..) => {
+                            messages.push(Message::Command(CommandMessage::Input(ev)));
+                        }
+                        Mode::Normal
+                        | Mode::Details
+                        | Mode::Rub(..)
+                        | Mode::Commit(..)
+                        | Mode::Move(..) => {}
                     }
-                    Mode::Command(..) => {
-                        messages.push(Message::Command(CommandMessage::Input(ev)));
-                    }
-                    Mode::Normal
-                    | Mode::Branch
-                    | Mode::Details
-                    | Mode::Rub(..)
-                    | Mode::RubButApi(..)
-                    | Mode::Commit(..)
-                    | Mode::Move(..) => {}
                 }
             }
         }
@@ -2748,13 +2332,7 @@ fn event_to_messages(ev: Event, key_binds: &KeyBinds, mode: &Mode, messages: &mu
             Mode::Command(..) => {
                 messages.push(Message::Command(CommandMessage::Input(ev)));
             }
-            Mode::Normal
-            | Mode::Branch
-            | Mode::Details
-            | Mode::Rub(..)
-            | Mode::RubButApi(..)
-            | Mode::Commit(..)
-            | Mode::Move(..) => {
+            Mode::Normal | Mode::Details | Mode::Rub(..) | Mode::Commit(..) | Mode::Move(..) => {
                 messages.push(Message::JustRender);
             }
         },
@@ -2765,7 +2343,8 @@ fn event_to_messages(ev: Event, key_binds: &KeyBinds, mode: &Mode, messages: &mu
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(MessageDiscriminant))]
 enum Message {
     // Lifecycle
     JustRender,
@@ -2780,12 +2359,18 @@ enum Message {
     Confirm(ConfirmMessage),
     Discard,
     DropToBeDiscarded,
+    GrowDetails,
+    ShrinkDetails,
 
     // Cursor movement
     MoveCursorUp,
     MoveCursorDown,
     MoveCursorPreviousSection,
     MoveCursorNextSection,
+    SelectUnassigned,
+    SelectMergeBase,
+    PickAndGotoBranch,
+    SelectBranch(FullName),
 
     // Features
     Commit(CommitMessage),
@@ -2794,37 +2379,25 @@ enum Message {
     Command(CommandMessage),
     Files(FilesMessage),
     Move(MoveMessage),
-    Branch(BranchMessage),
     Details(DetailsMessage),
+    BranchPicker(BranchPickerMessage),
+    Help(HelpMessage),
     EnterDetailsMode,
     LeaveDetailsMode,
+    NewBranch,
+    ToggleHelp,
 
     // Utilities
     CopySelection,
-    #[expect(clippy::type_complexity)]
-    RunAfterConfirmation(
-        DebugAsType<
-            Rc<
-                RefCell<
-                    Option<
-                        Box<
-                            dyn FnOnce(
-                                &mut App,
-                                &mut Context,
-                                &mut Vec<Message>,
-                            ) -> anyhow::Result<()>,
-                        >,
-                    >,
-                >,
-            >,
-        >,
-    ),
-    RegisterMessageOnDrop(Rc<Receiver<Message>>),
+    #[expect(clippy::enum_variant_names)]
+    RegisterOutOfBandMessage(Rc<Receiver<Message>>),
     WithOneFrameDelay(Box<Message>),
     AndThen {
         lhs: Box<Message>,
         rhs: Box<Message>,
     },
+    #[allow(dead_code)]
+    Debug(&'static str),
 }
 
 impl Message {
@@ -2845,19 +2418,21 @@ impl Message {
 
 #[derive(Debug, Clone)]
 enum RubMessage {
-    Start {
-        using_but_api: bool,
-    },
+    Start,
     StartWithSource {
         source: RubSource,
         unlock_details: Option<MessageOnDrop>,
     },
+    StartReverse,
+    UseTargetMessage,
+    UseSourceMessage,
     Confirm,
 }
 
 #[derive(Debug, Clone)]
 enum RewordMessage {
     WithEditor,
+    OpenEditor,
     InlineStart,
     InlineInput(Event),
     InlineConfirm,
@@ -2865,7 +2440,7 @@ enum RewordMessage {
 
 #[derive(Debug, Clone)]
 enum CommandMessage {
-    Start,
+    Start(CommandModeKind),
     Input(Event),
     Confirm,
 }
@@ -2874,21 +2449,14 @@ enum CommandMessage {
 enum CommitMessage {
     CreateEmpty,
     Start,
-    SetInsertSide(InsertSide),
-    Confirm { with_message: bool },
+    ToggleMessageComposer(CommitMessageComposer),
+    Confirm,
 }
 
 #[derive(Debug, Clone)]
 enum MoveMessage {
     Start,
-    SetInsertSide(InsertSide),
     Confirm,
-}
-
-#[derive(Debug, Clone)]
-enum BranchMessage {
-    Start,
-    New,
 }
 
 #[derive(Debug, Clone)]
@@ -2902,6 +2470,10 @@ enum FilesMessage {
 enum SelectAfterReload {
     Commit(gix::ObjectId),
     FirstFileInCommit(gix::ObjectId),
+    UncommittedFile {
+        path: BString,
+        stack_id: Option<StackId>,
+    },
     Branch(String),
     Stack(StackId),
     CliId(Arc<CliId>),
@@ -2937,15 +2509,6 @@ fn format_error_for_tui(err: &anyhow::Error) -> String {
     output
 }
 
-fn with_noop_output<F, T>(f: F) -> anyhow::Result<T>
-where
-    F: FnOnce(&mut OutputChannel) -> anyhow::Result<T>,
-{
-    let mut out = OutputChannel::new_without_pager_non_json(OutputFormat::None);
-    let t = f(&mut out)?;
-    Ok(t)
-}
-
 /// Formats an exit status for human-readable error messages.
 fn format_exit_status(status: std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
@@ -2955,195 +2518,8 @@ fn format_exit_status(status: std::process::ExitStatus) -> String {
     }
 }
 
-fn rub_operation_display_legacy(source: &CliId, target: &CliId) -> Option<&'static str> {
-    if source == target {
-        return Some(NOOP);
-    }
-
-    Some(match rub::route_operation(source, target)? {
-        RubOperation::UnassignUncommitted(..) => "unassign hunks",
-        RubOperation::UncommittedToCommit(..) => "amend commit",
-        RubOperation::UncommittedToBranch(..) => "assign hunks",
-        RubOperation::UncommittedToStack(..) => "assign hunks",
-        RubOperation::StackToUnassigned(..) => "unassign hunks",
-        RubOperation::StackToStack(..) => "reassign hunks",
-        RubOperation::StackToBranch(..) => "reassign hunks",
-        RubOperation::UnassignedToCommit(..) => "amend commit",
-        RubOperation::UnassignedToBranch(..) => "assign hunks",
-        RubOperation::UnassignedToStack(..) => "assign hunks",
-        RubOperation::UndoCommit(..) => "undo commit",
-        RubOperation::SquashCommits(..) => "squash commits",
-        RubOperation::MoveCommitToBranch(..) => "move commit",
-        RubOperation::BranchToUnassigned(..) => "unassign hunks",
-        RubOperation::BranchToStack(..) => "reassign hunks",
-        RubOperation::BranchToCommit(..) => "amend commit",
-        RubOperation::BranchToBranch(..) => "reassign hunks",
-        RubOperation::CommittedFileToBranch(..) => "extract file",
-        RubOperation::CommittedFileToCommit(..) => "move file",
-        RubOperation::CommittedFileToUnassigned(..) => "extract file",
-    })
-}
-
-fn commit_operation_display(
-    data: &StatusOutputLineData,
-    mode: &CommitMode,
-) -> Option<&'static str> {
-    match data {
-        StatusOutputLineData::Branch { cli_id } => {
-            if let Some(stack_scope) = mode.scope_to_stack
-                && let Some(stack_id) = cli_id.stack_id()
-                && stack_scope != stack_id
-            {
-                // don't allow selecting branches outside the scoped stack
-                None
-            } else {
-                Some("commit to branch")
-            }
-        }
-        StatusOutputLineData::Commit { stack_id, .. } => {
-            if let Some(stack_scope) = mode.scope_to_stack
-                && Some(stack_scope) != *stack_id
-            {
-                // don't allow selecting commits outside the scoped stack
-                None
-            } else {
-                match mode.insert_side {
-                    InsertSide::Above => Some("insert commit above"),
-                    InsertSide::Below => Some("insert commit below"),
-                }
-            }
-        }
-        StatusOutputLineData::StagedChanges { .. }
-        | StatusOutputLineData::StagedFile { .. }
-        | StatusOutputLineData::UnassignedChanges { .. }
-        | StatusOutputLineData::UnassignedFile { .. }
-        | StatusOutputLineData::UpdateNotice
-        | StatusOutputLineData::Connector
-        | StatusOutputLineData::CommitMessage
-        | StatusOutputLineData::EmptyCommitMessage
-        | StatusOutputLineData::File { .. }
-        | StatusOutputLineData::MergeBase
-        | StatusOutputLineData::UpstreamChanges
-        | StatusOutputLineData::Warning
-        | StatusOutputLineData::Hint
-        | StatusOutputLineData::NoAssignmentsUnstaged => None,
-    }
-}
-
-fn move_operation_display(data: &StatusOutputLineData, mode: &MoveMode) -> Option<&'static str> {
-    match &*mode.source {
-        MoveSource::Commit { .. } => match data {
-            StatusOutputLineData::Commit { .. } => match mode.insert_side {
-                InsertSide::Above => Some("move commit above"),
-                InsertSide::Below => Some("move commit below"),
-            },
-            StatusOutputLineData::Branch { .. } => Some("move commit to branch"),
-            StatusOutputLineData::UpdateNotice
-            | StatusOutputLineData::Connector
-            | StatusOutputLineData::StagedChanges { .. }
-            | StatusOutputLineData::StagedFile { .. }
-            | StatusOutputLineData::UnassignedChanges { .. }
-            | StatusOutputLineData::UnassignedFile { .. }
-            | StatusOutputLineData::CommitMessage
-            | StatusOutputLineData::EmptyCommitMessage
-            | StatusOutputLineData::File { .. }
-            | StatusOutputLineData::MergeBase
-            | StatusOutputLineData::UpstreamChanges
-            | StatusOutputLineData::Warning
-            | StatusOutputLineData::Hint
-            | StatusOutputLineData::NoAssignmentsUnstaged => None,
-        },
-        MoveSource::Branch { .. } => match data {
-            StatusOutputLineData::Branch { .. } => Some("move branch"),
-            StatusOutputLineData::MergeBase => Some("tear off branch"),
-            StatusOutputLineData::UpdateNotice
-            | StatusOutputLineData::Commit { .. }
-            | StatusOutputLineData::Connector
-            | StatusOutputLineData::StagedChanges { .. }
-            | StatusOutputLineData::StagedFile { .. }
-            | StatusOutputLineData::UnassignedChanges { .. }
-            | StatusOutputLineData::UnassignedFile { .. }
-            | StatusOutputLineData::CommitMessage
-            | StatusOutputLineData::EmptyCommitMessage
-            | StatusOutputLineData::File { .. }
-            | StatusOutputLineData::UpstreamChanges
-            | StatusOutputLineData::Warning
-            | StatusOutputLineData::Hint
-            | StatusOutputLineData::NoAssignmentsUnstaged => None,
-        },
-    }
-}
-
-fn branch_operation_display(data: &StatusOutputLineData) -> Option<&'static str> {
-    match data {
-        StatusOutputLineData::Branch { .. } | StatusOutputLineData::MergeBase => Some("target"),
-        StatusOutputLineData::UpdateNotice
-        | StatusOutputLineData::Connector
-        | StatusOutputLineData::StagedChanges { .. }
-        | StatusOutputLineData::StagedFile { .. }
-        | StatusOutputLineData::UnassignedChanges { .. }
-        | StatusOutputLineData::UnassignedFile { .. }
-        | StatusOutputLineData::Commit { .. }
-        | StatusOutputLineData::CommitMessage
-        | StatusOutputLineData::EmptyCommitMessage
-        | StatusOutputLineData::File { .. }
-        | StatusOutputLineData::UpstreamChanges
-        | StatusOutputLineData::Warning
-        | StatusOutputLineData::Hint
-        | StatusOutputLineData::NoAssignmentsUnstaged => None,
-    }
-}
-
-fn source_span() -> Span<'static> {
-    Span::raw("<< source >>").mode_colors(&Mode::Normal)
-}
-
-trait SpanExt {
-    fn mode_colors(self, mode: &Mode) -> Self;
-}
-
-impl SpanExt for Span<'_> {
-    fn mode_colors(self, mode: &Mode) -> Self {
-        self.fg(mode.fg()).bg(mode.bg())
-    }
-}
-
-enum StatusListItem {
-    Single(Line<'static>),
-    Double(Line<'static>, Line<'static>),
-}
-
-impl IntoIterator for StatusListItem {
-    type Item = ListItem<'static>;
-    type IntoIter =
-        Either<std::iter::Once<ListItem<'static>>, std::array::IntoIter<ListItem<'static>, 2>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        match self {
-            StatusListItem::Single(line) => Either::Left(once(ListItem::new(line))),
-            StatusListItem::Double(line1, line2) => {
-                Either::Right([ListItem::new(line1), ListItem::new(line2)].into_iter())
-            }
-        }
-    }
-}
-
 enum MoveTarget<'a> {
     Branch { name: &'a str },
     Commit { commit_id: gix::ObjectId },
     MergeBase,
-}
-
-fn run_after_confirmation_msg<F>(f: F) -> Message
-where
-    F: FnOnce(&mut App, &mut Context, &mut Vec<Message>) -> anyhow::Result<()> + 'static,
-{
-    Message::RunAfterConfirmation(DebugAsType(Rc::new(RefCell::new(Some(Box::new(
-        move |app, ctx, messages| f(app, ctx, messages),
-    ))))))
-}
-
-struct StatusLayout {
-    status_area: Rect,
-    details_area: Option<Rect>,
 }

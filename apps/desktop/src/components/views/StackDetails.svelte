@@ -66,7 +66,7 @@
 		maxWidth: 64,
 		defaultValue: 37,
 	};
-	const DETAILS_RIGHT_PADDING_REM = 1.125;
+	const DETAILS_RIGHT_PADDING_REM = 1;
 
 	const commitQuery = $derived(
 		controller.commitId
@@ -84,7 +84,7 @@
 	);
 
 	function onerror(err: unknown) {
-		if (isParsedError(err) && err.code === "errors.branch.notfound") {
+		if (isParsedError(err) && err.code === "BranchNotFound") {
 			controller.selection.set(undefined);
 			console.warn("Workspace selection cleared");
 		}
@@ -277,7 +277,8 @@
 		viewport={detailsEl}
 		persistId="resizer-panel2-${stackId}"
 		direction="right"
-		showBorder
+		edgeOffsetRem={DETAILS_RIGHT_PADDING_REM}
+		fullLayerCrossAxis
 		minWidth={RESIZER_CONFIG.minWidth}
 		maxWidth={RESIZER_CONFIG.maxWidth}
 		defaultValue={RESIZER_CONFIG.defaultValue}

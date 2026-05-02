@@ -145,10 +145,6 @@ Until that refactor lands, the `gitbutler-branch-actions` items below should be 
 "remaining legacy virtual-branches consumers", including `ctx.virtual_branches()` call sites,
 not as independent stateful-handle flows.
 
-#### gitbutler-cli (1)
-
-- [ ] `crates/gitbutler-cli/src/command/vbranch.rs`
-
 #### gitbutler-operating-modes (1)
 
 - [ ] `crates/gitbutler-operating-modes/src/lib.rs`
@@ -203,7 +199,6 @@ Sync the TOML file _on drop_ only, knowing well that this may write data that is
     - `crates/but-cherry-apply/tests/cherry_apply/main.rs`
     - `crates/but-claude/src/hooks/mod.rs`
     - `crates/but-cursor/src/lib.rs`
-    - `crates/but-testing/src/command/mod.rs`
     - `crates/but-tools/src/workspace.rs`
     - `crates/but-workspace/src/legacy/mod.rs`
     - `crates/but-worktrees/tests/worktree/main.rs`
@@ -211,7 +206,6 @@ Sync the TOML file _on drop_ only, knowing well that this may write data that is
     - `crates/but/src/legacy/commits.rs`
     - `crates/gitbutler-branch-actions/src/upstream_integration.rs`
     - `crates/gitbutler-branch-actions/tests/branch-actions/virtual_branches/mod.rs`
-    - `crates/gitbutler-cli/src/command/vbranch.rs`
     - `crates/but-testsupport/src/legacy.rs`
 - [ ] Not started
 

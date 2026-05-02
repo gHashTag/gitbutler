@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use bstr::{BString, ByteSlice};
 use but_api::diff::ComputeLineStats;
-use but_core::sync::RepoExclusive;
+use but_core::{DryRun, sync::RepoExclusive};
 use but_ctx::Context;
 use gix::prelude::ObjectIdExt;
 
@@ -125,7 +125,8 @@ fn prepare_provided_message(msg: Option<&str>, entity: &str) -> Option<Result<St
 pub(crate) fn get_commit_message_from_editor(
     ctx: &mut Context,
     commit_details: but_core::diff::CommitDetails,
-    current_message: String,
+    editor_initial_message: String,
+    current_message_for_comparison: &str,
     show_diff_in_editor: ShowDiffInEditor,
 ) -> Result<Option<String>> {
     let changed_files = get_changed_files_from_commit_details(&commit_details);
@@ -138,16 +139,19 @@ pub(crate) fn get_commit_message_from_editor(
             commit_details
                 .diff_with_first_parent
                 .iter()
-                .map(|change| change.unified_diff(&*ctx.repo.get()?, 3))
+                .map(|change| change.unified_diff(&*ctx.repo.get()?, ctx.settings.context_lines))
                 .filter_map(|diff| diff.transpose())
                 .collect::<Result<Vec<_>>>()
         })
         .transpose()?;
 
-    let new_message =
-        actually_get_commit_message_from_editor(&current_message, &changed_files, diff.as_deref())?;
+    let new_message = actually_get_commit_message_from_editor(
+        &editor_initial_message,
+        &changed_files,
+        diff.as_deref(),
+    )?;
 
-    if should_update_commit_message(&current_message, &new_message) {
+    if should_update_commit_message(current_message_for_comparison, &new_message) {
         Ok(Some(normalize_commit_message(&new_message).to_owned()))
     } else {
         Ok(None)
@@ -183,6 +187,7 @@ fn edit_commit_message_by_id_and_reword_commit(
             ctx,
             commit_details,
             current_message.clone(),
+            &current_message,
             show_diff_in_editor,
         )?
     }
@@ -193,6 +198,7 @@ fn edit_commit_message_by_id_and_reword_commit(
             ctx,
             commit_oid,
             BString::from(new_message),
+            DryRun::No,
             perm,
         )?;
 
@@ -281,7 +287,7 @@ fn actually_get_commit_message_from_editor(
     Ok(lossy_message)
 }
 
-fn get_branch_name_from_editor(current_name: &str) -> Result<String> {
+pub(crate) fn get_branch_name_from_editor(current_name: &str) -> Result<String> {
     let mut template = String::new();
     template.push_str(current_name);
     if !current_name.is_empty() && !current_name.ends_with('\n') {

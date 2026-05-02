@@ -55,6 +55,7 @@
 //! ```
 #![expect(clippy::inconsistent_digit_grouping)]
 #![deny(missing_docs)]
+use but_utils::OnDemand;
 use rusqlite::ErrorCode;
 use std::path::PathBuf;
 
@@ -154,7 +155,7 @@ pub struct M<'a> {
     /// The creation time of the `up` field, in a format like `20250529110746`, so it's suitable for sorting
     up_created_at: u64,
     /// The forward-compatibility schema version after this migration has been applied.
-    schema_version: SchemaVersion,
+    schema_version: u32,
 }
 
 /// Documents the forward-compatibility boundary associated with a migration.
@@ -205,6 +206,9 @@ pub struct DbHandle {
     conn: rusqlite::Connection,
     /// The path at which the connection was opened, mainly for debugging.
     path: PathBuf,
+    /// A lazily opened project-local cache. It is in-memory of the parent instance is in-memory,
+    /// or in the same directory as the parent instance.
+    pub cache: OnDemand<CacheHandle>,
 }
 
 /// A wrapper for a [`rusqlite::Transaction`] to allow ORM handles to be created more easily,

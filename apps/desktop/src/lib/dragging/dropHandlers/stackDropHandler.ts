@@ -8,15 +8,17 @@ import {
 import { BranchDropData } from "$lib/dragging/dropHandlers/branchDropHandler";
 import { unstackPRs, updateStackPrs } from "$lib/forge/shared/prFooter";
 import StackMacros from "$lib/stacks/macros";
-import { handleMoveBranchResult } from "$lib/stacks/stack";
+import { toMoveBranchWarning } from "$lib/stacks/stack";
 import { ensureValue } from "$lib/utils/validation";
 import { chipToasts } from "@gitbutler/ui";
+import type { DropResult } from "$lib/dragging/dropResult";
 import type { DropzoneHandler } from "$lib/dragging/handler";
 import type { ForgePrService } from "$lib/forge/interface/forgePrService";
 import type { DiffService } from "$lib/hunks/diffService.svelte";
 import type { UncommittedService } from "$lib/selection/uncommittedService.svelte";
 import type { StackService } from "$lib/stacks/stackService.svelte";
 import type { UiState } from "$lib/state/uiState.svelte";
+import type { HunkAssignmentTarget } from "@gitbutler/but-sdk";
 
 /** Handler when drop changes on a special outside lanes dropzone. */
 export class OutsideLaneDzHandler implements DropzoneHandler {
@@ -32,6 +34,10 @@ export class OutsideLaneDzHandler implements DropzoneHandler {
 		private readonly baseBranchName: string | undefined,
 	) {
 		this.macros = new StackMacros(this.projectId, this.stackService, this.uiState);
+	}
+
+	private stackTarget(stackId: string): HunkAssignmentTarget {
+		return { type: "stack", subject: { stackId } };
 	}
 
 	private acceptsChangeDropData(data: unknown): data is ChangeDropData {
@@ -138,7 +144,11 @@ export class OutsideLaneDzHandler implements DropzoneHandler {
 					.flatMap((c) =>
 						this.uncommittedService.getAssignmentsByPath(data.stackId ?? null, c.path),
 					)
-					.map((h) => ({ ...h, stackId: ensureValue(stack.id) }));
+					.map((h) => ({
+						hunkHeader: h.hunkHeader,
+						pathBytes: h.pathBytes,
+						target: this.stackTarget(ensureValue(stack.id)),
+					}));
 				await this.diffService.assignHunk({
 					projectId: this.projectId,
 					assignments,
@@ -206,24 +216,30 @@ export class OutsideLaneDzHandler implements DropzoneHandler {
 
 				await this.diffService.assignHunk({
 					projectId: this.projectId,
-					assignments: [{ ...assignment, stackId: ensureValue(stack.id) }],
+					assignments: [
+						{
+							hunkHeader: assignment.hunkHeader,
+							pathBytes: assignment.pathBytes,
+							target: this.stackTarget(ensureValue(stack.id)),
+						},
+					],
 				});
 				break;
 			}
 		}
 	}
 
-	async ondropBranchData(data: BranchDropData) {
-		await this.stackService
-			.tearOffBranch({
-				projectId: this.projectId,
-				sourceStackId: data.stackId,
-				subjectBranchName: data.branchName,
-			})
-			.then(async (result) => {
-				handleMoveBranchResult(result);
-				return await this.updatePrDescriptions(data);
-			});
+	async ondropBranchData(data: BranchDropData): Promise<DropResult | void> {
+		const beforeAppliedStackCount = (await this.stackService.fetchStacks(this.projectId)).length;
+		const result = await this.stackService.tearOffBranch({
+			projectId: this.projectId,
+			sourceStackId: data.stackId,
+			subjectBranchName: data.branchName,
+		});
+		const afterAppliedStackCount = result.workspace.headInfo.stacks.length;
+		const unappliedStackCount = Math.max(0, beforeAppliedStackCount + 1 - afterAppliedStackCount);
+		await this.updatePrDescriptions(data);
+		return toMoveBranchWarning(unappliedStackCount);
 	}
 
 	private async updatePrDescriptions(data: BranchDropData) {
@@ -242,7 +258,7 @@ export class OutsideLaneDzHandler implements DropzoneHandler {
 		await updateStackPrs(this.prService, branchDetails, this.baseBranchName);
 	}
 
-	async ondrop(data: unknown): Promise<void> {
+	async ondrop(data: unknown): Promise<DropResult | void> {
 		if (this.acceptsChangeDropData(data)) {
 			await this.ondropChangeData(data);
 			return;
@@ -254,8 +270,7 @@ export class OutsideLaneDzHandler implements DropzoneHandler {
 		}
 
 		if (this.acceptsBranchDropData(data)) {
-			await this.ondropBranchData(data);
-			return;
+			return await this.ondropBranchData(data);
 		}
 	}
 }

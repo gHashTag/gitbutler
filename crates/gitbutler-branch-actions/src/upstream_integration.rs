@@ -1,47 +1,57 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, Result, bail};
 use bstr::ByteSlice;
-use but_core::{Reference, RepositoryExt};
+use but_core::{RefMetadata, Reference, RepositoryExt, WORKSPACE_REF_NAME};
 use but_ctx::{Context, access::RepoExclusive};
 use but_rebase::{RebaseOutput, RebaseStep};
 use but_serde::BStringForFrontend;
 use but_workspace::{legacy::stack_ext::StackDetailsExt, ref_info::Options};
 use gitbutler_commit::commit_ext::CommitExt as _;
 use gitbutler_repo::{first_parent_commit_ids_until, rebase::merge_commits};
-use gitbutler_stack::{StackId, Target, VirtualBranchesHandle};
+use gitbutler_stack::{StackId, VirtualBranchesHandle};
 use gitbutler_workspace::branch_trees::{WorkspaceState, update_uncommitted_changes};
 use gix::merge::tree::TreatAsUnresolved;
 use serde::{Deserialize, Serialize};
 
-use crate::{BranchManagerExt, VirtualBranchesExt as _};
+use crate::BranchManagerExt;
 
 #[derive(Serialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct NameAndStatus {
     pub name: String,
     pub status: BranchStatus,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(NameAndStatus);
 
 #[derive(Serialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StackStatus {
-    pub tree_status: TreeStatus,
+    pub tree_status: UpstreamTreeStatus,
     pub branch_statuses: Vec<NameAndStatus>,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(StackStatus);
 
 #[derive(Serialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject", rename_all = "camelCase")]
-pub enum TreeStatus {
-    SaflyUpdatable,
+pub enum UpstreamTreeStatus {
+    SafelyUpdatable,
     Conflicted,
     Empty,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(UpstreamTreeStatus);
 
 #[derive(Serialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject", rename_all = "camelCase")]
 pub enum BranchStatus {
-    SaflyUpdatable,
+    SafelyUpdatable,
     Integrated,
     Conflicted {
         /// If the branch can be rebased onto the target without conflicts
@@ -49,27 +59,41 @@ pub enum BranchStatus {
     },
     Empty,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(BranchStatus);
 
 #[derive(Serialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject", rename_all = "camelCase")]
 pub enum StackStatuses {
     UpToDate,
     UpdatesRequired {
         #[serde(rename = "worktreeConflicts")]
+        #[cfg_attr(feature = "export-schema", schemars(with = "Vec<String>"))]
         worktree_conflicts: Vec<BStringForFrontend>,
+        #[cfg_attr(
+            feature = "export-schema",
+            schemars(with = "Vec<(Option<String>, StackStatus)>")
+        )]
         statuses: Vec<(Option<StackId>, StackStatus)>,
     },
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(StackStatuses);
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject", rename_all = "camelCase")]
 pub enum BaseBranchResolutionApproach {
     Rebase,
     Merge,
     HardReset,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(BaseBranchResolutionApproach);
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "subject", rename_all = "camelCase")]
 pub enum ResolutionApproach {
     Rebase,
@@ -77,24 +101,39 @@ pub enum ResolutionApproach {
     Unapply,
     Delete,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(ResolutionApproach);
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct BaseBranchResolution {
     #[serde(with = "but_serde::object_id")]
+    #[cfg_attr(
+        feature = "export-schema",
+        schemars(schema_with = "but_schemars::object_id")
+    )]
     target_commit_oid: gix::ObjectId,
     approach: BaseBranchResolutionApproach,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(BaseBranchResolution);
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationOutcome {
     /// The list of branches that have been deleted as a result of the upstream integration
     deleted_branches: Vec<String>,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(IntegrationOutcome);
 
 impl StackStatus {
-    fn create(tree_status: TreeStatus, branch_statuses: Vec<NameAndStatus>) -> Result<Self> {
+    fn create(
+        tree_status: UpstreamTreeStatus,
+        branch_statuses: Vec<NameAndStatus>,
+    ) -> Result<Self> {
         if branch_statuses.is_empty() {
             bail!("Branch statuses must not be empty")
         }
@@ -106,7 +145,7 @@ impl StackStatus {
     }
 
     fn resolution_acceptable(&self, approach: &ResolutionApproach) -> bool {
-        if self.tree_status == TreeStatus::Empty
+        if self.tree_status == UpstreamTreeStatus::Empty
             && self
                 .branch_statuses
                 .iter()
@@ -139,12 +178,19 @@ impl StackStatus {
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Resolution {
+    #[cfg_attr(
+        feature = "export-schema",
+        schemars(schema_with = "but_schemars::stack_id")
+    )]
     pub stack_id: StackId,
     pub approach: ResolutionApproach,
     pub delete_integrated_branches: bool,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(Resolution);
 
 enum IntegrationResult {
     UpdatedObjects {
@@ -161,7 +207,8 @@ pub struct UpstreamIntegrationContext<'a> {
     ctx: &'a Context,
     stacks_in_workspace: Vec<but_workspace::legacy::ui::StackEntry>,
     new_target: gix::ObjectId,
-    target: Target,
+    target_ref_name: gix::refs::FullName,
+    old_target_id: gix::ObjectId,
     gix_repo: &'a gix::Repository,
     review_map: &'a HashMap<String, but_forge::ForgeReview>,
 }
@@ -177,7 +224,6 @@ impl<'a> UpstreamIntegrationContext<'a> {
         {
             let meta = ctx.meta()?;
             let repo = ctx.repo.get()?;
-            let mut cache = ctx.cache.get_cache_mut()?;
             let _ref_info = but_workspace::head_info(
                 &repo,
                 &meta,
@@ -185,17 +231,24 @@ impl<'a> UpstreamIntegrationContext<'a> {
                     expensive_commit_info: true,
                     traversal: but_graph::init::Options::limited(),
                 },
-                &mut cache,
             )?;
         }
 
-        let virtual_branches_handle = ctx.virtual_branches();
-        let target = virtual_branches_handle.get_default_target()?;
+        let (target_ref_name, old_target_id) = {
+            let (_repo, ws, _db) = ctx.workspace_and_db_with_perm(permission.read_permission())?;
+            (
+                ws.target_ref_name()
+                    .context("failed to get target reference name")?
+                    .to_owned(),
+                ws.target_base_commit_id()
+                    .context("failed to get target base oid")?,
+            )
+        };
         let new_target = match target_commit_oid {
             Some(oid) => oid,
             None => {
                 gix_repo
-                    .find_reference(&target.branch.to_string())?
+                    .find_reference(target_ref_name.as_ref())?
                     .peel_to_commit()?
                     .id
             }
@@ -206,7 +259,8 @@ impl<'a> UpstreamIntegrationContext<'a> {
         Ok(Self {
             _permission: Some(permission),
             new_target,
-            target: target.clone(),
+            target_ref_name,
+            old_target_id,
             stacks_in_workspace,
             ctx,
             gix_repo,
@@ -215,29 +269,28 @@ impl<'a> UpstreamIntegrationContext<'a> {
     }
 }
 
+#[expect(deprecated, reason = "calls but_workspace::legacy::stacks_v3")]
 fn stacks(
     ctx: &Context,
     repo: &gix::Repository,
 ) -> anyhow::Result<Vec<but_workspace::legacy::ui::StackEntry>> {
     let meta = ctx.legacy_meta()?;
-    let mut cache = ctx.cache.get_cache_mut()?;
     but_workspace::legacy::stacks_v3(
         repo,
         &meta,
         but_workspace::legacy::StacksFilter::InWorkspace,
         None,
-        &mut cache,
     )
 }
 
+#[expect(deprecated, reason = "calls but_workspace::legacy::stack_details_v3")]
 fn stack_details(
     ctx: &Context,
     stack_id: Option<StackId>,
 ) -> anyhow::Result<but_workspace::ui::StackDetails> {
     let repo = ctx.clone_repo_for_merging_non_persisting()?;
     let meta = ctx.legacy_meta()?;
-    let mut cache = ctx.cache.get_cache_mut()?;
-    but_workspace::legacy::stack_details_v3(stack_id, &repo, &meta, &mut cache)
+    but_workspace::legacy::stack_details_v3(stack_id, &repo, &meta)
 }
 
 /// Returns the status of a stack.
@@ -310,7 +363,7 @@ fn get_stack_status(
         let mut rebase = but_rebase::Rebase::new(gix_repo, Some(rebase_base), None)?;
         rebase.rebase_noops(false);
         rebase.steps(steps)?;
-        let output = rebase.rebase(&*ctx.cache.get_cache()?)?;
+        let output = rebase.rebase()?;
         let new_head_oid = output.top_commit;
 
         let any_conflicted = output.commit_mapping.iter().any(|(_base, _old, new)| {
@@ -328,12 +381,12 @@ fn get_stack_status(
             status: if any_conflicted {
                 BranchStatus::Conflicted { rebasable: false }
             } else {
-                BranchStatus::SaflyUpdatable
+                BranchStatus::SafelyUpdatable
             },
         });
     }
 
-    StackStatus::create(TreeStatus::Empty, branch_statuses)
+    StackStatus::create(UpstreamTreeStatus::Empty, branch_statuses)
 }
 
 pub fn upstream_integration_statuses(
@@ -341,7 +394,7 @@ pub fn upstream_integration_statuses(
 ) -> Result<StackStatuses> {
     let UpstreamIntegrationContext {
         new_target,
-        target,
+        old_target_id,
         stacks_in_workspace,
         review_map,
         ctx,
@@ -351,7 +404,7 @@ pub fn upstream_integration_statuses(
     let repo = ctx.clone_repo_for_merging()?;
     let repo_in_memory = repo.clone().with_object_memory();
 
-    if *new_target == target.sha {
+    if *new_target == *old_target_id {
         return Ok(StackStatuses::UpToDate);
     };
 
@@ -369,7 +422,7 @@ pub fn upstream_integration_statuses(
         .tree_id()?;
 
     // The working directory tree
-    #[expect(deprecated)]
+    #[expect(deprecated, reason = "calls repo.create_wd_tree")]
     let workdir_tree = repo.create_wd_tree(gitbutler_project::AUTO_TRACK_LIMIT_BYTES)?;
 
     // The target tree
@@ -445,7 +498,6 @@ pub(crate) fn integrate_upstream(
     let context =
         UpstreamIntegrationContext::open(ctx, target_commit_oid, permission, &repo, review_map)?;
     let mut virtual_branches_state = VirtualBranchesHandle::new(ctx.project_data_dir());
-    let default_target = virtual_branches_state.get_default_target()?;
 
     let mut deleted_branches = vec![];
 
@@ -556,10 +608,15 @@ pub(crate) fn integrate_upstream(
 
         let mut stacks = virtual_branches_state.list_stacks_in_workspace()?;
 
-        virtual_branches_state.set_default_target(Target {
-            sha: context.new_target,
-            ..default_target
-        })?;
+        {
+            let workspace_ref: gix::refs::FullName = WORKSPACE_REF_NAME.try_into()?;
+            let mut meta = ctx.legacy_meta()?;
+            let mut workspace = meta.workspace(workspace_ref.as_ref())?;
+            workspace.target_commit_id = Some(context.new_target);
+            meta.set_workspace(&workspace)?;
+            meta.write_unreconciled()?;
+            ctx.invalidate_workspace_cache()?;
+        }
 
         // Update branch trees
         for (maybe_stack_id, integration_result) in &integration_results {
@@ -581,9 +638,37 @@ pub(crate) fn integrate_upstream(
                 continue;
             };
 
-            // Update the branch heads
+            let delete_local_refs = resolutions
+                .iter()
+                .find(|r| r.stack_id == *stack_id)
+                .map(|r| r.delete_integrated_branches)
+                .unwrap_or(false);
+
+            // Archive integrated heads before updating branch heads.
+            // `for_archival` captures branches that lost all commits during
+            // integrated-commit filtering. We must archive these before
+            // calling `set_heads_from_rebase_output`, which validates that
+            // rebase references match exactly the non-archived heads.
+            let stack_branches_deleted =
+                stack.archive_integrated_heads(ctx, &repo, for_archival, delete_local_refs)?;
+            deleted_branches.extend(stack_branches_deleted);
+
+            // Update the branch heads, filtering out references for archived
+            // heads so the validation in `set_all_heads` sees a consistent set.
             if let Some(output) = rebase_output {
-                stack.set_heads_from_rebase_output(ctx, output.references.clone())?;
+                let archived_names: HashSet<&str> = stack
+                    .heads
+                    .iter()
+                    .filter(|h| h.archived)
+                    .map(|h| h.name().as_str())
+                    .collect();
+                let active_references: Vec<_> = output
+                    .references
+                    .iter()
+                    .filter(|r| !archived_names.contains(r.reference.to_string().as_str()))
+                    .cloned()
+                    .collect();
+                stack.set_heads_from_rebase_output(ctx, active_references)?;
             }
 
             // Dissociate closed reviews
@@ -597,16 +682,6 @@ pub(crate) fn integrate_upstream(
             }
 
             stack.set_stack_head(&mut virtual_branches_state, &repo, *head)?;
-
-            let delete_local_refs = resolutions
-                .iter()
-                .find(|r| r.stack_id == *stack_id)
-                .map(|r| r.delete_integrated_branches)
-                .unwrap_or(false);
-
-            let stack_branches_deleted =
-                stack.archive_integrated_heads(ctx, &repo, for_archival, delete_local_refs)?;
-            deleted_branches.extend(stack_branches_deleted);
         }
 
         {
@@ -636,13 +711,13 @@ pub(crate) fn resolve_upstream_integration(
     let repo = ctx.repo.get()?;
     let context = UpstreamIntegrationContext::open(ctx, None, permission, &repo, review_map)?;
     let new_target_id = context.new_target;
-    let old_target_id = context.target.sha;
+    let old_target_id = context.old_target_id;
     let fork_point = repo.merge_base(old_target_id, new_target_id)?.detach();
 
     match resolution_approach {
         BaseBranchResolutionApproach::HardReset => Ok(new_target_id),
         BaseBranchResolutionApproach::Merge => {
-            let branch_name = context.target.branch.to_string();
+            let branch_name = context.target_ref_name.as_bstr().to_str_lossy();
             let new_head = merge_commits(
                 &repo,
                 old_target_id,
@@ -663,7 +738,7 @@ pub(crate) fn resolve_upstream_integration(
             let mut rebase = but_rebase::Rebase::new(&repo, Some(new_target_id), None)?;
             rebase.steps(steps)?;
             rebase.rebase_noops(false);
-            let outcome = rebase.rebase(&*ctx.cache.get_cache()?)?;
+            let outcome = rebase.rebase()?;
             Ok(outcome.top_commit)
         }
     }
@@ -676,7 +751,8 @@ fn compute_resolutions(
 ) -> Result<Vec<(Option<StackId>, IntegrationResult)>> {
     let UpstreamIntegrationContext {
         new_target,
-        target,
+        target_ref_name,
+        old_target_id,
         stacks_in_workspace,
         gix_repo,
         ..
@@ -700,7 +776,7 @@ fn compute_resolutions(
                     let top_branch = stack.heads.last().context("top branch not found")?;
 
                     // These two go into the merge commit message.
-                    let incoming_branch_name = target.branch.fullname();
+                    let incoming_branch_name = target_ref_name.as_bstr().to_str_lossy();
                     let target_branch_name = top_branch.name.to_str()?;
 
                     let new_head = merge_commits(
@@ -726,7 +802,7 @@ fn compute_resolutions(
                     // If the base branch needs to resolve its divergence
                     // pick only the commits that are ahead of the old target head
                     let lower_bound = if base_branch_resolution_approach.is_some() {
-                        target.sha
+                        *old_target_id
                     } else {
                         *new_target
                     };
@@ -778,7 +854,7 @@ fn compute_resolutions(
                         but_rebase::Rebase::new(context.gix_repo, Some(lower_bound), None)?;
                     rebase.rebase_noops(false);
                     rebase.steps(steps)?;
-                    let output = rebase.rebase(&*context.ctx.cache.get_cache()?)?;
+                    let output = rebase.rebase()?;
                     let new_head = output.top_commit;
 
                     Ok((

@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
 use but_ctx::Context;
-use colored::Colorize;
 use gitbutler_branch_actions::BranchListingFilter;
 
-use crate::utils::OutputChannel;
+use crate::{
+    command::legacy::workspace_target,
+    theme::{self, Paint},
+    utils::OutputChannel,
+};
 
 #[expect(clippy::too_many_arguments)]
 pub fn list(
@@ -42,12 +45,17 @@ pub fn list(
         Some(but_workspace::legacy::StacksFilter::InWorkspace),
     )?;
 
-    // Filter out empty branches unless --empty is requested
-    let target_oid_for_filter: Option<gix::ObjectId> = if !show_empty {
-        get_target_oid(ctx).ok()
+    // Resolve the target once for all target-based filtering and calculations we may perform.
+    let target_oid: Option<gix::ObjectId> = if !show_empty || ahead || check_merge {
+        let guard = ctx.shared_worktree_access();
+        Some(
+            workspace_target::ResolvedTarget::resolve_with_perm(ctx, guard.read_permission())?
+                .oid(),
+        )
     } else {
         None
     };
+    let target_oid_for_filter = (!show_empty).then_some(target_oid).flatten();
 
     if let Some(target_oid) = target_oid_for_filter {
         // For applied stacks: remove heads that have no commits on them.
@@ -152,7 +160,7 @@ pub fn list(
     }
 
     // Sort all branches by last commit date (most recent first)
-    branches.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    branches.sort_by_key(|branch| std::cmp::Reverse(branch.updated_at));
 
     // Limit branches unless --all flag is set
     let (branches_to_show, more_count) = if all {
@@ -169,7 +177,11 @@ pub fn list(
 
     // Calculate commits ahead if requested
     let commits_ahead_map: Option<HashMap<String, usize>> = if ahead {
-        Some(calculate_commits_ahead(ctx, &branches_to_show)?)
+        Some(calculate_commits_ahead(
+            ctx,
+            target_oid.expect("target OID must exist when ahead calculation is enabled"),
+            &branches_to_show,
+        )?)
     } else {
         None
     };
@@ -178,6 +190,7 @@ pub fn list(
     let merge_status_map: Option<HashMap<String, bool>> = if check_merge {
         Some(check_branches_merge_cleanly(
             ctx,
+            target_oid.expect("target OID must exist when merge check is enabled"),
             &applied_stacks,
             &branches_to_show,
         )?)
@@ -199,7 +212,7 @@ pub fn list(
     } else if let Some(out) = out.for_human() {
         // Print applied branches section with header
         if !applied_stacks.is_empty() {
-            writeln!(out, "{}", "Applied Branches".green())?;
+            writeln!(out, "Applied branches")?;
             print_applied_branches_table(
                 &applied_stacks,
                 &branch_review_map,
@@ -368,29 +381,13 @@ fn get_reviews_json(
 //             the graph.
 fn check_branches_merge_cleanly(
     ctx: &Context,
+    target_commit_id: gix::ObjectId,
     applied_stacks: &[but_workspace::legacy::ui::StackEntry],
     branches: &[gitbutler_branch_actions::BranchListing],
 ) -> Result<HashMap<String, bool>, anyhow::Error> {
     use but_core::RepositoryExt;
 
     let repo = ctx.clone_repo_for_merging_non_persisting()?;
-
-    let stack = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-    let target = stack.get_default_target()?;
-
-    // Try to find the remote tracking branch (e.g., refs/remotes/origin/master)
-    let target_ref_name = format!(
-        "refs/remotes/{}/{}",
-        target.branch.remote(),
-        target.branch.branch()
-    );
-    let target_commit_id = match repo.find_reference(&target_ref_name) {
-        Ok(reference) => reference.id().detach(),
-        Err(_) => {
-            // Fallback to the stored SHA if remote branch doesn't exist
-            target.sha
-        }
-    };
     let target_tree_id = repo.find_commit(target_commit_id)?.tree_id()?.detach();
     let cache = repo.commit_graph_if_enabled()?;
     let mut graph = repo.revision_graph(cache.as_ref());
@@ -472,27 +469,12 @@ fn check_branches_merge_cleanly(
 
 fn calculate_commits_ahead(
     ctx: &Context,
+    target_oid: gix::ObjectId,
     branches: &[gitbutler_branch_actions::BranchListing],
 ) -> Result<HashMap<String, usize>, anyhow::Error> {
     use gix::prelude::ObjectIdExt as _;
 
     let repo = ctx.repo.get()?;
-    let stack = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-    let target = stack.get_default_target()?;
-
-    // Try to find the remote tracking branch (e.g., refs/remotes/origin/master)
-    let target_ref_name = format!(
-        "refs/remotes/{}/{}",
-        target.branch.remote(),
-        target.branch.branch()
-    );
-    let target_oid = match repo.find_reference(&target_ref_name) {
-        Ok(mut reference) => reference.peel_to_commit()?.id,
-        Err(_) => {
-            // Fallback to the stored SHA if remote branch doesn't exist
-            target.sha
-        }
-    };
 
     let mut result = HashMap::new();
     let cache = repo.commit_graph_if_enabled()?;
@@ -565,6 +547,8 @@ fn print_applied_branches_table(
 ) -> Result<(), anyhow::Error> {
     use crate::tui::{Table, table::Cell};
 
+    let t = theme::get();
+
     if applied_stacks.is_empty() {
         return Ok(());
     }
@@ -604,38 +588,60 @@ fn print_applied_branches_table(
             };
 
             // Type column
-            let type_str = "active".green().to_string();
+            let type_str = "active".to_string();
 
             // Ahead column
             let ahead_str = commits_ahead_map
                 .and_then(|map| map.get(&branch.name.to_string()))
-                .map(|count| format!("↑{count}").bright_cyan().to_string())
+                .map(|count| t.info.paint(format!("↑{count}")))
                 .unwrap_or_default();
 
             // Merge status indicator
             let merge_status_str = if let Some(map) = merge_status_map {
                 match map.get(&branch.name.to_string()) {
-                    Some(true) => "✓ ".green().to_string(),
-                    Some(false) => "✗ ".red().to_string(),
+                    Some(true) => format!("{} ", t.sym().success),
+                    Some(false) => format!("{} ", t.sym().error),
                     None => String::new(),
                 }
             } else {
                 String::new()
             };
 
+            let painted_branch_name = t.local_branch.paint(branch.name.to_string());
+
             // Branch name with tree prefix and merge status
             let branch_with_prefix = if is_single_branch {
-                format!("{}{}{}", merge_status_str, "*".green(), branch.name)
+                format!(
+                    "{}{}{}",
+                    merge_status_str,
+                    t.hint.paint("*"),
+                    painted_branch_name
+                )
             } else if let (Some(first), Some(last)) = (first_branch, last_branch) {
                 if branch.name == first.name {
-                    format!("{}{}{}", merge_status_str, "*-".green(), branch.name)
+                    format!(
+                        "{}{}{}",
+                        merge_status_str,
+                        t.hint.paint("*-"),
+                        painted_branch_name
+                    )
                 } else if branch.name == last.name {
-                    format!("{}{}{}", merge_status_str, "└─".green(), branch.name)
+                    format!(
+                        "{}{}{}",
+                        merge_status_str,
+                        t.hint.paint("└─"),
+                        painted_branch_name
+                    )
                 } else {
-                    format!("{}{}{}", merge_status_str, "├─".green(), branch.name)
+                    format!(
+                        "{}{}{}",
+                        merge_status_str,
+                        t.hint.paint("├─"),
+                        painted_branch_name
+                    )
                 }
             } else {
-                format!("{}{}", merge_status_str, branch.name)
+                format!("{merge_status_str}{painted_branch_name}")
             };
 
             // Get PR/review info
@@ -646,9 +652,9 @@ fn print_applied_branches_table(
                     .map(|r| format!("{}{}", r.unit_symbol, r.number))
                     .collect::<Vec<String>>()
                     .join(", ");
-                format!(" ({review_numbers})").blue().to_string()
+                t.info.paint(format!(" ({review_numbers})"))
             } else {
-                String::new()
+                t.default.paint("")
             };
 
             let branch_str = format!("{branch_with_prefix}{reviews_str}");
@@ -656,9 +662,9 @@ fn print_applied_branches_table(
             table.add_row(vec![
                 Cell::new(type_str),
                 Cell::new(branch_str),
-                Cell::new(ahead_str),
-                Cell::new(date_str.dimmed().to_string()),
-                Cell::new(author_str.dimmed().to_string()),
+                Cell::new(ahead_str.to_string()),
+                Cell::new(t.hint.paint(date_str).to_string()),
+                Cell::new(t.hint.paint(author_str).to_string()),
             ]);
         }
     }
@@ -675,6 +681,7 @@ fn print_branches_table(
     out: &mut (dyn std::fmt::Write + 'static),
 ) -> Result<(), anyhow::Error> {
     use crate::tui::{Table, table::Cell};
+    let t = theme::get();
 
     if branches.is_empty() {
         return Ok(());
@@ -694,24 +701,17 @@ fn print_branches_table(
     let mut table = Table::new(headers);
 
     for branch in branches {
-        // Type column
-        let type_str = if branch.has_local {
-            "local".normal().to_string()
-        } else {
-            "remote".dimmed().to_string()
-        };
-
         // Ahead column
         let ahead_str = commits_ahead_map
             .and_then(|map| map.get(&branch.name.to_string()))
-            .map(|count| format!("↑{count}").bright_cyan().to_string())
+            .map(|count| t.info.paint(format!("↑{count}")).to_string())
             .unwrap_or_default();
 
         // Merge status indicator
         let merge_status_str = if let Some(map) = merge_status_map {
             match map.get(&branch.name.to_string()) {
-                Some(true) => "✓ ".green().to_string(),
-                Some(false) => "✗ ".red().to_string(),
+                Some(true) => format!("{} ", t.sym().success),
+                Some(false) => format!("{} ", t.sym().error),
                 None => String::new(),
             }
         } else {
@@ -737,37 +737,33 @@ fn print_branches_table(
                 .map(|r| format!("{}{}", r.unit_symbol, r.number))
                 .collect::<Vec<String>>()
                 .join(", ");
-            format!(" ({review_numbers})").blue().to_string()
+            t.info.paint(format!(" ({review_numbers})"))
         } else {
-            String::new()
+            t.default.paint("")
         };
 
-        let branch_str = format!("{}{}{}", merge_status_str, branch.name, reviews_str);
+        let (type_str, branch_name) = if branch.has_local {
+            (
+                t.default.paint("local"),
+                t.local_branch.paint(branch.name.to_string()),
+            )
+        } else {
+            (
+                t.hint.paint("remote"),
+                t.remote_branch.paint(branch.name.to_string()),
+            )
+        };
+        let branch_str = format!("{merge_status_str}{branch_name}{reviews_str}");
 
         table.add_row(vec![
-            Cell::new(type_str),
+            Cell::new(type_str.to_string()),
             Cell::new(branch_str),
             Cell::new(ahead_str),
-            Cell::new(date_str.dimmed().to_string()),
-            Cell::new(author_str.dimmed().to_string()),
+            Cell::new(t.hint.paint(date_str).to_string()),
+            Cell::new(t.hint.paint(author_str).to_string()),
         ]);
     }
 
     table.render(out)?;
     Ok(())
-}
-
-fn get_target_oid(ctx: &Context) -> anyhow::Result<gix::ObjectId> {
-    let handle = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-    let target = handle.get_default_target()?;
-    let repo = ctx.repo.get()?;
-    let target_ref = format!(
-        "refs/remotes/{}/{}",
-        target.branch.remote(),
-        target.branch.branch()
-    );
-    match repo.find_reference(&target_ref) {
-        Ok(mut reference) => Ok(reference.peel_to_commit()?.id),
-        Err(_) => Ok(target.sha),
-    }
 }

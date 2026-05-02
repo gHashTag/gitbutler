@@ -41,7 +41,7 @@ impl ActiveProjects {
 
     pub fn set_active(
         &mut self,
-        ctx: &mut Context,
+        ctx: &Context,
         claude: &Claude,
         app_settings_sync: AppSettingsWithDiskSync,
         #[cfg(feature = "irc")] working_files_broadcast: WorkingFilesBroadcast,
@@ -78,6 +78,10 @@ impl ActiveProjects {
                         payload: serde_json::json!({
                             "headSha": head_sha,
                         }),
+                    },
+                    Change::GitRemoteActivity { project_id } => FrontendEvent {
+                        name: format!("project://{project_id}/git/remote-activity"),
+                        payload: serde_json::json!({}),
                     },
                     Change::WorktreeChanges {
                         project_id,
@@ -123,7 +127,7 @@ impl ActiveProjects {
 
         // Set up database watcher for database changes
         let db_watcher = {
-            let db = &mut *ctx.db.get_mut()?;
+            let db = &mut *ctx.db.get_cache_mut()?;
             but_db::poll::watch_in_background(db, {
                 let broadcaster = claude.broadcaster.clone();
                 let project_id = ctx.legacy_project.id.clone();
@@ -177,17 +181,6 @@ pub async fn set_project_active(
 ) -> Result<serde_json::Value> {
     let params: SetProjectActiveParams = serde_json::from_value(params).to_json_error()?;
 
-    // When a project is pinned, reject attempts to switch to a different one.
-    if extra
-        .pinned_project
-        .as_ref()
-        .is_some_and(|pinned| &params.id != pinned)
-    {
-        anyhow::bail!(
-            "Project switching is disabled: only the current directory's project is accessible"
-        );
-    }
-
     // TODO(ctx): Adding projects to a list of active projects requires some more
     //            knowledge around how many unique tabs are looking at it
 
@@ -195,7 +188,7 @@ pub async fn set_project_active(
     let mut ctx: Context = params.id.try_into()?;
     but_api::legacy::projects::prepare_project_for_activation(&mut ctx)?;
     active_projects.set_active(
-        &mut ctx,
+        &ctx,
         claude,
         app_settings_sync,
         #[cfg(feature = "irc")]

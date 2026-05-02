@@ -1,7 +1,3 @@
-import {
-	getMoveCommitIllegalActionMessage,
-	type MoveCommitIllegalAction,
-} from "$lib/commits/commit";
 import { changesToDiffSpec } from "$lib/commits/utils";
 import {
 	FileChangeDropData,
@@ -9,13 +5,17 @@ import {
 	HunkDropDataV3,
 	type ChangeDropData,
 } from "$lib/dragging/draggables";
+import { parseError } from "$lib/error/parser";
 import { HOOKS_SERVICE } from "$lib/git/hooksService";
-import { showToast } from "$lib/notifications/toasts";
+import { toCommitMovePlacement } from "$lib/stacks/commitMovePlacement";
 import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
-import { UI_STATE, type UiState } from "$lib/state/uiState.svelte";
+import { UI_STATE, withStackBusy, type UiState } from "$lib/state/uiState.svelte";
 import { inject } from "@gitbutler/core/context";
 import { untrack } from "svelte";
+import type { DropResult } from "$lib/dragging/dropResult";
 import type { DropzoneHandler } from "$lib/dragging/handler";
+import type { CreateCommitOutcome } from "$lib/stacks/stackEndpoints";
+import type { RejectionReason } from "@gitbutler/but-sdk";
 
 /** Details about a commit belonging to a drop zone. */
 export type DzCommitData = {
@@ -27,12 +27,22 @@ export type DzCommitData = {
 
 /** Details about a commit that can be dropped into a drop zone. */
 export class CommitDropData {
+	/** All commits being dragged (for multi-select). Defaults to just `[commit]`. */
+	readonly allCommits: DzCommitData[];
+
 	constructor(
 		readonly stackId: string,
 		readonly commit: DzCommitData,
 		readonly isHeadCommit: boolean,
 		readonly branchName?: string,
-	) {}
+		allCommits?: DzCommitData[],
+	) {
+		this.allCommits = allCommits && allCommits.length > 0 ? allCommits : [commit];
+	}
+
+	get isMultiCommit(): boolean {
+		return this.allCommits.length > 1;
+	}
 }
 
 /** Handler that can move commits between stacks. */
@@ -43,40 +53,58 @@ export class MoveCommitDzHandler implements DropzoneHandler {
 	constructor(
 		private stackId: string,
 		private projectId: string,
+		private targetBranchName: string,
 	) {}
 
 	accepts(data: unknown): boolean {
 		return (
-			data instanceof CommitDropData && data.stackId !== this.stackId && !data.commit.hasConflicts
+			data instanceof CommitDropData &&
+			data.stackId !== this.stackId &&
+			!data.allCommits.some((c) => c.hasConflicts)
 		);
 	}
 
-	private handleIllegalMoveResponse(illegalMove: MoveCommitIllegalAction | null) {
-		if (illegalMove) {
-			const message = getMoveCommitIllegalActionMessage(illegalMove);
-			showToast({
-				style: "warning",
-				title: "Cannot move commit",
-				message,
-			});
-		}
-	}
+	async ondrop(data: CommitDropData): Promise<DropResult | void> {
+		const { relativeTo, side } = toCommitMovePlacement({
+			targetBranchName: this.targetBranchName,
+			targetCommitId: "top",
+		});
 
-	ondrop(data: CommitDropData): void {
-		// Clear the selection from the source lane if this commit was selected
+		// Clear the selection from the source lane if any dragged commit was selected
 		const sourceSelection = untrack(() => this.uiState.lane(data.stackId).selection.current);
-		if (sourceSelection?.commitId === data.commit.id) {
+		if (
+			sourceSelection?.commitId &&
+			data.allCommits.some((c) => c.id === sourceSelection.commitId)
+		) {
 			this.uiState.lane(data.stackId).selection.set(undefined);
 		}
 
-		this.stackService
-			.moveCommit({
-				projectId: this.projectId,
-				targetStackId: this.stackId,
-				commitId: data.commit.id,
-				sourceStackId: data.stackId,
-			})
-			.then((response) => this.handleIllegalMoveResponse(response));
+		const commitIds = data.allCommits.map((c) => c.id);
+		let result: DropResult | undefined;
+		await withStackBusy(
+			this.uiState,
+			this.projectId,
+			{ stackIds: [data.stackId, this.stackId] },
+			async () => {
+				try {
+					await this.stackService.commitMove({
+						projectId: this.projectId,
+						subjectCommitIds: commitIds,
+						relativeTo,
+						side,
+						dryRun: false,
+					});
+				} catch (error) {
+					const { description, message } = parseError(error);
+					result = {
+						type: "warning",
+						title: "Cannot move commits",
+						message: description ?? message,
+					};
+				}
+			},
+		);
+		return result;
 	}
 }
 
@@ -104,25 +132,36 @@ export class AmendCommitWithChangeDzHandler implements DropzoneHandler {
 		return true;
 	}
 
-	async ondrop(data: ChangeDropData) {
+	async ondrop(data: ChangeDropData): Promise<DropResult | void> {
 		switch (data.selectionId.type) {
 			case "commit": {
 				const sourceStackId = data.stackId;
 				const sourceCommitId = data.selectionId.commitId;
 				const changes = changesToDiffSpec(await data.treeChanges());
 				if (sourceStackId && sourceCommitId) {
-					const { replacedCommits } = await this.stackService.moveChangesBetweenCommits({
-						projectId: this.projectId,
-						destinationStackId: this.stackId,
-						destinationCommitId: this.commit.id,
-						sourceStackId,
-						sourceCommitId,
-						changes,
-					});
+					await withStackBusy(
+						this.uiState,
+						this.projectId,
+						{
+							commitId: sourceCommitId,
+							stackIds: [sourceStackId, this.stackId],
+						},
+						async () => {
+							const { workspace } = await this.stackService.moveChangesBetweenCommits({
+								projectId: this.projectId,
+								destinationStackId: this.stackId,
+								destinationCommitId: this.commit.id,
+								sourceStackId,
+								sourceCommitId,
+								changes,
+								dryRun: false,
+							});
 
-					// Update the project state to point to the new commit if needed.
-					updateUiState(this.uiState, sourceStackId, sourceCommitId, replacedCommits);
-					updateUiState(this.uiState, this.stackId, this.commit.id, replacedCommits);
+							// Update the project state to point to the new commit if needed.
+							updateUiState(this.uiState, sourceStackId, sourceCommitId, workspace.replacedCommits);
+							updateUiState(this.uiState, this.stackId, this.commit.id, workspace.replacedCommits);
+						},
+					);
 				} else {
 					throw new Error("Change drop data must specify the source stackId");
 				}
@@ -136,21 +175,39 @@ export class AmendCommitWithChangeDzHandler implements DropzoneHandler {
 				const worktreeChanges = changesToDiffSpec(await data.treeChanges(), assignments);
 
 				if (this.runHooks) {
-					await this.hooksService.runPreCommitHooks(this.projectId, worktreeChanges);
+					try {
+						await this.hooksService.runPreCommitHooks(this.projectId, worktreeChanges);
+					} catch (err) {
+						return { type: "error", title: "Git hook failed", error: err };
+					}
 				}
 
-				this.onresult(
-					await this.stackService.amendCommitMutation({
-						projectId: this.projectId,
-						stackId: this.stackId,
-						commitId: this.commit.id,
-						worktreeChanges: worktreeChanges,
-					}),
-				);
+				const outcome = await this.stackService.amendCommitMutation({
+					projectId: this.projectId,
+					stackId: this.stackId,
+					commitId: this.commit.id,
+					worktreeChanges: worktreeChanges,
+					dryRun: false,
+				});
+
+				if (outcome.newCommit) {
+					this.onresult(outcome.newCommit);
+				}
+
+				const rejectionResult = toRejectedChangesResult(this.projectId, outcome);
 
 				if (this.runHooks) {
-					await this.hooksService.runPostCommitHooks(this.projectId);
+					try {
+						await this.hooksService.runPostCommitHooks(this.projectId);
+					} catch (err) {
+						if (!rejectionResult) {
+							return { type: "error", title: "Git hook failed", error: err };
+						}
+						console.error("Post-commit hook failed (rejected changes take priority):", err);
+					}
 				}
+
+				return rejectionResult;
 			}
 		}
 	}
@@ -188,17 +245,25 @@ export class UncommitDzHandler implements DropzoneHandler {
 					const stackId = data.stackId;
 					const commitId = data.selectionId.commitId;
 					if (stackId && commitId) {
-						const changes = changesToDiffSpec(await data.treeChanges());
-						const { replacedCommits } = await this.stackService.uncommitChanges({
-							projectId: this.projectId,
-							stackId,
-							commitId,
-							changes,
-							assignTo: this.assignTo,
-						});
+						await withStackBusy(
+							this.uiState,
+							this.projectId,
+							{ commitId, stackIds: [stackId] },
+							async () => {
+								const changes = changesToDiffSpec(await data.treeChanges());
+								const { workspace } = await this.stackService.uncommitChanges({
+									projectId: this.projectId,
+									stackId,
+									commitId,
+									changes,
+									assignTo: this.assignTo,
+									dryRun: false,
+								});
 
-						// Update the project state to point to the new commit if needed.
-						updateUiState(this.uiState, stackId, commitId, replacedCommits);
+								// Update the project state to point to the new commit if needed.
+								updateUiState(this.uiState, stackId, commitId, workspace.replacedCommits);
+							},
+						);
 					} else {
 						throw new Error("Change drop data must specify the source stackId");
 					}
@@ -218,29 +283,40 @@ export class UncommitDzHandler implements DropzoneHandler {
 			const previousPathBytes =
 				data.change.status.type === "Rename" ? data.change.status.subject.previousPathBytes : null;
 
-			const { replacedCommits } = await this.stackService.uncommitChanges({
-				projectId: this.projectId,
-				stackId: data.stackId,
-				commitId: data.commitId,
-				changes: [
-					{
-						previousPathBytes,
-						pathBytes: data.change.pathBytes,
-						hunkHeaders: [
+			const sourceStackId = data.stackId;
+			const sourceCommitId = data.commitId;
+
+			await withStackBusy(
+				this.uiState,
+				this.projectId,
+				{ commitId: sourceCommitId, stackIds: [sourceStackId] },
+				async () => {
+					const { workspace } = await this.stackService.uncommitChanges({
+						projectId: this.projectId,
+						stackId: sourceStackId,
+						commitId: sourceCommitId,
+						changes: [
 							{
-								oldStart: data.hunk.oldStart,
-								oldLines: data.hunk.oldLines,
-								newStart: data.hunk.newStart,
-								newLines: data.hunk.newLines,
+								previousPathBytes,
+								pathBytes: data.change.pathBytes,
+								hunkHeaders: [
+									{
+										oldStart: data.hunk.oldStart,
+										oldLines: data.hunk.oldLines,
+										newStart: data.hunk.newStart,
+										newLines: data.hunk.newLines,
+									},
+								],
 							},
 						],
-					},
-				],
-				assignTo: this.assignTo,
-			});
+						assignTo: this.assignTo,
+						dryRun: false,
+					});
 
-			// Update the project state to point to the new commit if needed.
-			updateUiState(this.uiState, data.stackId, data.commitId, replacedCommits);
+					// Update the project state to point to the new commit if needed.
+					updateUiState(this.uiState, sourceStackId, sourceCommitId, workspace.replacedCommits);
+				},
+			);
 
 			return;
 		}
@@ -277,7 +353,7 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
 		return this.acceptsHunkV3(data);
 	}
 
-	async ondrop(data: HunkDropDataV3): Promise<void> {
+	async ondrop(data: HunkDropDataV3): Promise<DropResult | void> {
 		const { projectId, stackId, commit, okWithForce, runHooks } = this.args;
 		if (!okWithForce && commit.isRemote) return;
 
@@ -290,31 +366,42 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
 					throw new Error("Can't receive a change without it's source or commit");
 				}
 
-				const { replacedCommits } = await this.stackService.moveChangesBetweenCommits({
+				const sourceStackId = data.stackId;
+				const sourceCommitId = data.commitId;
+
+				await withStackBusy(
+					this.uiState,
 					projectId,
-					destinationStackId: stackId,
-					destinationCommitId: commit.id,
-					sourceStackId: data.stackId,
-					sourceCommitId: data.commitId,
-					changes: [
-						{
-							previousPathBytes,
-							pathBytes: data.change.pathBytes,
-							hunkHeaders: [
+					{ commitId: sourceCommitId, stackIds: [sourceStackId, stackId] },
+					async () => {
+						const { workspace } = await this.stackService.moveChangesBetweenCommits({
+							projectId,
+							destinationStackId: stackId,
+							destinationCommitId: commit.id,
+							sourceStackId,
+							sourceCommitId,
+							changes: [
 								{
-									oldStart: data.hunk.oldStart,
-									oldLines: data.hunk.oldLines,
-									newStart: data.hunk.newStart,
-									newLines: data.hunk.newLines,
+									previousPathBytes,
+									pathBytes: data.change.pathBytes,
+									hunkHeaders: [
+										{
+											oldStart: data.hunk.oldStart,
+											oldLines: data.hunk.oldLines,
+											newStart: data.hunk.newStart,
+											newLines: data.hunk.newLines,
+										},
+									],
 								},
 							],
-						},
-					],
-				});
+							dryRun: false,
+						});
 
-				// Update the project state to point to the new commit if needed.
-				updateUiState(this.uiState, data.stackId, data.commitId, replacedCommits);
-				updateUiState(this.uiState, stackId, commit.id, replacedCommits);
+						// Update the project state to point to the new commit if needed.
+						updateUiState(this.uiState, sourceStackId, sourceCommitId, workspace.replacedCommits);
+						updateUiState(this.uiState, stackId, commit.id, workspace.replacedCommits);
+					},
+				);
 
 				return;
 			}
@@ -337,23 +424,32 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
 			if (runHooks) {
 				try {
 					await this.hooksService.runPreCommitHooks(projectId, worktreeChanges);
-				} catch {
-					return;
+				} catch (err) {
+					return { type: "error", title: "Git hook failed", error: err };
 				}
 			}
-			this.stackService.amendCommitMutation({
+			const outcome = await this.stackService.amendCommitMutation({
 				projectId,
 				stackId,
 				commitId: commit.id,
 				worktreeChanges,
+				dryRun: false,
 			});
+
+			const rejectionResult = toRejectedChangesResult(projectId, outcome);
+
 			if (runHooks) {
 				try {
 					await this.hooksService.runPostCommitHooks(projectId);
-				} catch {
-					return;
+				} catch (err) {
+					if (!rejectionResult) {
+						return { type: "error", title: "Git hook failed", error: err };
+					}
+					console.error("Post-commit hook failed (rejected changes take priority):", err);
 				}
 			}
+
+			return rejectionResult;
 		}
 	}
 }
@@ -362,6 +458,7 @@ export class AmendCommitWithHunkDzHandler implements DropzoneHandler {
  * Handler that is able to squash two commits using `DzCommitData`.
  */
 export class SquashCommitDzHandler implements DropzoneHandler {
+	private readonly uiState = inject(UI_STATE);
 	private readonly stackService = inject(STACK_SERVICE);
 
 	constructor(
@@ -377,8 +474,11 @@ export class SquashCommitDzHandler implements DropzoneHandler {
 		if (!(data instanceof CommitDropData)) return false;
 		if (data.stackId !== stackId) return false;
 
-		if (commit.hasConflicts || data.commit.hasConflicts) return false;
-		if (commit.id === data.commit.id) return false;
+		if (commit.hasConflicts) return false;
+		if (data.allCommits.some((c) => c.hasConflicts)) return false;
+
+		// Don't show dropzone on any of the commits being dragged
+		if (data.allCommits.some((c) => c.id === commit.id)) return false;
 
 		return true;
 	}
@@ -386,26 +486,60 @@ export class SquashCommitDzHandler implements DropzoneHandler {
 	async ondrop(data: unknown) {
 		const { projectId, stackId, commit } = this.args;
 		if (data instanceof CommitDropData) {
-			await this.stackService.squashCommits({
+			const sourceCommitIds = data.allCommits.map((c) => c.id).filter((id) => id !== commit.id);
+			if (sourceCommitIds.length === 0) return;
+
+			await withStackBusy(
+				this.uiState,
 				projectId,
-				stackId,
-				sourceCommitIds: [data.commit.id],
-				targetCommitId: commit.id,
-			});
+				{ commitId: data.commit.id, stackIds: [stackId] },
+				async () => {
+					await this.stackService.squashCommits({
+						projectId,
+						stackId,
+						sourceCommitIds,
+						targetCommitId: commit.id,
+					});
+				},
+			);
 		}
 	}
+}
+
+function toRejectedChangesResult(
+	projectId: string,
+	outcome: CreateCommitOutcome,
+): DropResult | undefined {
+	if (outcome.rejectedChanges.length === 0) return undefined;
+
+	const pathsToRejectedChanges = outcome.rejectedChanges.reduce(
+		(acc: Record<string, RejectionReason>, { reason, path }) => {
+			acc[path] = reason;
+			return acc;
+		},
+		{},
+	);
+
+	return {
+		type: "rejectedChanges",
+		projectId,
+		newCommitId: outcome.newCommit ?? undefined,
+		commitTitle: undefined,
+		targetBranchName: "",
+		pathsToRejectedChanges,
+	};
 }
 
 function updateUiState(
 	uiState: UiState,
 	stackId: string,
 	commitId: string,
-	mapping: [string, string][],
+	mapping: Record<string, string>,
 ) {
-	const sourceReplacement = mapping.find(([before]) => before === commitId);
+	const sourceReplacement = mapping[commitId];
 	const sourceState = untrack(() => uiState.lane(stackId).selection.current);
 	if (sourceReplacement && sourceState) {
-		uiState.lane(stackId).selection.set({ ...sourceState, commitId: sourceReplacement[1] });
+		uiState.lane(stackId).selection.set({ ...sourceState, commitId: sourceReplacement });
 	}
 }
 

@@ -27,15 +27,26 @@ import type {
 	WatcherEvent,
 	WorktreeChanges,
 } from "@gitbutler/but-sdk";
+import type { UpdateDownloadedEvent } from "electron-updater";
 
-export interface AssignHunkParams {
+export interface AbsorbParams {
 	projectId: string;
-	assignments: Array<HunkAssignmentRequest>;
+	absorptionPlan: Array<CommitAbsorption>;
+}
+
+export interface AbsorptionPlanParams {
+	projectId: string;
+	target: AbsorptionTarget;
 }
 
 export interface ApplyParams {
 	projectId: string;
 	existingBranch: string;
+}
+
+export interface AssignHunkParams {
+	projectId: string;
+	assignments: Array<HunkAssignmentRequest>;
 }
 
 export interface BranchDetailsParams {
@@ -49,33 +60,11 @@ export interface BranchDiffParams {
 	branch: string;
 }
 
-export interface MoveBranchParams {
-	projectId: string;
-	subjectBranch: string;
-	targetBranch: string;
-}
-
-export interface UpdateBranchNameParams {
-	projectId: string;
-	stackId: string;
-	branchName: string;
-	newName: string;
-}
-
-export interface TearOffBranchParams {
-	projectId: string;
-	subjectBranch: string;
-}
-
 export interface CommitAmendParams {
 	projectId: string;
 	commitId: string;
 	changes: Array<DiffSpec>;
-}
-
-export interface CommitDetailsWithLineStatsParams {
-	projectId: string;
-	commitId: string;
+	dryRun: boolean;
 }
 
 export interface CommitCreateParams {
@@ -84,11 +73,33 @@ export interface CommitCreateParams {
 	side: InsertSide;
 	changes: Array<DiffSpec>;
 	message: string;
+	dryRun: boolean;
+}
+
+export interface CommitDetailsWithLineStatsParams {
+	projectId: string;
+	commitId: string;
 }
 
 export interface CommitDiscardParams {
 	projectId: string;
 	subjectCommitId: string;
+	dryRun: boolean;
+}
+
+export interface CommitInsertBlankParams {
+	projectId: string;
+	relativeTo: RelativeTo;
+	side: InsertSide;
+	dryRun: boolean;
+}
+
+export interface CommitMoveParams {
+	projectId: string;
+	subjectCommitIds: Array<string>;
+	relativeTo: RelativeTo;
+	side: InsertSide;
+	dryRun: boolean;
 }
 
 export interface CommitMoveChangesBetweenParams {
@@ -96,31 +107,21 @@ export interface CommitMoveChangesBetweenParams {
 	sourceCommitId: string;
 	destinationCommitId: string;
 	changes: Array<DiffSpec>;
-}
-
-export interface CommitSquashParams {
-	projectId: string;
-	sourceCommitId: string;
-	destinationCommitId: string;
-}
-
-export interface CommitMoveParams {
-	projectId: string;
-	subjectCommitId: string;
-	relativeTo: RelativeTo;
-	side: InsertSide;
-}
-
-export interface CommitInsertBlankParams {
-	projectId: string;
-	relativeTo: RelativeTo;
-	side: InsertSide;
+	dryRun: boolean;
 }
 
 export interface CommitRewordParams {
 	projectId: string;
 	commitId: string;
 	message: string;
+	dryRun: boolean;
+}
+
+export interface CommitSquashParams {
+	projectId: string;
+	sourceCommitIds: Array<string>;
+	destinationCommitId: string;
+	dryRun: boolean;
 }
 
 export interface CommitUncommitChangesParams {
@@ -128,16 +129,31 @@ export interface CommitUncommitChangesParams {
 	commitId: string;
 	changes: Array<DiffSpec>;
 	assignTo: string | null;
+	dryRun: boolean;
 }
 
-export interface AbsorptionPlanParams {
+export interface ListBranchesParams {
 	projectId: string;
-	target: AbsorptionTarget;
+	filter: BranchListingFilter | null;
 }
 
-export interface AbsorbParams {
+export interface MoveBranchParams {
 	projectId: string;
-	absorptionPlan: Array<CommitAbsorption>;
+	subjectBranch: string;
+	targetBranch: string;
+	dryRun: boolean;
+}
+
+export interface PushStackLegacyParams {
+	projectId: string;
+	stackId: string;
+	branch: string;
+}
+
+export interface TearOffBranchParams {
+	projectId: string;
+	subjectBranch: string;
+	dryRun: boolean;
 }
 
 export interface TreeChangeDiffParams {
@@ -150,23 +166,45 @@ export interface UnapplyStackParams {
 	stackId: string;
 }
 
-export interface PushStackLegacyParams {
+export interface UpdateBranchNameParams {
 	projectId: string;
 	stackId: string;
-	branch: string;
+	branchName: string;
+	newName: string;
 }
 
 export interface WatcherSubscribeParams {
 	projectId: string;
 }
 
+export interface WatcherSubscribeResult {
+	subscriptionId: string;
+	eventChannel: string;
+}
+
 export interface WatcherUnsubscribeParams {
 	subscriptionId: string;
 }
 
-export interface WatcherSubscribeResult {
-	subscriptionId: string;
-	eventChannel: string;
+export interface NativeMenuPosition {
+	x: number;
+	y: number;
+}
+
+type NativeMenuPopupItemData = {
+	label: string;
+	enabled?: boolean;
+	itemId?: string;
+	submenu?: Array<NativeMenuPopupItem>;
+};
+
+export type NativeMenuPopupItem =
+	| { _tag: "Separator" }
+	| ({ _tag: "Item" } & NativeMenuPopupItemData);
+
+export interface ShowNativeMenuParams {
+	items: Array<NativeMenuPopupItem>;
+	position: NativeMenuPosition;
 }
 
 export interface LiteElectronApi {
@@ -199,11 +237,14 @@ export interface LiteElectronApi {
 	tearOffBranch: (params: TearOffBranchParams) => Promise<MoveBranchResult>;
 	ping: (input: string) => Promise<string>;
 	pushStackLegacy: (params: PushStackLegacyParams) => Promise<PushResult>;
+	showNativeMenu: (params: ShowNativeMenuParams) => Promise<string | null>;
 	treeChangeDiffs: (params: TreeChangeDiffParams) => Promise<UnifiedPatch | null>;
 	unapplyStack: (params: UnapplyStackParams) => Promise<void>;
 	watcherSubscribe: (projectId: string, callback: (event: WatcherEvent) => void) => Promise<string>;
 	watcherUnsubscribe: (subscriptionId: string) => Promise<boolean>;
 	watcherStopAll: () => Promise<number>;
+	onUpdateDownloaded: (callback: (info: UpdateDownloadedEvent) => void) => () => void;
+	quitAndInstallUpdate: () => Promise<void>;
 }
 
 export const liteIpcChannels = {
@@ -233,9 +274,12 @@ export const liteIpcChannels = {
 	tearOffBranch: "workspace:tear-off-branch",
 	ping: "lite:ping",
 	pushStackLegacy: "workspace:push-stack-legacy",
+	showNativeMenu: "lite:show-native-menu",
 	treeChangeDiffs: "workspace:tree-change-diffs",
 	unapplyStack: "workspace:unapply-stack",
 	watcherSubscribe: "workspace:watcher-subscribe",
 	watcherUnsubscribe: "workspace:watcher-unsubscribe",
 	watcherStopAll: "workspace:watcher-stop-all",
+	updaterUpdateDownloaded: "updater:update-downloaded",
+	updaterQuitAndInstall: "updater:quit-and-install",
 } as const;

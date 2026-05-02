@@ -1,3 +1,4 @@
+import { checkForUpdates, registerUpdater } from "./updater.js";
 import WatcherManager from "./watcher.js";
 import {
 	liteIpcChannels,
@@ -22,9 +23,11 @@ import {
 	type TreeChangeDiffParams,
 	type UpdateBranchNameParams,
 	type ApplyParams,
+	type ShowNativeMenuParams,
 	type UnapplyStackParams,
 	WatcherSubscribeParams,
 	WatcherUnsubscribeParams,
+	NativeMenuPopupItem,
 } from "./ipc.js";
 import {
 	absorb,
@@ -55,15 +58,65 @@ import {
 	updateBranchName,
 	BranchListingFilter,
 } from "@gitbutler/but-sdk";
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, type MenuItemConstructorOptions } from "electron";
 import { REACT_DEVELOPER_TOOLS, installExtension } from "electron-devtools-installer";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const currentDirPath = path.dirname(currentFilePath);
 
-function registerIpcHandlers(): void {
+// Dev-only runtime icons path (packaged builds rely on electron-builder icons).
+const iconsPath = path.join(currentDirPath, "../../resources/icons");
+
+function getWindowIcon(): string | undefined {
+	if (app.isPackaged) return undefined;
+
+	let iconPath: string;
+
+	switch (os.platform()) {
+		case "win32":
+			iconPath = path.join(iconsPath, "windows/icon.ico");
+			break;
+		case "darwin":
+			return undefined;
+		default:
+			iconPath = path.join(iconsPath, "linux/icons/256x256.png");
+			break;
+	}
+
+	return fs.existsSync(iconPath) ? iconPath : undefined;
+}
+
+function getMacDockIcon(): string | undefined {
+	const candidates = [
+		path.join(iconsPath, "macos/1024x1024.png"),
+		path.join(iconsPath, "macos/512x512.png"),
+		path.join(iconsPath, "macos/256x256.png"),
+	];
+
+	return candidates.find((c) => fs.existsSync(c));
+}
+
+const buildNativeMenuTemplate = (
+	items: Array<NativeMenuPopupItem>,
+	onItem: (itemId: string) => void,
+): Array<MenuItemConstructorOptions> =>
+	items.map((item): MenuItemConstructorOptions => {
+		if (item._tag === "Separator") return { type: "separator" };
+		const itemId = item.itemId;
+
+		return {
+			label: item.label,
+			enabled: item.enabled,
+			click: itemId !== undefined ? () => onItem(itemId) : undefined,
+			submenu: item.submenu ? buildNativeMenuTemplate(item.submenu, onItem) : undefined,
+		};
+	});
+
+const registerIpcHandlers = (): void => {
 	ipcMain.handle(
 		liteIpcChannels.absorptionPlan,
 		(_e, { projectId, target }: AbsorptionPlanParams) => absorptionPlan(projectId, target),
@@ -90,18 +143,18 @@ function registerIpcHandlers(): void {
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitAmend,
-		(_e, { projectId, commitId, changes }: CommitAmendParams) =>
-			commitAmend(projectId, commitId, changes),
+		(_e, { projectId, commitId, changes, dryRun }: CommitAmendParams) =>
+			commitAmend(projectId, commitId, changes, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitCreate,
-		(_e, { projectId, relativeTo, side, changes, message }: CommitCreateParams) =>
-			commitCreate(projectId, relativeTo, side, changes, message),
+		(_e, { projectId, relativeTo, side, changes, message, dryRun }: CommitCreateParams) =>
+			commitCreate(projectId, relativeTo, side, changes, message, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitDiscard,
-		(_e, { projectId, subjectCommitId }: CommitDiscardParams) =>
-			commitDiscard(projectId, subjectCommitId),
+		(_e, { projectId, subjectCommitId, dryRun }: CommitDiscardParams) =>
+			commitDiscard(projectId, subjectCommitId, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitDetailsWithLineStats,
@@ -110,35 +163,41 @@ function registerIpcHandlers(): void {
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitInsertBlank,
-		(_e, { projectId, relativeTo, side }: CommitInsertBlankParams) =>
-			commitInsertBlank(projectId, relativeTo, side),
+		(_e, { projectId, relativeTo, side, dryRun }: CommitInsertBlankParams) =>
+			commitInsertBlank(projectId, relativeTo, side, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitMove,
-		(_e, { projectId, subjectCommitId, relativeTo, side }: CommitMoveParams) =>
-			commitMove(projectId, subjectCommitId, relativeTo, side),
+		(_e, { projectId, subjectCommitIds, relativeTo, side, dryRun }: CommitMoveParams) =>
+			commitMove(projectId, subjectCommitIds, relativeTo, side, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitSquash,
-		(_e, { projectId, sourceCommitId, destinationCommitId }: CommitSquashParams) =>
-			commitSquash(projectId, sourceCommitId, destinationCommitId),
+		(_e, { projectId, sourceCommitIds, destinationCommitId, dryRun }: CommitSquashParams) =>
+			commitSquash(projectId, sourceCommitIds, destinationCommitId, "KeepBoth", dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitReword,
-		(_e, { projectId, commitId, message }: CommitRewordParams) =>
-			commitReword(projectId, commitId, message),
+		(_e, { projectId, commitId, message, dryRun }: CommitRewordParams) =>
+			commitReword(projectId, commitId, message, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitMoveChangesBetween,
 		(
 			_e,
-			{ projectId, sourceCommitId, destinationCommitId, changes }: CommitMoveChangesBetweenParams,
-		) => commitMoveChangesBetween(projectId, sourceCommitId, destinationCommitId, changes),
+			{
+				projectId,
+				sourceCommitId,
+				destinationCommitId,
+				changes,
+				dryRun,
+			}: CommitMoveChangesBetweenParams,
+		) => commitMoveChangesBetween(projectId, sourceCommitId, destinationCommitId, changes, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.commitUncommitChanges,
-		(_e, { projectId, commitId, changes, assignTo }: CommitUncommitChangesParams) =>
-			commitUncommitChanges(projectId, commitId, changes, assignTo),
+		(_e, { projectId, commitId, changes, assignTo, dryRun }: CommitUncommitChangesParams) =>
+			commitUncommitChanges(projectId, commitId, changes, assignTo, dryRun),
 	);
 	ipcMain.handle(liteIpcChannels.getVersion, () => Promise.resolve(app.getVersion()));
 	ipcMain.handle(liteIpcChannels.headInfo, (_e, projectId: string) => headInfo(projectId));
@@ -149,8 +208,8 @@ function registerIpcHandlers(): void {
 	ipcMain.handle(liteIpcChannels.listProjects, () => listProjectsStateless());
 	ipcMain.handle(
 		liteIpcChannels.moveBranch,
-		(_e, { projectId, subjectBranch, targetBranch }: MoveBranchParams) =>
-			moveBranch(projectId, subjectBranch, targetBranch),
+		(_e, { projectId, subjectBranch, targetBranch, dryRun }: MoveBranchParams) =>
+			moveBranch(projectId, subjectBranch, targetBranch, dryRun),
 	);
 	ipcMain.handle(
 		liteIpcChannels.updateBranchName,
@@ -159,8 +218,8 @@ function registerIpcHandlers(): void {
 	);
 	ipcMain.handle(
 		liteIpcChannels.tearOffBranch,
-		(_e, { projectId, subjectBranch }: TearOffBranchParams) =>
-			tearOffBranch(projectId, subjectBranch),
+		(_e, { projectId, subjectBranch, dryRun }: TearOffBranchParams) =>
+			tearOffBranch(projectId, subjectBranch, dryRun),
 	);
 	ipcMain.handle(liteIpcChannels.ping, (_event, input: string) =>
 		Promise.resolve(`pong: ${input}`),
@@ -169,6 +228,31 @@ function registerIpcHandlers(): void {
 		liteIpcChannels.pushStackLegacy,
 		(_e, { projectId, stackId, branch }: PushStackLegacyParams) =>
 			pushStackLegacy(projectId, stackId, false, false, branch, true),
+	);
+	ipcMain.handle(
+		liteIpcChannels.showNativeMenu,
+		async (event, { items, position }: ShowNativeMenuParams) => {
+			const window = BrowserWindow.fromWebContents(event.sender);
+			if (!window) return null;
+
+			let selectedItemId: string | null = null;
+			const menu = Menu.buildFromTemplate(
+				buildNativeMenuTemplate(items, (itemId) => {
+					selectedItemId = itemId;
+				}),
+			);
+
+			await new Promise<void>((resolve) => {
+				menu.popup({
+					window,
+					x: Math.round(position.x),
+					y: Math.round(position.y),
+					callback: () => resolve(),
+				});
+			});
+
+			return selectedItemId;
+		},
 	);
 	ipcMain.handle(
 		liteIpcChannels.treeChangeDiffs,
@@ -190,20 +274,20 @@ function registerIpcHandlers(): void {
 	ipcMain.handle(liteIpcChannels.watcherStopAll, () =>
 		WatcherManager.getInstance().stopAllWatchersForShutdown(),
 	);
-}
+};
 
-async function createMainWindow(): Promise<void> {
+const createMainWindow = async (): Promise<void> => {
+	const icon = getWindowIcon();
 	const mainWindow = new BrowserWindow({
 		width: 1024,
 		height: 768,
+		icon,
 		webPreferences: {
 			contextIsolation: true,
 			nodeIntegration: false,
 			preload: path.join(currentDirPath, "preload.cjs"),
 		},
 	});
-
-	mainWindow.maximize();
 
 	const devServerUrl = process.env.VITE_DEV_SERVER_URL;
 	if (devServerUrl !== undefined) {
@@ -213,10 +297,16 @@ async function createMainWindow(): Promise<void> {
 	}
 
 	await mainWindow.loadFile(path.join(currentDirPath, "../ui/index.html"));
-}
+	registerUpdater(mainWindow);
+	checkForUpdates();
+};
 
 void app.whenReady().then(async () => {
 	if (!app.isPackaged) await installExtension(REACT_DEVELOPER_TOOLS);
+	if (process.platform === "darwin" && !app.isPackaged) {
+		const dockIcon = getMacDockIcon();
+		if (dockIcon !== undefined && app.dock) app.dock.setIcon(dockIcon);
+	}
 	registerIpcHandlers();
 	await createMainWindow();
 

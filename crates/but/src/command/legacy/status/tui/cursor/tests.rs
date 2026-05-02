@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use but_rebase::graph_rebase::mutate::InsertSide;
+use but_workspace::commit::squash_commits::MessageCombinationStrategy;
 use gitbutler_stack::StackId;
 use ratatui_textarea::TextArea;
 
@@ -11,8 +11,8 @@ use crate::{
         CommitClassification, FilesStatusFlag,
         output::{StatusOutputContent, StatusOutputLine, StatusOutputLineData},
         tui::{
-            CommitMode, CommitSource, InlineRewordMode, Mode, RubMode, RubSource,
-            SelectAfterReload, mode::UnassignedCommitSource,
+            CommitMessageComposer, CommitMode, CommitSource, InlineRewordMode, Mode, RubMode,
+            RubSource, SelectAfterReload, mode::UnassignedCommitSource,
         },
     },
 };
@@ -56,6 +56,7 @@ fn branch_cli_id(name: &str, id: &str, stack_id: Option<StackId>) -> Arc<CliId> 
     })
 }
 
+#[expect(dead_code)]
 fn stack_cli_id(id: &str, stack_id: StackId) -> Arc<CliId> {
     Arc::new(CliId::Stack {
         id: id.into(),
@@ -454,10 +455,7 @@ fn select_branch_finds_branch_line_by_name() {
         }),
     ];
 
-    assert_eq!(
-        Cursor::select_branch("main".into(), &lines),
-        Some(Cursor(1))
-    );
+    assert_eq!(Cursor::select_branch("main", &lines), Some(Cursor(1)));
 }
 
 #[test]
@@ -470,7 +468,7 @@ fn select_branch_returns_none_when_branch_is_missing() {
         }),
     })];
 
-    assert_eq!(Cursor::select_branch("feature".into(), &lines), None);
+    assert_eq!(Cursor::select_branch("feature", &lines), None);
 }
 
 #[test]
@@ -492,10 +490,7 @@ fn select_branch_uses_first_matching_line_when_branch_appears_multiple_times() {
         }),
     ];
 
-    assert_eq!(
-        Cursor::select_branch("main".into(), &lines),
-        Some(Cursor(0))
-    );
+    assert_eq!(Cursor::select_branch("main", &lines), Some(Cursor(0)));
 }
 
 #[test]
@@ -877,21 +872,35 @@ fn movement_does_not_panic_or_move_when_cursor_is_out_of_bounds() {
         cursor = new_cursor;
     }
 
-    assert_eq!(cursor.closest_branch_cursor(&lines), None);
     assert_eq!(cursor, Cursor(99));
 }
 
 #[test]
 fn move_next_section_moves_to_next_jump_target() {
     let lines = vec![
-        line(StatusOutputLineData::UnassignedChanges {
-            cli_id: unassigned("u0"),
+        line(StatusOutputLineData::Branch {
+            cli_id: Arc::new(CliId::Branch {
+                name: "main".into(),
+                id: "a0".into(),
+                stack_id: None,
+            }),
         }),
-        line(StatusOutputLineData::UnassignedFile {
-            cli_id: unassigned("u1"),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_cli_id("1111111111111111111111111111111111111111", "c0"),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
-        line(StatusOutputLineData::StagedChanges {
-            cli_id: unassigned("s0"),
+        line(StatusOutputLineData::Branch {
+            cli_id: Arc::new(CliId::Branch {
+                name: "other".into(),
+                id: "a1".into(),
+                stack_id: None,
+            }),
+        }),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_cli_id("2222222222222222222222222222222222222222", "c0"),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
     ];
 
@@ -927,17 +936,29 @@ fn move_next_section_does_not_move_when_no_jump_target_below() {
 #[test]
 fn move_previous_section_moves_to_current_section_header_when_cursor_is_inside_it() {
     let lines = vec![
-        line(StatusOutputLineData::UnassignedChanges {
-            cli_id: unassigned("u0"),
+        line(StatusOutputLineData::Branch {
+            cli_id: Arc::new(CliId::Branch {
+                name: "main".into(),
+                id: "a0".into(),
+                stack_id: None,
+            }),
         }),
-        line(StatusOutputLineData::UnassignedFile {
-            cli_id: unassigned("u1"),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_cli_id("1111111111111111111111111111111111111111", "c0"),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
-        line(StatusOutputLineData::StagedChanges {
-            cli_id: unassigned("s0"),
+        line(StatusOutputLineData::Branch {
+            cli_id: Arc::new(CliId::Branch {
+                name: "other".into(),
+                id: "a1".into(),
+                stack_id: None,
+            }),
         }),
-        line(StatusOutputLineData::StagedFile {
-            cli_id: unassigned("s1"),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_cli_id("2222222222222222222222222222222222222222", "c0"),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
     ];
 
@@ -1018,163 +1039,6 @@ fn move_previous_section_does_not_move_when_on_first_jump_target() {
 }
 
 #[test]
-fn closest_branch_cursor_from_commit_selects_nearest_preceding_branch() {
-    let lines = vec![
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("main", "b0", None),
-        }),
-        line(StatusOutputLineData::Commit {
-            cli_id: commit_cli_id("1111111111111111111111111111111111111111", "c0"),
-            stack_id: None,
-            classification: CommitClassification::LocalOnly,
-        }),
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("feature", "b1", None),
-        }),
-        line(StatusOutputLineData::Commit {
-            cli_id: commit_cli_id("2222222222222222222222222222222222222222", "c1"),
-            stack_id: None,
-            classification: CommitClassification::LocalOnly,
-        }),
-    ];
-
-    let cursor = Cursor(3);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(2)));
-}
-
-#[test]
-fn closest_branch_cursor_from_committed_file_selects_nearest_preceding_branch() {
-    let lines = vec![
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("main", "b0", None),
-        }),
-        line(StatusOutputLineData::Commit {
-            cli_id: commit_cli_id("1111111111111111111111111111111111111111", "c0"),
-            stack_id: None,
-            classification: CommitClassification::LocalOnly,
-        }),
-        line(StatusOutputLineData::File {
-            cli_id: committed_file_cli_id(
-                "1111111111111111111111111111111111111111",
-                "src/lib.rs",
-                "f0",
-            ),
-        }),
-    ];
-
-    let cursor = Cursor(2);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(0)));
-}
-
-#[test]
-fn closest_branch_cursor_from_branch_is_noop() {
-    let lines = vec![line(StatusOutputLineData::Branch {
-        cli_id: branch_cli_id("main", "b0", None),
-    })];
-
-    let cursor = Cursor(0);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(0)));
-}
-
-#[test]
-fn closest_branch_cursor_from_unassigned_changes_selects_first_branch() {
-    let lines = vec![
-        line(StatusOutputLineData::UnassignedChanges {
-            cli_id: unassigned("u0"),
-        }),
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("first", "b0", None),
-        }),
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("second", "b1", None),
-        }),
-    ];
-
-    let cursor = Cursor(0);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(1)));
-}
-
-#[test]
-fn closest_branch_cursor_from_unassigned_file_selects_first_branch() {
-    let lines = vec![
-        line(StatusOutputLineData::File {
-            cli_id: unassigned("u0"),
-        }),
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("first", "b0", None),
-        }),
-    ];
-
-    let cursor = Cursor(0);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(1)));
-}
-
-#[test]
-fn closest_branch_cursor_from_staged_file_prefers_branch_for_matching_stack() {
-    let stack_a = StackId::generate();
-    let stack_b = StackId::generate();
-    let lines = vec![
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("a", "b0", Some(stack_a)),
-        }),
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("b", "b1", Some(stack_b)),
-        }),
-        line(StatusOutputLineData::StagedFile {
-            cli_id: stack_cli_id("s0", stack_b),
-        }),
-    ];
-
-    let cursor = Cursor(2);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(1)));
-}
-
-#[test]
-fn closest_branch_cursor_from_merge_base_is_noop() {
-    let lines = vec![
-        line(StatusOutputLineData::Branch {
-            cli_id: branch_cli_id("main", "b0", None),
-        }),
-        line(StatusOutputLineData::MergeBase),
-    ];
-
-    let cursor = Cursor(1);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(1)));
-}
-
-#[test]
-fn closest_branch_cursor_falls_back_to_merge_base_when_no_branch_exists() {
-    let lines = vec![
-        line(StatusOutputLineData::UnassignedChanges {
-            cli_id: unassigned("u0"),
-        }),
-        line(StatusOutputLineData::MergeBase),
-    ];
-
-    let cursor = Cursor(0);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), Some(Cursor(1)));
-}
-
-#[test]
-fn closest_branch_cursor_is_none_when_no_branch_exists() {
-    let lines = vec![line(StatusOutputLineData::UnassignedChanges {
-        cli_id: unassigned("u0"),
-    })];
-
-    let cursor = Cursor(0);
-
-    assert_eq!(cursor.closest_branch_cursor(&lines), None);
-}
-
-#[test]
 fn move_up_in_rub_mode_skips_unavailable_targets() {
     let allowed = Arc::new(CliId::Branch {
         name: "main".into(),
@@ -1198,6 +1062,7 @@ fn move_up_in_rub_mode_skips_unavailable_targets() {
     let mode = Mode::Rub(RubMode {
         source: RubSource::CliId(unassigned("source")),
         available_targets: vec![allowed],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
         _unlock_details: None,
     });
 
@@ -1233,6 +1098,7 @@ fn move_down_in_rub_mode_skips_unavailable_targets() {
     let mode = Mode::Rub(RubMode {
         source: RubSource::CliId(unassigned("source")),
         available_targets: vec![allowed],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
         _unlock_details: None,
     });
 
@@ -1278,6 +1144,7 @@ fn movement_in_rub_mode_handles_starting_on_unavailable_line() {
     let mode = Mode::Rub(RubMode {
         source: RubSource::CliId(unassigned("source")),
         available_targets: vec![allowed_a, allowed_b],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
         _unlock_details: None,
     });
 
@@ -1315,8 +1182,12 @@ fn move_next_section_skips_non_jump_targets_like_commits() {
             stack_id: None,
             classification: CommitClassification::LocalOnly,
         }),
-        line(StatusOutputLineData::StagedChanges {
-            cli_id: unassigned("s0"),
+        line(StatusOutputLineData::Branch {
+            cli_id: Arc::new(CliId::Branch {
+                name: "other".into(),
+                id: "a0".into(),
+                stack_id: None,
+            }),
         }),
     ];
 
@@ -1385,108 +1256,71 @@ fn move_previous_section_can_jump_from_merge_base_line() {
 }
 
 #[test]
-fn move_next_section_in_rub_mode_skips_unavailable_sections() {
-    let allowed = Arc::new(CliId::Branch {
+fn move_next_section_in_rub_mode_jumps_to_first_selectable_in_next_section() {
+    let branch_a = Arc::new(CliId::Branch {
         name: "main".into(),
         id: "b0".into(),
         stack_id: None,
     });
-    let blocked = Arc::new(CliId::Branch {
-        name: "feature".into(),
+    let branch_b = Arc::new(CliId::Branch {
+        name: "release".into(),
         id: "b1".into(),
         stack_id: None,
     });
+    let commit_a = commit_cli_id("1111111111111111111111111111111111111111", "c0");
+    let commit_b = commit_cli_id("2222222222222222222222222222222222222222", "c1");
     let lines = vec![
-        line(StatusOutputLineData::Branch {
-            cli_id: blocked.clone(),
+        line(StatusOutputLineData::Branch { cli_id: branch_a }),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_a.clone(),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
-        line(StatusOutputLineData::UnassignedChanges { cli_id: blocked }),
-        line(StatusOutputLineData::StagedChanges {
-            cli_id: allowed.clone(),
+        line(StatusOutputLineData::Branch { cli_id: branch_b }),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_b.clone(),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
     ];
     let mode = Mode::Rub(RubMode {
         source: RubSource::CliId(unassigned("source")),
-        available_targets: vec![allowed],
+        available_targets: vec![commit_a, commit_b],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
         _unlock_details: None,
     });
 
-    let mut cursor = Cursor(0);
+    let mut cursor = Cursor(1);
     if let Some(new_cursor) = cursor.move_next_section(&lines, &mode, FilesStatusFlag::All) {
         cursor = new_cursor;
     }
 
-    assert_eq!(cursor, Cursor(2));
+    assert_eq!(cursor, Cursor(3));
 }
 
 #[test]
-fn move_previous_section_in_rub_mode_moves_to_current_available_section_header() {
-    let allowed = Arc::new(CliId::Branch {
+fn move_previous_section_in_rub_mode_moves_to_first_selectable_in_current_section() {
+    let branch = Arc::new(CliId::Branch {
         name: "main".into(),
         id: "b0".into(),
         stack_id: None,
     });
-    let blocked = Arc::new(CliId::Branch {
-        name: "feature".into(),
-        id: "b1".into(),
-        stack_id: None,
-    });
-    let lines = vec![
-        line(StatusOutputLineData::UnassignedChanges {
-            cli_id: allowed.clone(),
-        }),
-        line(StatusOutputLineData::StagedChanges { cli_id: blocked }),
-        line(StatusOutputLineData::StagedChanges {
-            cli_id: allowed.clone(),
-        }),
-        line(StatusOutputLineData::StagedFile {
-            cli_id: allowed.clone(),
-        }),
-    ];
-    let mode = Mode::Rub(RubMode {
-        source: RubSource::CliId(unassigned("source")),
-        available_targets: vec![allowed],
-        _unlock_details: None,
-    });
-
-    let mut cursor = Cursor(3);
-    if let Some(new_cursor) = cursor.move_previous_section(&lines, &mode, FilesStatusFlag::All) {
-        cursor = new_cursor;
-    }
-
-    assert_eq!(cursor, Cursor(2));
-}
-
-#[test]
-fn move_previous_section_in_rub_mode_from_unavailable_section_header_goes_to_previous_available_section()
- {
-    let allowed_a = Arc::new(CliId::Branch {
-        name: "main".into(),
-        id: "b0".into(),
-        stack_id: None,
-    });
-    let allowed_b = Arc::new(CliId::Branch {
-        name: "release".into(),
-        id: "b2".into(),
-        stack_id: None,
-    });
-    let blocked = Arc::new(CliId::Branch {
-        name: "feature".into(),
-        id: "b1".into(),
-        stack_id: None,
-    });
+    let commit = commit_cli_id("1111111111111111111111111111111111111111", "c0");
     let lines = vec![
         line(StatusOutputLineData::Branch {
-            cli_id: allowed_a.clone(),
+            cli_id: branch.clone(),
         }),
-        line(StatusOutputLineData::StagedChanges {
-            cli_id: allowed_b.clone(),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit.clone(),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
         }),
-        line(StatusOutputLineData::UnassignedChanges { cli_id: blocked }),
+        line(StatusOutputLineData::StagedFile { cli_id: branch }),
     ];
     let mode = Mode::Rub(RubMode {
         source: RubSource::CliId(unassigned("source")),
-        available_targets: vec![allowed_a, allowed_b],
+        available_targets: vec![commit],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
         _unlock_details: None,
     });
 
@@ -1496,6 +1330,103 @@ fn move_previous_section_in_rub_mode_from_unavailable_section_header_goes_to_pre
     }
 
     assert_eq!(cursor, Cursor(1));
+}
+
+#[test]
+fn move_previous_section_in_rub_mode_from_first_selectable_goes_to_previous_section_first_selectable()
+ {
+    let branch_a = Arc::new(CliId::Branch {
+        name: "main".into(),
+        id: "b0".into(),
+        stack_id: None,
+    });
+    let branch_b = Arc::new(CliId::Branch {
+        name: "release".into(),
+        id: "b1".into(),
+        stack_id: None,
+    });
+    let blocked = Arc::new(CliId::Branch {
+        name: "feature".into(),
+        id: "b2".into(),
+        stack_id: None,
+    });
+    let commit_a = commit_cli_id("1111111111111111111111111111111111111111", "c0");
+    let commit_b = commit_cli_id("2222222222222222222222222222222222222222", "c1");
+    let lines = vec![
+        line(StatusOutputLineData::Branch { cli_id: branch_a }),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_a.clone(),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
+        }),
+        line(StatusOutputLineData::Branch { cli_id: blocked }),
+        line(StatusOutputLineData::Branch { cli_id: branch_b }),
+        line(StatusOutputLineData::Commit {
+            cli_id: commit_b.clone(),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
+        }),
+    ];
+    let mode = Mode::Rub(RubMode {
+        source: RubSource::CliId(unassigned("source")),
+        available_targets: vec![commit_a, commit_b],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
+        _unlock_details: None,
+    });
+
+    let mut cursor = Cursor(4);
+    if let Some(new_cursor) = cursor.move_previous_section(&lines, &mode, FilesStatusFlag::All) {
+        cursor = new_cursor;
+    }
+
+    assert_eq!(cursor, Cursor(1));
+}
+
+#[test]
+fn move_next_section_in_rub_mode_skips_sections_without_selectable_targets() {
+    let allowed_branch = Arc::new(CliId::Branch {
+        name: "main".into(),
+        id: "b0".into(),
+        stack_id: None,
+    });
+    let blocked_branch = Arc::new(CliId::Branch {
+        name: "feature".into(),
+        id: "b1".into(),
+        stack_id: None,
+    });
+    let blocked_commit = commit_cli_id("1111111111111111111111111111111111111111", "c0");
+    let allowed_commit = commit_cli_id("2222222222222222222222222222222222222222", "c1");
+    let lines = vec![
+        line(StatusOutputLineData::Branch {
+            cli_id: blocked_branch,
+        }),
+        line(StatusOutputLineData::Commit {
+            cli_id: blocked_commit,
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
+        }),
+        line(StatusOutputLineData::Branch {
+            cli_id: allowed_branch,
+        }),
+        line(StatusOutputLineData::Commit {
+            cli_id: allowed_commit.clone(),
+            stack_id: None,
+            classification: CommitClassification::LocalOnly,
+        }),
+    ];
+    let mode = Mode::Rub(RubMode {
+        source: RubSource::CliId(unassigned("source")),
+        available_targets: vec![allowed_commit],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
+        _unlock_details: None,
+    });
+
+    let mut cursor = Cursor(0);
+    if let Some(new_cursor) = cursor.move_next_section(&lines, &mode, FilesStatusFlag::All) {
+        cursor = new_cursor;
+    }
+
+    assert_eq!(cursor, Cursor(3));
 }
 
 #[test]
@@ -1557,6 +1488,7 @@ fn is_selectable_in_rub_mode_requires_available_target() {
     let mode = Mode::Rub(RubMode {
         source: RubSource::CliId(unassigned("source")),
         available_targets: vec![allowed],
+        how_to_combine_messages: MessageCombinationStrategy::KeepBoth,
         _unlock_details: None,
     });
 
@@ -1604,7 +1536,7 @@ fn is_selectable_in_commit_mode_scopes_commit_targets_to_stack() {
             id: "zz".into(),
         })),
         scope_to_stack: Some(scoped_stack_id),
-        insert_side: InsertSide::Above,
+        message_composer: CommitMessageComposer::default(),
     });
 
     let same_stack_commit_line = line(StatusOutputLineData::Commit {

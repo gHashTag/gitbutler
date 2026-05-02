@@ -1,22 +1,23 @@
 use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, anyhow};
+use bstr::ByteSlice;
 use but_api_macros::but_api;
 use but_core::{DiffSpec, sync::RepoExclusive};
 use but_ctx::{Context, ThreadSafeContext};
 use but_workspace::legacy::ui::{StackEntryNoOpt, StackHeadInfo};
 use gitbutler_branch::{BranchCreateRequest, BranchUpdateRequest};
 use gitbutler_branch_actions::{
-    BaseBranch, BranchListing, BranchListingDetails, BranchListingFilter, MoveBranchResult,
-    MoveCommitIllegalAction, StackOrder,
+    BaseBranch, BranchListing, BranchListingDetails, BranchListingFilter,
     branch_upstream_integration::IntegrationStrategy,
     upstream_integration::{
         BaseBranchResolution, BaseBranchResolutionApproach, IntegrationOutcome, Resolution,
         StackStatuses,
     },
 };
+use gitbutler_git::GitContextExt as _;
 use gitbutler_project::FetchResult;
-use gitbutler_reference::{Refname, RemoteRefname, normalize_branch_name as normalize_name};
+use gitbutler_reference::{Refname, normalize_branch_name as normalize_name};
 use gitbutler_stack::StackId;
 use gix::reference::Category;
 use tracing::instrument;
@@ -114,14 +115,12 @@ pub fn delete_local_branch(
 pub fn create_virtual_branch_from_branch(
     ctx: &mut but_ctx::Context,
     branch: Refname,
-    remote: Option<RemoteRefname>,
     pr_number: Option<usize>,
 ) -> Result<gitbutler_branch_actions::CreateBranchFromBranchOutcome> {
     let mut guard = ctx.exclusive_worktree_access();
     let outcome = create_virtual_branch_from_branch_with_perm(
         ctx,
         &branch,
-        remote,
         pr_number,
         guard.write_permission(),
     )?;
@@ -136,12 +135,11 @@ pub fn create_virtual_branch_from_branch(
 pub fn create_virtual_branch_from_branch_with_perm(
     ctx: &mut but_ctx::Context,
     branch: &Refname,
-    remote: Option<RemoteRefname>,
     pr_number: Option<usize>,
     perm: &mut RepoExclusive,
 ) -> Result<gitbutler_branch_actions::CreateBranchFromBranchOutcome> {
     let outcome = gitbutler_branch_actions::create_virtual_branch_from_branch_with_perm(
-        ctx, branch, remote, pr_number, perm,
+        ctx, branch, pr_number, perm,
     )?;
     Ok(outcome.into())
 }
@@ -340,40 +338,6 @@ pub fn unapply_stack_with_perm(
     Ok(())
 }
 
-#[but_api]
-#[instrument(err(Debug))]
-pub fn amend_virtual_branch(
-    ctx: &mut but_ctx::Context,
-    stack_id: StackId,
-    commit_id: gix::ObjectId,
-    worktree_changes: Vec<DiffSpec>,
-) -> Result<String> {
-    let oid = gitbutler_branch_actions::amend(ctx, stack_id, commit_id, worktree_changes)?;
-    Ok(oid.to_string())
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn undo_commit(
-    ctx: &mut but_ctx::Context,
-    stack_id: StackId,
-    commit_id: gix::ObjectId,
-) -> Result<()> {
-    gitbutler_branch_actions::undo_commit(ctx, stack_id, commit_id)?;
-    Ok(())
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn reorder_stack(
-    ctx: &mut but_ctx::Context,
-    stack_id: StackId,
-    stack_order: StackOrder,
-) -> Result<()> {
-    gitbutler_branch_actions::reorder_stack(ctx, stack_id, stack_order)?;
-    Ok(())
-}
-
 #[but_api(napi)]
 #[instrument(err(Debug))]
 pub fn list_branches(
@@ -443,10 +407,34 @@ pub fn squash_commits_with_perm(
 #[but_api]
 #[instrument(err(Debug))]
 pub fn fetch_from_remotes(ctx: &Context, action: Option<String>) -> Result<BaseBranch> {
-    let project_data_last_fetched = gitbutler_branch_actions::fetch_from_remotes(
-        ctx,
-        Some(action.unwrap_or_else(|| "unknown".to_string())),
-    )?;
+    let remotes = {
+        let repo = ctx.repo.get()?;
+        repo.remote_names()
+            .iter()
+            .map(|name| name.to_str().map(str::to_owned))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let askpass = Some(action.unwrap_or_else(|| "unknown".to_string()));
+    let fetch_errors: Vec<_> = remotes
+        .iter()
+        .filter_map(|remote| {
+            ctx.fetch(remote, askpass.clone())
+                .err()
+                .map(|err| err.to_string())
+        })
+        .collect();
+
+    let timestamp = std::time::SystemTime::now();
+    let project_data_last_fetched = if fetch_errors.is_empty() {
+        FetchResult::Fetched { timestamp }
+    } else {
+        FetchResult::Error {
+            timestamp,
+            error: fetch_errors.join("\n"),
+        }
+    };
+    let mut meta = ctx.legacy_meta()?;
+    meta.garbage_collect(&*ctx.repo.get()?)?;
 
     // Updates the project controller with the last fetched timestamp
     //
@@ -463,58 +451,6 @@ pub fn fetch_from_remotes(ctx: &Context, action: Option<String>) -> Result<BaseB
 
     let base_branch = gitbutler_branch_actions::base::get_base_branch_data(ctx)?;
     Ok(base_branch)
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn move_commit(
-    ctx: &mut but_ctx::Context,
-    commit_id: gix::ObjectId,
-    target_stack_id: StackId,
-    source_stack_id: StackId,
-) -> Result<Option<MoveCommitIllegalAction>> {
-    gitbutler_branch_actions::move_commit(ctx, target_stack_id, commit_id, source_stack_id)
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn move_branch_legacy(
-    ctx: &mut but_ctx::Context,
-    target_stack_id: StackId,
-    target_branch_name: String,
-    source_stack_id: StackId,
-    subject_branch_name: String,
-) -> Result<MoveBranchResult> {
-    gitbutler_branch_actions::move_branch(
-        ctx,
-        target_stack_id,
-        target_branch_name.as_str(),
-        source_stack_id,
-        subject_branch_name.as_str(),
-    )
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn tear_off_branch_legacy(
-    ctx: &mut but_ctx::Context,
-    source_stack_id: StackId,
-    subject_branch_name: String,
-) -> Result<MoveBranchResult> {
-    gitbutler_branch_actions::tear_off_branch(ctx, source_stack_id, subject_branch_name.as_str())
-}
-
-#[but_api]
-#[instrument(err(Debug))]
-pub fn update_commit_message(
-    ctx: &mut but_ctx::Context,
-    stack_id: StackId,
-    commit_id: gix::ObjectId,
-    message: String,
-) -> Result<String> {
-    let new_commit_id =
-        gitbutler_branch_actions::update_commit_message(ctx, stack_id, commit_id, &message)?;
-    Ok(new_commit_id.to_string())
 }
 
 /// Compute upstream integration statuses, optionally scoped to `target_commit_id`.
@@ -613,9 +549,9 @@ async fn resolve_review_map(
         }
         acc
     });
-    let mut ctx = ctx;
+    let ctx = ctx;
     let mut resolved_reviews = HashMap::new();
-    let db = &mut *ctx.db.get_mut()?;
+    let db = &mut *ctx.db.get_cache_mut()?;
     let storage = but_forge_storage::Controller::from_path(but_path::app_data_dir()?);
     for (key, pr_number) in reviews.drain() {
         if let Ok(resolved) = but_forge::get_forge_review(

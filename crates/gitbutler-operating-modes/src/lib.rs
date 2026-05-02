@@ -1,14 +1,14 @@
 use std::{fs, path::PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use bstr::BString;
-use but_core::{ref_metadata::StackId, sync::RepoShared};
+use but_core::{WORKSPACE_REF_NAME, ref_metadata::StackId, sync::RepoShared};
 use but_ctx::Context;
 use but_serde::BStringForFrontend;
 use serde::{Deserialize, Serialize};
 
 /// The reference the app will checkout when the workspace is open
-pub const WORKSPACE_BRANCH_REF: &str = "refs/heads/gitbutler/workspace";
+pub const WORKSPACE_BRANCH_REF: &str = WORKSPACE_REF_NAME;
 
 /// Previous workspace reference, delete after transition.
 pub const INTEGRATION_BRANCH_REF: &str = "refs/heads/gitbutler/integration";
@@ -50,7 +50,7 @@ pub fn write_edit_mode_metadata(
 ) -> Result<()> {
     let serialized_edit_mode_metadata =
         toml::to_string(edit_mode_metadata).context("Failed to serialize edit mode metadata")?;
-    but_fs::write(
+    but_utils::write(
         edit_mode_metadata_path(ctx).as_path(),
         serialized_edit_mode_metadata,
     )
@@ -198,7 +198,7 @@ pub fn in_edit_mode(ctx: &Context, perm: &RepoShared) -> Result<bool> {
 pub fn ensure_edit_mode(ctx: &Context, perm: &RepoShared) -> Result<EditModeMetadata> {
     match operating_mode(ctx, perm)? {
         OperatingMode::Edit(edit_mode_metadata) => Ok(edit_mode_metadata),
-        _ => bail!("Expected to be in edit mode"),
+        _ => Err(anyhow!("Expected to be in edit mode")),
     }
 }
 

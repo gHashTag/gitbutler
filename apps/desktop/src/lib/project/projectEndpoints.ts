@@ -1,7 +1,7 @@
 import { invalidatesList, providesItem, providesList, ReduxTag } from "$lib/state/tags";
-import type { TreeChanges } from "$lib/hunks/change";
 import type { AddProjectOutcome, Project } from "$lib/project/project";
 import type { BackendEndpointBuilder } from "$lib/state/backendApi";
+import type { TreeChanges } from "@gitbutler/but-sdk";
 
 export type ProjectInfo = {
 	is_exclusive: boolean;
@@ -9,9 +9,17 @@ export type ProjectInfo = {
 	headsup?: string;
 };
 
+export type ServerCapabilities = {
+	isRemote: boolean;
+	canAddProjects: boolean;
+};
+
 export function buildProjectEndpoints(build: BackendEndpointBuilder) {
 	return {
-		// ── Projects ────────────────────────────────────────────────
+		serverCapabilities: build.query<ServerCapabilities, void>({
+			extraOptions: { command: "server_capabilities" },
+			query: () => undefined,
+		}),
 		listProjects: build.query<Project[], void>({
 			extraOptions: { command: "list_projects" },
 			query: () => undefined,
@@ -58,8 +66,6 @@ export function buildProjectEndpoints(build: BackendEndpointBuilder) {
 			query: (args) => args,
 			providesTags: (_result, _error, args) => providesItem(ReduxTag.ProjectGerrit, args.projectId),
 		}),
-
-		// ── Oplog ───────────────────────────────────────────────────
 		oplogDiffWorktrees: build.query<TreeChanges, { projectId: string; snapshotId: string }>({
 			extraOptions: { command: "oplog_diff_worktrees" },
 			query: (args) => args,

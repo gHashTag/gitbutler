@@ -12,13 +12,13 @@
 	import { changesToDiffSpec } from "$lib/commits/utils";
 	import { projectAiExperimentalFeaturesEnabled, projectAiGenEnabled } from "$lib/config/config";
 	import { FILE_SERVICE } from "$lib/files/fileService";
-	import { isTreeChange, type TreeChange } from "$lib/hunks/change";
+	import { isTreeChange } from "$lib/hunks/change";
 	import { vscodePath } from "$lib/project/project";
 	import { PROJECTS_SERVICE } from "$lib/project/projectsService";
 	import { FILE_SELECTION_MANAGER } from "$lib/selection/fileSelectionManager.svelte";
 	import { SETTINGS } from "$lib/settings/userSettings";
 	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
-	import { UI_STATE } from "$lib/state/uiState.svelte";
+	import { UI_STATE, withStackBusy } from "$lib/state/uiState.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import {
 		ContextMenu,
@@ -29,6 +29,7 @@
 		TestId,
 	} from "@gitbutler/ui";
 	import type { SelectionId } from "$lib/selection/key";
+	import type { TreeChange } from "@gitbutler/but-sdk";
 
 	const DEFAULT_MODEL = "gpt-4";
 
@@ -113,7 +114,10 @@
 		}
 	})();
 
-	let contextMenu: ReturnType<typeof ContextMenu>;
+	let menuOpen = $state(false);
+	let menuTarget = $state<MouseEvent | HTMLElement>();
+	let menuItem = $state<ChangedFilesItem>();
+
 	let discardModal: ReturnType<typeof DiscardChangesModal>;
 	let stashModal: ReturnType<typeof StashIntoBranchModal>;
 	let absorbModal: ReturnType<typeof AbsorbPlanModal>;
@@ -145,37 +149,42 @@
 		return null;
 	}
 
-	export function open(e: MouseEvent | HTMLElement, item: ChangedFilesItem) {
-		contextMenu.open(e, item);
+	export function open(e: MouseEvent | HTMLElement, newItem: ChangedFilesItem) {
+		menuTarget = e;
+		menuItem = newItem;
+		menuOpen = true;
 		aiService.validateGitButlerAPIConfiguration().then((value) => {
 			aiConfigurationValid = value;
 		});
 	}
 
 	export function close() {
-		contextMenu.close();
+		menuOpen = false;
 	}
 
 	async function uncommitChanges(stackId: string, commitId: string, changes: TreeChange[]) {
-		const { replacedCommits } = await stackService.uncommitChanges({
-			projectId,
-			stackId,
-			commitId,
-			changes: changesToDiffSpec(changes),
+		menuOpen = false;
+		await withStackBusy(uiState, projectId, { commitId, stackIds: [stackId] }, async () => {
+			const { workspace } = await stackService.uncommitChanges({
+				projectId,
+				stackId,
+				commitId,
+				changes: changesToDiffSpec(changes),
+				dryRun: false,
+			});
+			const newCommitId = workspace.replacedCommits[commitId];
+			const branchName = uiState.lane(stackId).selection.current?.branchName;
+			const selectedFiles = changes.map((change) => ({ ...selectionId, path: change.path }));
+
+			// Unselect the uncommitted files
+			idSelection.removeMany(selectedFiles);
+
+			if (newCommitId && branchName) {
+				const previewOpen = uiState.lane(stackId).selection.current?.previewOpen ?? false;
+				// Update the selection to the new commit
+				uiState.lane(stackId).selection.set({ branchName, commitId: newCommitId, previewOpen });
+			}
 		});
-		const newCommitId = replacedCommits.find(([before]) => before === commitId)?.[1];
-		const branchName = uiState.lane(stackId).selection.current?.branchName;
-		const selectedFiles = changes.map((change) => ({ ...selectionId, path: change.path }));
-
-		// Unselect the uncommitted files
-		idSelection.removeMany(selectedFiles);
-
-		if (newCommitId && branchName) {
-			const previewOpen = uiState.lane(stackId).selection.current?.previewOpen ?? false;
-			// Update the selection to the new commit
-			uiState.lane(stackId).selection.set({ branchName, commitId: newCommitId, previewOpen });
-		}
-		contextMenu.close();
 	}
 
 	async function triggerAutoCommit(changes: TreeChange[]) {
@@ -188,7 +197,7 @@
 				projectId,
 				target: {
 					type: "treeChanges",
-					subject: { changes, assigned_stack_id: stackId ?? null },
+					subject: { changes, assignedStackId: stackId ?? null },
 				},
 				useAi: $aiGenEnabled,
 			});
@@ -301,19 +310,23 @@
 	}
 </script>
 
-<ContextMenu
-	bind:this={contextMenu}
-	{leftClickTrigger}
-	rightClickTrigger={trigger}
-	side="bottom"
-	{align}
-	{onopen}
-	{onclose}
->
-	{#snippet children(item: unknown)}
+{#if menuOpen && menuItem}
+	{@const item = menuItem}
+	{@const deletion = isDeleted(item)}
+	{@const itemPath = getItemPath(item)}
+	<ContextMenu
+		{leftClickTrigger}
+		rightClickTrigger={trigger}
+		side="bottom"
+		{align}
+		target={menuTarget}
+		{onopen}
+		onclose={() => {
+			menuOpen = false;
+			onclose?.();
+		}}
+	>
 		{#if isChangedFilesItem(item)}
-			{@const deletion = isDeleted(item)}
-			{@const itemPath = getItemPath(item)}
 			{#if item.changes.length > 0 && !editMode}
 				<ContextMenuSection>
 					{@const changes = item.changes}
@@ -324,7 +337,7 @@
 							icon="bin"
 							onclick={() => {
 								discardModal.show(item);
-								contextMenu.close();
+								menuOpen = false;
 							}}
 						/>
 						<ContextMenuItem
@@ -332,7 +345,7 @@
 							icon="branch-bottom-up-arrow"
 							onclick={() => {
 								stashModal.show(item);
-								contextMenu.close();
+								menuOpen = false;
 							}}
 						/>
 						<ContextMenuItem
@@ -341,15 +354,15 @@
 							testId={TestId.FileListItemContextMenu_Absorb}
 							onclick={() => {
 								absorbModal.show(item.changes);
-								contextMenu.close();
+								menuOpen = false;
 							}}
 							disabled={absorbingChanges.current.isLoading}
 						/>
 						<ContextMenuItem
 							label="Auto commit"
 							icon="commit-ai"
-							onclick={async () => {
-								contextMenu.close();
+							onclick={() => {
+								menuOpen = false;
 								triggerAutoCommit(changes);
 							}}
 							disabled={autoCommitting.current.isLoading}
@@ -377,16 +390,16 @@
 										label="Split off changes"
 										icon="split"
 										onclick={() => {
+											menuOpen = false;
 											split(changes);
-											contextMenu.close();
 										}}
 									/>
 									<ContextMenuItem
 										label="Split into dependent branch"
 										icon="stack-plus"
 										onclick={() => {
+											menuOpen = false;
 											splitIntoDependentBranch(changes);
-											contextMenu.close();
 										}}
 									/>
 								{/if}
@@ -399,11 +412,12 @@
 			{#if itemPath}
 				<ContextMenuSection>
 					<ContextMenuItemSubmenu label="Copy path" icon="copy">
-						{#snippet submenu({ close: closeSubmenu })}
+						{#snippet submenu(_sub)}
 							<ContextMenuSection>
 								<ContextMenuItem
 									label="Copy path"
 									onclick={async () => {
+										menuOpen = false;
 										const project = await projectService.fetchProject(projectId);
 										const projectPath = project?.path;
 										if (projectPath) {
@@ -414,19 +428,16 @@
 												errorMessage: "Failed to copy absolute path",
 											});
 										}
-										closeSubmenu();
-										contextMenu.close();
 									}}
 								/>
 								<ContextMenuItem
 									label="Copy relative path"
 									onclick={async () => {
+										menuOpen = false;
 										await clipboardService.write(itemPath, {
 											message: "Relative path copied",
 											errorMessage: "Failed to copy relative path",
 										});
-										closeSubmenu();
-										contextMenu.close();
 									}}
 								/>
 							</ContextMenuSection>
@@ -442,6 +453,7 @@
 						icon="open-in-ide"
 						disabled={deletion}
 						onclick={async () => {
+							menuOpen = false;
 							try {
 								const project = await projectService.fetchProject(projectId);
 								const projectPath = project?.path;
@@ -454,7 +466,6 @@
 										urlService.openExternalUrl(path);
 									}
 								}
-								contextMenu.close();
 							} catch {
 								chipToasts.error("Failed to open in editor");
 								console.error("Failed to open in editor");
@@ -467,13 +478,13 @@
 						label={showInFolderLabel}
 						icon="open-in-folder"
 						onclick={async () => {
+							menuOpen = false;
 							const project = await projectService.fetchProject(projectId);
 							const projectPath = project?.path;
 							if (projectPath) {
 								const absPath = await backend.joinPath(projectPath, itemPath);
 								await fileService.showFileInFolder(absPath);
 							}
-							contextMenu.close();
 						}}
 					/>
 				{/if}
@@ -482,13 +493,12 @@
 			{#if canUseGBAI && isUncommitted}
 				<ContextMenuSection>
 					<ContextMenuItemSubmenu label="Experimental AI" icon="lab">
-						{#snippet submenu({ close: closeSubmenu })}
+						{#snippet submenu(_sub)}
 							<ContextMenuSection>
 								<ContextMenuItem
 									label="Branch changes"
 									onclick={() => {
-										closeSubmenu();
-										contextMenu.close();
+										menuOpen = false;
 										triggerBranchChanges(item.changes);
 									}}
 									disabled={branchingChanges.current.isLoading}
@@ -503,8 +513,8 @@
 				<p class="text-13">'Woops! Malformed data :(</p>
 			</ContextMenuSection>
 		{/if}
-	{/snippet}
-</ContextMenu>
+	</ContextMenu>
+{/if}
 
 <DiscardChangesModal bind:this={discardModal} {projectId} {selectionId} />
 <StashIntoBranchModal bind:this={stashModal} {projectId} />

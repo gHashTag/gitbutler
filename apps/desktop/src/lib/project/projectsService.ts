@@ -1,5 +1,6 @@
 import { goto } from "$app/navigation";
 import { showError } from "$lib/error/showError";
+import { showToast } from "$lib/notifications/toasts";
 import { handleAddProjectOutcome, type Project } from "$lib/project/project";
 import { projectPath } from "$lib/routes/routes.svelte";
 import { getCookie } from "$lib/utils/cookies";
@@ -9,10 +10,8 @@ import { chipToasts } from "@gitbutler/ui";
 import { get } from "svelte/store";
 import type { IBackend } from "$lib/backend";
 import type { ProjectInfo } from "$lib/project/projectEndpoints";
-import type { BackendApi } from "$lib/state/clientState.svelte";
-import type { ForgeUser } from "@gitbutler/core/api";
-
-export type { ProjectInfo } from "$lib/project/projectEndpoints";
+import type { BackendApi } from "$lib/state/backendApi";
+import type { ForgeUser } from "@gitbutler/but-sdk";
 
 export const PROJECTS_SERVICE = new InjectionToken<ProjectsService>("ProjectsService");
 
@@ -27,6 +26,19 @@ export class ProjectsService {
 
 	projects() {
 		return this.backendApi.endpoints.listProjects.useQuery();
+	}
+
+	async fetchProjects() {
+		return await this.backendApi.endpoints.listProjects.fetch();
+	}
+
+	/**
+	 * Capabilities that vary by how the backend was launched (local Tauri app
+	 * vs. but-server running behind a tunnel). Used to hide UI entry points
+	 * that require the user to be on the same machine as the backend.
+	 */
+	serverCapabilities() {
+		return this.backendApi.endpoints.serverCapabilities.useQuery();
 	}
 
 	getProject(projectId: string, noValidation?: boolean) {
@@ -113,6 +125,15 @@ export class ProjectsService {
 	}
 
 	async addProject(path?: string) {
+		const capabilities = await this.backendApi.endpoints.serverCapabilities.fetch();
+		if (!capabilities?.canAddProjects) {
+			showToast({
+				style: "info",
+				title: "Adding projects is disabled",
+				message: "Projects can only be added when GitButler runs on your local machine.",
+			});
+			return;
+		}
 		if (!path) {
 			path = await this.getValidPath();
 			if (!path) return;
@@ -142,22 +163,34 @@ export class ProjectsService {
 	}
 
 	validateProjectPath(path: string) {
+		// These two paths represent unsupported-configuration guidance, not
+		// runtime errors. Surface them as info toasts so they don't pollute
+		// error telemetry — they previously accounted for 53 + many events
+		// of noisy toast:show_error captures.
 		if (/^\\\\wsl.localhost/i.test(path)) {
-			const errorMsg =
-				"For WSL2 projects, install the Linux version of GitButler inside of your WSL2 distro";
-			console.error(errorMsg);
-			showError("Use the Linux version of GitButler", errorMsg);
+			const message =
+				"For WSL2 projects, install the Linux version of GitButler inside of your WSL2 distro.";
+			console.warn(message);
+			showToast({
+				style: "info",
+				title: "Use the Linux version of GitButler",
+				message,
+			});
 
 			return false;
 		}
 
 		if (/^\\\\/i.test(path)) {
-			const errorMsg =
+			const message =
 				"Using git across a network is not recommended. Either clone " +
 				"the repo locally, or use the NET USE command to map a " +
-				"network drive";
-			console.error(errorMsg);
-			showError("UNC Paths are not directly supported", errorMsg);
+				"network drive.";
+			console.warn(message);
+			showToast({
+				style: "info",
+				title: "UNC paths are not directly supported",
+				message,
+			});
 
 			return false;
 		}

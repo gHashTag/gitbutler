@@ -1,12 +1,13 @@
 use std::{io::Write, ops::DerefMut, path::Path};
 
 use but_core::{
-    RefMetadata, RepositoryExt,
+    RefMetadata, RepositoryExt, WORKSPACE_REF_NAME,
     ref_metadata::{StackId, WorkspaceCommitRelation},
 };
 use but_meta::VirtualBranchesTomlMetadata;
 #[cfg(feature = "sandbox-but-api")]
 use but_settings::AppSettings;
+use gix::bstr::ByteVec;
 use gix_testtools::{Creation, tempfile};
 use snapbox::{Assert, Redactions};
 
@@ -246,14 +247,14 @@ impl Sandbox {
         )
     }
 
-    /// Return a context configured to interact with this repository.
+    /// Return a fully isolated context configured to interact with this repository.
     ///
     /// ### Not for plumbing
     ///
     /// This feature is only meant for higher-level Client or API tests. Plumbing crates must not use the [`but_ctx::Context`].
     #[cfg(feature = "sandbox-but-api")]
     pub fn context(&self) -> anyhow::Result<but_ctx::Context> {
-        but_ctx::Context::from_repo(self.open_repo()?)
+        but_ctx::Context::from_repo(self.open_repo()?).map(but_ctx::Context::with_memory_app_cache)
     }
 
     /// Return the graph at `HEAD`, along with the `(graph, repo, meta)` repository and metadata used to create it.
@@ -323,6 +324,13 @@ impl Sandbox {
             .write_all(data.as_ref())
             .expect("writes should work");
         self
+    }
+
+    /// Read a file at `path` from our projects root.
+    pub fn read_file(&self, path: impl AsRef<Path>) -> Result<String, gix::bstr::FromUtf8Error> {
+        std::fs::read(self.projects_root().join(path))
+            .expect("File exists and can be read")
+            .into_string()
     }
 
     /// Append `data` to `path` in our projects root.
@@ -401,7 +409,7 @@ impl Sandbox {
     /// Create stack metadata for `branch_names` and return its StackIds, one per item in the input slice, in order.
     pub fn setup_metadata(&self, branch_names: &[&str]) -> anyhow::Result<Vec<StackId>> {
         let mut meta = self.meta()?;
-        let mut ws = meta.workspace(r("refs/heads/gitbutler/workspace"))?;
+        let mut ws = meta.workspace(r(WORKSPACE_REF_NAME))?;
         let ws_data: &mut but_core::ref_metadata::Workspace = ws.deref_mut();
         for (stable_id, branch_name) in (0_u128..).zip(branch_names.iter()) {
             ws_data.add_or_insert_new_stack_if_not_present(
@@ -443,7 +451,6 @@ impl Sandbox {
             },
             feature_flags: FeatureFlags {
                 cv3: true,
-                apply3: true,
                 undo: true,
                 rules: true,
                 single_branch: true,

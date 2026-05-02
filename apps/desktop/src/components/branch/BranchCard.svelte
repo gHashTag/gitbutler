@@ -22,7 +22,7 @@
 	import { isDefined } from "@gitbutler/ui/utils/typeguards";
 	import type { BranchIconName } from "$lib/branches/branchIcon";
 	import type { DropzoneHandler } from "$lib/dragging/handler";
-	import type { PushStatus } from "$lib/stacks/stack";
+	import type { PushStatus } from "@gitbutler/but-sdk";
 	import type { Snippet } from "svelte";
 
 	interface BranchCardProps {
@@ -172,7 +172,7 @@
 >
 	{#if args.type === "stack-branch"}
 		{@const moveHandler = args.stackId
-			? new MoveCommitDzHandler(args.stackId, projectId)
+			? new MoveCommitDzHandler(args.stackId, projectId, branchName)
 			: undefined}
 		{#if !args.prNumber && args.stackId}
 			<PrNumberSync {projectId} stackId={args.stackId} {branchName} />
@@ -201,7 +201,6 @@
 						type: "commit",
 						stackId: args.stackId,
 						branchName,
-						parentCommitId: args.baseCommit,
 					});
 				}}
 				iconName={args.iconName}
@@ -270,8 +269,12 @@
 										{projectId}
 										branchName={pr.sourceBranch}
 										prUpdatedAt={pr.updatedAt}
+										mergeableState={pr.mergeableState}
 										isFork={pr.fork}
 										isMerged={pr.merged}
+										onrefetch={() => {
+											if (args.prNumber) prService?.fetch(args.prNumber, { forceRefetch: true });
+										}}
 									/>
 								{/if}
 							{/if}

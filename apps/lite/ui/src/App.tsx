@@ -1,42 +1,19 @@
 import { Toast, ToastManager, Tooltip } from "@base-ui/react";
+import { WorkerPoolContextProvider } from "@pierre/diffs/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
 import { RegisteredRouter, RouterProvider } from "@tanstack/react-router";
-import { FC, StrictMode } from "react";
+import { StrictMode } from "react";
 import { Provider } from "react-redux";
-import { store } from "#ui/state/store.ts";
-import { classes } from "./classes";
-import styles from "./App.module.css";
-import uiStyles from "./ui.module.css";
+import { store } from "#ui/store.ts";
+import { Toasts } from "#ui/ui/Toasts/Toasts.tsx";
+import { Updater } from "#ui/Updater.tsx";
 
-const Toasts: FC = () => {
-	const { toasts } = Toast.useToastManager();
+const workerFactory = (): Worker =>
+	new Worker(new URL("@pierre/diffs/worker/worker.js", import.meta.url), {
+		type: "module",
+	});
 
-	return (
-		<Toast.Portal>
-			<Toast.Viewport className={styles.toastViewport}>
-				{toasts.map((toast) => (
-					<Toast.Root
-						key={toast.id}
-						toast={toast}
-						className={classes(uiStyles.popup, styles.toastRoot)}
-					>
-						<Toast.Content>
-							<Toast.Title />
-							<Toast.Description
-								render={
-									// Default is `p` which restricts content elements.
-									<div />
-								}
-							/>
-							<Toast.Close>Dismiss</Toast.Close>
-						</Toast.Content>
-					</Toast.Root>
-				))}
-			</Toast.Viewport>
-		</Toast.Portal>
-	);
-};
 export const App: React.FC<{
 	queryClient: QueryClient;
 	toastManager: ToastManager;
@@ -46,13 +23,15 @@ export const App: React.FC<{
 		<Provider store={store}>
 			<QueryClientProvider client={queryClient}>
 				<Toast.Provider toastManager={toastManager}>
-					<Tooltip.Provider
-						// Workaround for flicker issue when nesting tooltips
-						// https://github.com/mui/base-ui/issues/4499
-						delay={0}
-					>
-						<RouterProvider router={router} />
-						<Toasts />
+					<Tooltip.Provider>
+						<WorkerPoolContextProvider
+							poolOptions={{ workerFactory }}
+							highlighterOptions={{ preferredHighlighter: "shiki-wasm" }}
+						>
+							<RouterProvider router={router} />
+							<Updater />
+							<Toasts />
+						</WorkerPoolContextProvider>
 					</Tooltip.Provider>
 				</Toast.Provider>
 				<ReactQueryDevtools />

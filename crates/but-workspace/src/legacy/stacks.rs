@@ -29,7 +29,7 @@ use crate::{
 };
 
 fn default_workspace_metadata(meta: &impl RefMetadata) -> anyhow::Result<Option<Workspace>> {
-    ref_info::function::workspace_data_of_default_workspace_branch(meta)
+    ref_info::workspace_data_of_default_workspace_branch(meta)
 }
 
 /// Build a lookup from workspace branch ref names to their stable stack IDs.
@@ -160,15 +160,18 @@ fn try_from_stack_v3(
 /// Returns the list of stacks that pass `filter`, in unspecified order.
 ///
 /// Use `repo` and `meta` to read branches data
-/// Use `ref_name` to forcefully pretend the HEAD is looking at something else. Only used in testing to avoid needing
-/// multiple fixtures just with a different HEAD position.
+/// Use `ref_name_override` to read from a specific ref instead of HEAD. Used in production by
+/// `stacks_v3_from_ctx` to anchor queries to the workspace ref (during edit mode, HEAD points
+/// elsewhere), and in tests to avoid needing multiple fixtures with different HEAD positions.
 // TODO: See if the UI can migrate to `head_info()` or a variant of it so the information is only called once.
+#[deprecated(
+    note = "Use head_info() and the returned RefInfo instead. Callers that already have a Context should prefer ctx.workspace_* helpers."
+)]
 pub fn stacks_v3(
     repo: &gix::Repository,
     meta: &impl RefMetadata,
     filter: StacksFilter,
     ref_name_override: Option<&gix::refs::FullNameRef>,
-    cache: &mut but_db::CacheHandle,
 ) -> anyhow::Result<Vec<StackEntry>> {
     // TODO: See if this works at all once VirtualBranches.toml isn't the backing anymore.
     //       Probably needs to change, maybe even alongside the notion of 'unapplied'.
@@ -228,8 +231,8 @@ pub fn stacks_v3(
         traversal: but_graph::init::Options::limited(),
     };
     let info = match ref_name_override {
-        None => head_info(repo, meta, options, cache),
-        Some(ref_name) => ref_info(repo.find_reference(ref_name)?, meta, options, cache),
+        None => head_info(repo, meta, options),
+        Some(ref_name) => ref_info(repo.find_reference(ref_name)?, meta, options),
     }?;
     let stack_ids_by_ref_name = stack_ids_by_ref_name(meta)?;
 
@@ -284,12 +287,14 @@ pub fn stacks_v3(
 // TODO: StackId shouldn't be used, instead use the ref-name or stack index as universal tip identifier.
 //       It's notable that there isn't always a ref-name available right now in case the ref advanced, but maybe this is something
 //       we can pull out of the metadata information.
+#[deprecated(
+    note = "Use head_info() and the returned RefInfo instead. Callers that already have a Context should prefer ctx.workspace_* helpers."
+)]
 #[instrument(level = "debug", skip(meta), err(Debug))]
 pub fn stack_details_v3(
     stack_id: Option<StackId>,
     repo: &gix::Repository,
     meta: &impl RefMetadata,
-    cache: &mut but_db::CacheHandle,
 ) -> anyhow::Result<ui::StackDetails> {
     // Prefer the current `HEAD` projection if it can still see the requested stack, and only fall
     // back to resolving from a surviving ref when that stack is no longer reachable from `HEAD`.
@@ -311,7 +316,7 @@ pub fn stack_details_v3(
             // would otherwise be returned. The problem is that then the workspace might not be correct, but there isn't
             // another way that still allows to extend the range via gas-stations. Maybe one day we won't need this.
             ref_info_options.traversal.hard_limit = Some(500);
-            let mut info = head_info(repo, meta, ref_info_options, cache)?;
+            let mut info = head_info(repo, meta, ref_info_options)?;
             if info.is_entrypoint {
                 if info.stacks.len() != 1 {
                     bail!(
@@ -329,10 +334,9 @@ pub fn stack_details_v3(
             }
         }
         Some(stack_id) => {
-            if let Some(stack) = stack_by_id(
-                head_info(repo, meta, ref_info_options.clone(), cache)?,
-                stack_id,
-            ) {
+            if let Some(stack) =
+                stack_by_id(head_info(repo, meta, ref_info_options.clone())?, stack_id)
+            {
                 stack
             } else {
                 let branch_names_by_stack_id = branch_names_by_stack_id(meta)?;
@@ -345,7 +349,7 @@ pub fn stack_details_v3(
                     .with_context(|| {
                         format!("Couldn't find any refs for stack {stack_id} in the repository")
                     })?;
-                let ref_info = ref_info(existing_ref, meta, ref_info_options, cache)?;
+                let ref_info = ref_info(existing_ref, meta, ref_info_options)?;
                 stack_by_id(ref_info, stack_id).with_context(|| {
                     format!("Really couldn't find {stack_id} in the current workspace projection")
                 })?
@@ -406,6 +410,7 @@ impl ui::BranchDetails {
             commits: commits_unique_from_tip,
             commits_on_remote: commits_unique_in_remote_tracking_branch,
             remote_tracking_ref_name,
+            remote_tracking_branch_segment_id: _,
             // There is nothing equivalent
             commits_outside,
             metadata,
@@ -488,15 +493,15 @@ impl ui::BranchDetails {
 /// The entries are ordered from newest to oldest.
 pub fn stack_branches(stack_id: StackId, ctx: &Context) -> anyhow::Result<Vec<ui::Branch>> {
     let state = state_handle(&ctx.project_data_dir());
-    let remote = state
-        .get_default_target()
-        .context("failed to get default target")?
-        .push_remote_name();
+    let repo = ctx.repo.get()?;
+    let target = ctx.persisted_default_target()?;
+    let remote = target
+        .push_remote_name
+        .unwrap_or_else(|| target.branch.remote().to_owned());
 
     let mut stack_branches = vec![];
     let stack = state.get_stack(stack_id)?;
     let mut current_base = stack.merge_base(ctx)?;
-    let repo = ctx.repo.get()?;
     for internal in stack.branches() {
         let upstream_reference_name = internal.remote_reference(remote.as_str());
         let upstream_reference = repo
@@ -556,13 +561,28 @@ pub fn local_and_remote_commits(
     stack_branch: &gitbutler_stack::StackBranch,
     stack: &Stack,
 ) -> anyhow::Result<Vec<ui::Commit>> {
-    let state = state_handle(&ctx.project_data_dir());
-    let default_target = state
-        .get_default_target()
-        .context("failed to get default target")?;
+    let (target_ref_name, target_base_oid) = {
+        let meta = ctx.meta()?;
+        let workspace =
+            default_workspace_metadata(&meta)?.context("failed to get workspace metadata")?;
+        (
+            workspace
+                .target_ref
+                .context("failed to get target reference")?
+                .clone(),
+            workspace
+                .target_commit_id
+                .context("failed to get target base oid")?,
+        )
+    };
     let cache = repo.commit_graph_if_enabled()?;
     let mut graph = repo.revision_graph(cache.as_ref());
-    let mut check_commit = IsCommitIntegrated::new(repo, &default_target, &mut graph)?;
+    let mut check_commit = IsCommitIntegrated::new_with_target(
+        repo,
+        target_ref_name.as_ref(),
+        target_base_oid,
+        &mut graph,
+    )?;
 
     let branch_commits = stack_branch.commit_ids(repo, ctx, stack)?;
     let mut local_and_remote: Vec<ui::Commit> = vec![];
@@ -630,6 +650,11 @@ pub fn local_and_remote_commits(
             state,
             created_at,
             author: gix_commit.author()?.into(),
+            change_id: change_id
+                .unwrap_or_else(|| {
+                    but_core::commit::Headers::synthetic_change_id_from_commit_id(*commit_id)
+                })
+                .to_string(),
             gerrit_review_url: None,
         };
         local_and_remote.push(api_commit);
@@ -651,8 +676,10 @@ impl TryFrom<&gix::Commit<'_>> for CommitData {
     type Error = anyhow::Error;
 
     fn try_from(commit: &gix::Commit<'_>) -> std::result::Result<Self, Self::Error> {
+        let raw_message: BString = commit.message_bstr().into();
+        let message = but_core::commit::strip_conflict_markers(raw_message.as_ref());
         Ok(CommitData {
-            message: commit.message_bstr().into(),
+            message,
             author: commit.author()?.into(),
         })
     }

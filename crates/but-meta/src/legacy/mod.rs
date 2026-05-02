@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context as _, bail};
 use bstr::ByteSlice;
 use but_core::{
-    RefMetadata, is_workspace_ref_name,
+    RefMetadata, WORKSPACE_REF_NAME, is_workspace_ref_name,
     ref_metadata::{
         Branch, RefInfo, StackId,
         StackKind::{Applied, AppliedAndUnapplied},
@@ -511,6 +511,59 @@ impl VirtualBranchesTomlMetadata {
         self.snapshot
             .write_if_changed(ReconcileWithWorkspace::Disallow, None)
     }
+
+    /// Garbage collect stacks that are outside the workspace and hold no commits relative to the
+    /// target, or whose head points to a missing commit.
+    pub fn garbage_collect(&mut self, repo: &gix::Repository) -> anyhow::Result<()> {
+        let target_sha = self
+            .data()
+            .default_target
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("there is no default target")
+                    .context(but_error::Code::DefaultTargetNotFound)
+            })?
+            .sha;
+        let cache = repo.commit_graph_if_enabled()?;
+        let mut graph = repo.revision_graph(cache.as_ref());
+        let mut to_remove = Vec::new();
+        for stack in self
+            .data()
+            .branches
+            .values()
+            .filter(|stack| !stack.in_workspace)
+        {
+            if let Ok(stack_head) = stack_head_oid(repo, stack, target_sha)
+                && (repo.find_commit(stack_head).is_err()
+                    || stack_head
+                        == repo
+                            .merge_base_with_graph(stack_head, target_sha, &mut graph)?
+                            .detach())
+            {
+                to_remove.push(stack.id);
+            }
+        }
+
+        for stack_id in to_remove {
+            if self.data_mut().branches.remove(&stack_id).is_some() {
+                self.snapshot.set_changed_to_necessitate_write();
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the legacy default target and materialize the change immediately.
+    ///
+    /// This exists for transitional callers that still have to initialize the old
+    /// `default_target` shape, which stores fields that don't exist in workspace metadata.
+    pub fn set_default_target(
+        &mut self,
+        target: impl Into<crate::virtual_branches_legacy_types::Target>,
+    ) -> anyhow::Result<()> {
+        self.snapshot.content.default_target = Some(target.into());
+        self.snapshot.set_changed_to_necessitate_write();
+        self.write_unreconciled()
+    }
 }
 
 /// Mostly used in testing, and it's fine as it's intermediate, and we are very practical here.
@@ -543,7 +596,7 @@ impl Drop for VirtualBranchesTomlMetadata {
     }
 }
 
-const INTEGRATION_BRANCH: &str = "refs/heads/gitbutler/workspace";
+const INTEGRATION_BRANCH: &str = WORKSPACE_REF_NAME;
 
 impl RefMetadata for VirtualBranchesTomlMetadata {
     type Handle<T> = VBTomlMetadataHandle<T>;
@@ -817,6 +870,7 @@ impl RefMetadata for VirtualBranchesTomlMetadata {
                     && new_id != existing.sha
                 {
                     existing.sha = new_id;
+                    changed_target = true;
                 }
             }
             (None, None) => {}
@@ -1080,6 +1134,25 @@ fn default_workspace() -> Workspace {
 
 fn full_branch_name(name: &str) -> Option<gix::refs::FullName> {
     gix::refs::FullName::try_from(format!("refs/heads/{name}")).ok()
+}
+
+fn stack_head_oid(
+    repo: &gix::Repository,
+    stack: &Stack,
+    default_target: gix::ObjectId,
+) -> anyhow::Result<gix::ObjectId> {
+    let Some(head) = stack.heads.last() else {
+        return Ok(default_target);
+    };
+    let full_name = full_branch_name(&head.name)
+        .context("Stack head name could not be turned into a full branch reference name")?;
+    let Some(reference) = repo.try_find_reference(full_name.as_ref())? else {
+        return Ok(head.head);
+    };
+    reference
+        .try_id()
+        .map(|id| id.detach())
+        .context("Stack head reference did not point to an object id")
 }
 
 /// Make it appear managed, which it is as we created it. Can only make the date up though,

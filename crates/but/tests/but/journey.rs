@@ -76,13 +76,13 @@ More info: https://docs.gitbutler.com/workspace-branch
 
 
 
- ██████▄      ▄██████    ██████╗ ██╗   ██╗████████╗
- ██▀▀▀▀██▄  ▄██▀▀▀▀██    ██╔══██╗██║   ██║╚══██╔══╝
- ██     ▀████▀     ██    ██████╔╝██║   ██║   ██║
- ██▄▄▄▄██▀  ▀██▄▄▄▄██    ██╔══██╗██║   ██║   ██║
- ██████▀      ▀██████    ██████╔╝╚██████╔╝   ██║
+██▄      ▄██  ▀██▀▀█▄ ▀██▀ ▀██▀ █▀▀██▀▀█
+████▄  ▄████   ██  ██  ██   ██  ▀  ██  ▀
+████████████   ██▀▀█▄  ██   ██     ██
+████▀  ▀████   ██  ██  ██   ██     ██
+██▀      ▀██  ▄██▄▄█▀  ▀█▄▄▄█▀   ▄▄██▄▄
 
-The command-line interface for GitButler
+The command-line interface for GitButler ⋈
 
 $ but branch new <name>                       Create a new branch
 $ but status                                  View workspace status
@@ -121,13 +121,13 @@ Target branch: gb-local/main
 
 
 
- ██████▄      ▄██████    ██████╗ ██╗   ██╗████████╗
- ██▀▀▀▀██▄  ▄██▀▀▀▀██    ██╔══██╗██║   ██║╚══██╔══╝
- ██     ▀████▀     ██    ██████╔╝██║   ██║   ██║
- ██▄▄▄▄██▀  ▀██▄▄▄▄██    ██╔══██╗██║   ██║   ██║
- ██████▀      ▀██████    ██████╔╝╚██████╔╝   ██║
+██▄      ▄██  ▀██▀▀█▄ ▀██▀ ▀██▀ █▀▀██▀▀█
+████▄  ▄████   ██  ██  ██   ██  ▀  ██  ▀
+████████████   ██▀▀█▄  ██   ██     ██
+████▀  ▀████   ██  ██  ██   ██     ██
+██▀      ▀██  ▄██▄▄█▀  ▀█▄▄▄█▀   ▄▄██▄▄
 
-The command-line interface for GitButler
+The command-line interface for GitButler ⋈
 
 $ but branch new <name>                       Create a new branch
 $ but status                                  View workspace status
@@ -145,8 +145,7 @@ Learn more at https://docs.gitbutler.com/cli-overview
         .assert()
         .success()
         .stdout_eq(str![[r#"
-╭┄zz [unstaged changes]
-┊     no changes
+╭┄zz [unassigned changes] (no changes)
 ┊
 ┴ 6f66116 [gb-local/main] 2000-01-02 Initial empty commit
 

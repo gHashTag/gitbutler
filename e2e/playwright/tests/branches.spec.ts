@@ -1,5 +1,6 @@
 import { createNewBranch, deleteBranch, unapplyStack } from "../src/branch.ts";
 import { getBaseURL, type GitButler, startGitButler } from "../src/setup.ts";
+import { test } from "../src/test.ts";
 import {
 	clickByTestId,
 	fillByTestId,
@@ -8,7 +9,7 @@ import {
 	waitForTestId,
 	waitForTestIdToNotExist,
 } from "../src/util.ts";
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 
 let gitbutler: GitButler;
@@ -392,6 +393,7 @@ test("should be able gracefully handle adding a branch that is behind of our tar
 	// Update the workspace
 	await clickByTestId(page, "integrate-upstream-commits-button");
 	await clickByTestId(page, "integrate-upstream-action-button");
+	await waitForTestIdToNotExist(page, "integrate-upstream-commits-button");
 
 	// Should navigate to the branches page when clicking the branches button
 	await clickByTestId(page, "navigation-branches-button");
@@ -413,6 +415,7 @@ test("should be able gracefully handle adding a branch that is behind of our tar
 	await clickByTestId(page, "branches-view-apply-branch-button");
 	// Should be redirected to the workspace
 	await waitForTestId(page, "workspace-view");
+	await expect(getByTestId(page, "integrate-upstream-commits-button")).toBeVisible();
 
 	const commits = getByTestId(page, "commit-row");
 	await expect(commits).toHaveCount(2);
@@ -422,119 +425,15 @@ test("should be able gracefully handle adding a branch that is behind of our tar
 	});
 	await expect(conflictedCommit).toBeVisible();
 
-	// Click on the conflicted commit to open the commit drawer
+	// New apply does not rebase the branch onto the updated target. The branch stays
+	// based on the older target, so applying it should not create the old per-commit
+	// conflict resolution flow.
 	await conflictedCommit.click();
-
-	// Click the resolve conflicts button (now in the file list area)
-	await clickByTestId(page, "commit-drawer-resolve-conflicts-button");
-
-	// Should open the edit mode
-	await waitForTestId(page, "edit-mode");
-
-	let conflictedFileContent = readFileSync(filePath, "utf-8");
-	expect(conflictedFileContent).toEqual(
+	await expect(getByTestId(page, "commit-drawer-resolve-conflicts-button")).toHaveCount(0);
+	expect(readFileSync(filePath, "utf-8")).toEqual(
 		`foo
 bar
 baz
-<<<<<` +
-			`<< New base: branch1: first commit
-Update to main branch
-||||||| Common ancestor
-=======
-branch1 commit 1
->>>>>>> Current commit: branch1: first commit
-`,
-	);
-
-	// Resolve the conflict by keeping both changes
-	writeFileSync(
-		filePath,
-		`foo
-bar
-baz
-Update to main branch
-branch1 commit 1
-`,
-		{ flag: "w" },
-	);
-
-	// Click the save and exit button
-	await clickByTestId(page, "edit-mode-save-and-exit-button");
-
-	// Should be back in the workspace
-	await waitForTestId(page, "workspace-view");
-
-	const commitsAfterResolving = getByTestId(page, "commit-row");
-	await expect(commitsAfterResolving).toHaveCount(2);
-
-	// Verify the file content
-	let resolvedFileContent = readFileSync(filePath, "utf-8");
-	expect(resolvedFileContent).toEqual(
-		`foo
-bar
-baz
-Update to main branch
-branch1 commit 1
-`,
-	);
-
-	const commitsAfterResolution = getByTestId(page, "commit-row");
-	const conflictedCommitAfterResolution = commitsAfterResolution.filter({
-		hasText: "branch1: second commit",
-	});
-	await expect(conflictedCommitAfterResolution).toBeVisible();
-
-	// Click on the conflicted commit to open the commit drawer
-	await conflictedCommitAfterResolution.click();
-
-	// Click the resolve conflicts button (now in the file list area)
-	await clickByTestId(page, "commit-drawer-resolve-conflicts-button");
-
-	// Should open the edit mode
-	await waitForTestId(page, "edit-mode");
-
-	conflictedFileContent = readFileSync(filePath, "utf-8");
-	expect(conflictedFileContent).toEqual(
-		`foo
-bar
-baz
-Update to main branch
-<<<<<` +
-			`<< New base: branch1: second commit
-branch1 commit 1
-||||||| Common ancestor
-=======
-branch1 commit 2
->>>>>>> Current commit: branch1: second commit
-`,
-	);
-
-	// Resolve the conflict by keeping both changes
-	writeFileSync(
-		filePath,
-		`foo
-bar
-baz
-Update to main branch
-branch1 commit 1
-branch1 commit 2
-`,
-		{ flag: "w" },
-	);
-
-	// Click the save and exit button
-	await clickByTestId(page, "edit-mode-save-and-exit-button");
-
-	// Should be back in the workspace
-	await waitForTestId(page, "workspace-view");
-
-	// Verify the file content
-	resolvedFileContent = readFileSync(filePath, "utf-8");
-	expect(resolvedFileContent).toEqual(
-		`foo
-bar
-baz
-Update to main branch
 branch1 commit 1
 branch1 commit 2
 `,

@@ -26,7 +26,10 @@ pub(crate) fn squash_commits(
     perm: &mut RepoExclusive,
 ) -> Result<gix::ObjectId> {
     // create a snapshot
-    let snap = ctx.create_snapshot(SnapshotDetails::new(OperationKind::SquashCommit), perm)?;
+    let snap = ctx.create_snapshot(
+        SnapshotDetails::new(OperationKind::SquashCommit).with_count(source_ids.len()),
+        perm,
+    )?;
     let result = do_squash_commits(ctx, stack_id, source_ids, desitnation_id, perm);
     // if result is error, restore from snapshot
     if result.is_err() {
@@ -62,9 +65,9 @@ fn do_squash_commits(
         let stack = vb_state.get_stack_in_workspace(stack_id)?;
         let repo = ctx.repo.get()?;
 
-        let default_target = vb_state.get_default_target()?;
+        let target_base_oid = ctx.persisted_default_target()?.sha;
         let merge_base = repo
-            .merge_base(stack.head_oid(ctx)?, default_target.sha)?
+            .merge_base(stack.head_oid(ctx)?, target_base_oid)?
             .detach();
 
         // =========== Step 1: Reorder
@@ -246,7 +249,7 @@ fn do_squash_commits(
         let mut builder = but_rebase::Rebase::new(&repo, Some(merge_base), None)?;
         let builder = builder.steps(steps)?;
         builder.rebase_noops(false);
-        let output = builder.rebase(&*ctx.cache.get_cache()?)?;
+        let output = builder.rebase()?;
 
         stack.set_stack_head(&mut vb_state, &repo, output.top_commit)?;
 

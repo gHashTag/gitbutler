@@ -61,8 +61,8 @@ pub fn safe_checkout(
 
     let mut delegate = super::utils::Delegate::default();
     gix::diff::tree(
-        TreeRefIter::from_bytes(&source_tree.data),
-        TreeRefIter::from_bytes(&destination_tree.data),
+        TreeRefIter::from_bytes(&source_tree.data, repo.object_hash()),
+        TreeRefIter::from_bytes(&destination_tree.data, repo.object_hash()),
         &mut gix::diff::tree::State::default(),
         repo,
         &mut delegate,
@@ -144,7 +144,7 @@ pub fn safe_checkout(
         )?;
 
         if num_deleted_files > 0
-            && let Ok(mut index) = repo.open_index()
+            && let Ok(mut index) = repo.index().map(|index| index.into_owned_or_cloned())
         {
             for (kind, path_to_alter) in &changed_files {
                 if matches!(kind, ChangeKind::Deletion)

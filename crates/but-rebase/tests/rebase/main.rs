@@ -5,8 +5,7 @@ use but_testsupport::visualize_commit_graph;
 use gix::prelude::ObjectIdExt;
 
 use crate::utils::{
-    assure_nonconflicting, conflicted, fixture_writable, four_commits_writable, test_cache,
-    visualize_tree,
+    assure_nonconflicting, conflicted, fixture_writable, four_commits_writable, visualize_tree,
 };
 
 mod error_handling;
@@ -73,7 +72,6 @@ mod commit {
 #[test]
 fn single_stack_journey() -> Result<()> {
     let (repo, commits, _tmp) = four_commits_writable()?;
-    let cache = test_cache();
     let mut builder = Rebase::new(&repo, commits.base, None)?;
     let out = builder
         .steps([
@@ -87,7 +85,7 @@ fn single_stack_journey() -> Result<()> {
             },
             RebaseStep::Reference(but_core::Reference::Virtual("anchor".into())),
         ])?
-        .rebase(&cache)?;
+        .rebase()?;
     insta::assert_snapshot!(visualize_commit_graph(&repo, "@")?, @"
     * 120e3a9 (HEAD -> main) c
     * a96434e b
@@ -142,7 +140,7 @@ fn single_stack_journey() -> Result<()> {
     assure_nonconflicting(&repo, &out)?;
 
     assert_eq!(
-        builder.rebase(&cache).unwrap_err().to_string(),
+        builder.rebase().unwrap_err().to_string(),
         "No rebase steps provided",
         "The builder (and its base) can be reused, but it needs new steps"
     );
@@ -152,7 +150,6 @@ fn single_stack_journey() -> Result<()> {
 #[test]
 fn amended_commit() -> Result<()> {
     let (repo, _tmp, _meta) = fixture_writable("three-branches-merged")?;
-    let cache = test_cache();
     insta::assert_snapshot!(visualize_commit_graph(&repo, "@")?, @r"
     *-.   1348870 (HEAD -> main) Merge branches 'A', 'B' and 'C'
     |\ \  
@@ -181,7 +178,7 @@ fn amended_commit() -> Result<()> {
                 new_message: Some("Merge branches 'A', 'B' and 'C' - rewritten".into()),
             },
         ])?
-        .rebase(&cache)?;
+        .rebase()?;
     // Note how the `C` isn't visible anymore as we don't rewrite reference here.
     insta::assert_snapshot!(visualize_commit_graph(&repo, out.top_commit)?, @r"
     *-.   6a38e67 Merge branches 'A', 'B' and 'C' - rewritten
@@ -226,7 +223,6 @@ fn amended_commit() -> Result<()> {
 #[test]
 fn reorder_merge_in_reverse() -> Result<()> {
     let (repo, _tmp, _meta) = fixture_writable("merge-in-the-middle")?;
-    let cache = test_cache();
     insta::assert_snapshot!(visualize_commit_graph(&repo, "with-inner-merge")?, @r"
     * e8ee978 (HEAD -> with-inner-merge) on top of inner merge
     *   2fc288c Merge branch 'B' into with-inner-merge
@@ -257,7 +253,7 @@ fn reorder_merge_in_reverse() -> Result<()> {
                 new_message: Some("was dd59d2 below merge".into()),
             },
         ])?
-        .rebase(&cache)
+        .rebase()
         .expect("the first parent of a merge is replaced unconditionally");
     // Note that we don't rewrite references here.
     insta::assert_snapshot!(visualize_commit_graph(&repo, out.top_commit)?, @r"
@@ -305,7 +301,6 @@ fn reorder_merge_in_reverse() -> Result<()> {
 #[test]
 fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
     let (repo, _tmp, _meta) = fixture_writable("three-branches-merged")?;
-    let cache = test_cache();
     insta::assert_snapshot!(visualize_commit_graph(&repo, "@")?, @r"
     *-.   1348870 (HEAD -> main) Merge branches 'A', 'B' and 'C'
     |\ \  
@@ -342,10 +337,10 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
                 new_message: Some("Re-merge branches 'A', 'B' and 'C'".into()),
             },
         ])?
-        .rebase(&cache)?;
+        .rebase()?;
     insta::assert_debug_snapshot!(out, @"
     RebaseOutput {
-        top_commit: Sha1(b811bdb2d96bfc96bf54030ce094edea09fc8db0),
+        top_commit: Sha1(976ad5208a756763180113d0a021610aba3c0dad),
         references: [],
         commit_mapping: [
             (
@@ -367,22 +362,22 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
                     Sha1(8f0d33828e5c859c95fb9e9fc063374fdd482536),
                 ),
                 Sha1(68a2fc349e13a186e6d65871a31bad244d25e6f4),
-                Sha1(a5e5bdbc985301d4f814944f11f1cace8eac13a1),
+                Sha1(d3cf6a9c107edc10d76ff7842de61a1b8c2fe8a8),
             ),
             (
                 Some(
                     Sha1(8f0d33828e5c859c95fb9e9fc063374fdd482536),
                 ),
                 Sha1(134887021e06909021776c023a608f8ef179e859),
-                Sha1(b811bdb2d96bfc96bf54030ce094edea09fc8db0),
+                Sha1(976ad5208a756763180113d0a021610aba3c0dad),
             ),
         ],
     }
     ");
     insta::assert_snapshot!(visualize_commit_graph(&repo, out.top_commit)?, @r"
-    *-.   b811bdb Re-merge branches 'A', 'B' and 'C'
+    *-.   976ad52 Re-merge branches 'A', 'B' and 'C'
     |\ \  
-    | | * a5e5bdb C~1
+    | | * d3cf6a9 [conflict] C~1
     | | * eebaa8b C
     | | * a037d4a C~2
     | * | a748762 (B) B: another 10 lines at the bottom
@@ -407,7 +402,7 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
 
     let conflict_commit_id = repo.rev_parse_single(format!("{}^3", out.top_commit).as_str())?;
     insta::assert_snapshot!(but_testsupport::visualize_tree(conflict_commit_id), @r#"
-    9a27e64
+    c581f79
     ├── .auto-resolution:5b3a532 
     │   ├── file:100644:5ecf5f4 "50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
     │   └── new-file:100644:213ec44 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n"
@@ -421,30 +416,38 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
     ├── .conflict-side-1:71364f9 
     │   ├── file:100644:5ecf5f4 "50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
     │   └── new-file:100644:0ff3bbb "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── file:100644:5ecf5f4 "50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
     └── new-file:100644:213ec44 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n"
     "#);
 
     // gitbutler headers were added here to indicate conflict (change-id is frozen for testing)
-    insta::assert_snapshot!(conflict_commit_id.object()?.data.as_bstr(), @"
-    tree 9a27e6447201f9ae394c1e0aaef1536633943fe0
+    insta::assert_snapshot!(conflict_commit_id.object()?.data.as_bstr(), @r#"
+    tree c581f7908b6eee5cf2cd3a481c8d167f0a47d3c3
     parent eebaa8b32984736d7a835f805724c66a3988f01b
     author author <author@example.com> 946684800 +0000
     committer Committer (Memory Override) <committer@example.com> 946771200 +0000
     gitbutler-headers-version 2
     change-id 1
-    gitbutler-conflicted 1
 
-    C~1
-    ");
+    [conflict] C~1
+
+    GitButler-Conflict: This is a GitButler-managed conflicted commit. Files are auto-resolved
+       using the "ours" side. The commit tree contains additional directories:
+         .conflict-side-0  — our tree
+         .conflict-side-1  — their tree
+         .conflict-base-0  — the merge base tree
+         .auto-resolution  — the auto-resolved tree
+         .conflict-files   — metadata about conflicted files
+       To manually resolve, check out this commit, remove the directories
+       listed above, resolve the conflicts, and amend the commit.
+    "#);
 
     // And they are added to merge commits.
     insta::assert_snapshot!(out.top_commit.attach(&repo).object()?.data.as_bstr(), @"
     tree 6abc3da6f1642bfd5543ef97f98b924f4f232a96
     parent add59d26b2ffd7468fcb44c2db48111dd8f481e5
     parent a7487625f079bedf4d20e48f052312c010117b38
-    parent a5e5bdbc985301d4f814944f11f1cace8eac13a1
+    parent d3cf6a9c107edc10d76ff7842de61a1b8c2fe8a8
     author author <author@example.com> 946684800 +0000
     committer Committer (Memory Override) <committer@example.com> 946771200 +0000
     gitbutler-headers-version 2
@@ -482,12 +485,12 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
             commit_id: repo.rev_parse_single("C~2")?.into(),
             new_message: Some("picked on top of conflicted base".into()),
         }])?
-        .rebase(&cache)?;
+        .rebase()?;
 
     // The base doesn't have new file, and we pick that up from the base of `base` of
     // the previous conflict. `our` side then is the original our.
     insta::assert_snapshot!(visualize_tree(&repo, &out ), @r#"
-    72b9cf3
+    ee9bc70
     ├── .auto-resolution:5b3a532 
     │   ├── file:100644:5ecf5f4 "50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
     │   └── new-file:100644:213ec44 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n"
@@ -500,7 +503,6 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
     ├── .conflict-side-1:fa799da 
     │   ├── file:100644:5ecf5f4 "50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
     │   └── new-file:100644:f00c965 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── file:100644:5ecf5f4 "50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n"
     └── new-file:100644:213ec44 "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n"
     "#);
@@ -512,7 +514,6 @@ fn reorder_with_conflict_and_remerge_and_pick_from_conflicts() -> Result<()> {
 fn reversible_conflicts() -> anyhow::Result<()> {
     // If conflicts are created one way, putting them back the other way auto-resolves them.
     let (repo, _tmp, _meta) = fixture_writable("three-branches-merged")?;
-    let cache = test_cache();
 
     let mut builder = Rebase::new(&repo, repo.rev_parse_single("base")?.detach(), None)?;
     // Re-order commits with conflict, and trigger a re-merge.
@@ -535,7 +536,7 @@ fn reversible_conflicts() -> anyhow::Result<()> {
                 new_message: Some("Re-merge branches 'A', 'B' and 'C'".into()),
             },
         ])?
-        .rebase(&cache)?;
+        .rebase()?;
     assert_eq!(
         conflicted(&repo, &out),
         [false, false, true, false],
@@ -563,7 +564,7 @@ fn reversible_conflicts() -> anyhow::Result<()> {
                     new_message: Some("Re-merge branches 'A', 'B' and 'C'".into()),
                 },
             ])?
-            .rebase(&cache)?;
+            .rebase()?;
 
         assert_eq!(
             conflicted(&repo, &out),
@@ -582,7 +583,7 @@ fn reversible_conflicts() -> anyhow::Result<()> {
                 commit_id: repo.rev_parse_single("C")?.into(),
                 new_message: Some("C~1".into()),
             }])?
-            .rebase(&cache)?;
+            .rebase()?;
         assert_eq!(conflicted(&repo, &out), [false]);
         // The conflicting commit is 1-10, 21-30, and now it is putting 21-30 on top again.
         // Important is that it uses the real tree of the base.
@@ -595,9 +596,9 @@ fn reversible_conflicts() -> anyhow::Result<()> {
 
     let conflict_tip = repo.rev_parse_single(format!("{}^3", out.top_commit).as_str())?;
     insta::assert_snapshot!(visualize_commit_graph(&repo, out.top_commit)?, @r"
-    *-.   b811bdb Re-merge branches 'A', 'B' and 'C'
+    *-.   976ad52 Re-merge branches 'A', 'B' and 'C'
     |\ \  
-    | | * a5e5bdb C~1
+    | | * d3cf6a9 [conflict] C~1
     | | * eebaa8b C
     | | * a037d4a C~2
     | * | a748762 (B) B: another 10 lines at the bottom
@@ -633,7 +634,7 @@ fn reversible_conflicts() -> anyhow::Result<()> {
                 new_message: Some("Re-merge branches 'A', 'B' and 'C'".into()),
             },
         ])?
-        .rebase(&cache)?;
+        .rebase()?;
     assert_eq!(
         conflicted(&repo, &out),
         [false, false, false, false],
@@ -651,7 +652,6 @@ fn reversible_conflicts() -> anyhow::Result<()> {
 #[test]
 fn pick_the_first_commit_with_no_parents_for_squashing() -> Result<()> {
     let (repo, commits, _tmp) = four_commits_writable()?;
-    let cache = test_cache();
     let mut builder = Rebase::new(&repo, None, None)?;
     let out = builder
         .steps([
@@ -664,7 +664,7 @@ fn pick_the_first_commit_with_no_parents_for_squashing() -> Result<()> {
                 new_message: Some("reworded base after squash".into()),
             },
         ])?
-        .rebase(&cache)?;
+        .rebase()?;
     insta::assert_snapshot!(visualize_commit_graph(&repo, out.top_commit)?, @"* e380582 reworded base after squash");
     insta::assert_debug_snapshot!(out, @"
     RebaseOutput {
@@ -743,10 +743,6 @@ pub mod utils {
                 .join("should-never-be-written.toml"),
         )?;
         Ok((repo, tmp, std::mem::ManuallyDrop::new(meta)))
-    }
-
-    pub fn test_cache() -> but_db::CacheHandle {
-        but_db::CacheHandle::new_at_path(":memory:")
     }
 
     #[derive(Debug)]

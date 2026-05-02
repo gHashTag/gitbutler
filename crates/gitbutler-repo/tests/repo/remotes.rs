@@ -12,17 +12,15 @@ struct TestCtx {
 
 fn ctx() -> TestCtx {
     let (repo, tmp) = test_repository();
-    let project = projects::Project::new_for_gitbutler_repo(
-        repo.workdir().unwrap().to_path_buf(),
-        projects::AuthKey::SystemExecutable,
-    );
+    let project = projects::Project::new_for_gitbutler_repo(repo.workdir().unwrap().to_path_buf());
     TestCtx {
         ctx: Context::new_from_legacy_project_and_settings_with_repo_open_mode(
             &project,
             AppSettings::default(),
             RepoOpenMode::Isolated,
         )
-        .expect("can create context"),
+        .expect("can create context")
+        .with_memory_app_cache(),
         _tmp: tmp,
     }
 }

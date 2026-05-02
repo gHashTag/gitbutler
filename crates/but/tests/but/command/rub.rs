@@ -361,7 +361,7 @@ Uncommitted changes
 ...
               "changes": [
                 {
-                  "cliId": "76:nk",
+                  "cliId": "fd:nk",
                   "filePath": "a.txt",
                   "changeType": "modified"
                 }
@@ -685,8 +685,7 @@ fn uncommit_command_with_discard_on_commit() -> anyhow::Result<()> {
         .success()
         .stderr_eq(snapbox::str![])
         .stdout_eq(snapbox::str![[r#"
-╭┄zz [unstaged changes]
-┊     no changes
+╭┄zz [unassigned changes] (no changes)
 ┊
 ┊╭┄g0 [A]
 ┊●   fce8ecc create a.txt and b.txt
@@ -733,8 +732,7 @@ Hint: run `but help` for all commands
         .success()
         .stderr_eq(snapbox::str![])
         .stdout_eq(snapbox::str![[r#"
-╭┄zz [unstaged changes]
-┊     no changes
+╭┄zz [unassigned changes] (no changes)
 ┊
 ┊╭┄g0 [A]
 ┊●   9477ae7 add A
@@ -771,8 +769,7 @@ fn uncommit_command_with_discard_on_committed_file() -> anyhow::Result<()> {
         .success()
         .stderr_eq(snapbox::str![])
         .stdout_eq(snapbox::str![[r#"
-╭┄zz [unstaged changes]
-┊     no changes
+╭┄zz [unassigned changes] (no changes)
 ┊
 ┊╭┄g0 [A]
 ┊●   fce8ecc create a.txt and b.txt
@@ -816,8 +813,7 @@ Hint: run `but help` for all commands
         .success()
         .stderr_eq(snapbox::str![])
         .stdout_eq(snapbox::str![[r#"
-╭┄zz [unstaged changes]
-┊     no changes
+╭┄zz [unassigned changes] (no changes)
 ┊
 ┊╭┄g0 [A]
 ┊●   993513d create a.txt and b.txt
@@ -1331,6 +1327,64 @@ Amended the only hunk in rename-target-single.txt in the unassigned area → [..
 }
 
 #[test]
+fn rub_unassigned_deleted_file_to_commit_keeps_unrelated_deleted_file() -> anyhow::Result<()> {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks")?;
+    env.setup_metadata(&["A", "B"])?;
+
+    env.file("a.txt", "a\n");
+    env.file("b.txt", "b\n");
+    env.file("c.txt", "c\n");
+    env.but("commit A -m 'Add a.txt, b.txt, and c.txt'")
+        .assert()
+        .success();
+
+    std::fs::remove_file(env.projects_root().join("a.txt"))?;
+    std::fs::remove_file(env.projects_root().join("b.txt"))?;
+
+    let before = status_json(&env)?;
+    let source_file_id = unassigned_cli_id_for_file(&before, "a.txt")
+        .expect("a.txt deletion should be present in the unassigned area");
+    let target_commit = branch_commit_ids(&before, "A")[0].clone();
+    assert!(
+        unassigned_contains_file(&before, "b.txt"),
+        "b.txt deletion should start in the unassigned area"
+    );
+
+    env.but(format!("rub {source_file_id} {target_commit}"))
+        .assert()
+        .success()
+        .stdout_eq(str![[r#"
+Amended the only hunk in a.txt in the unassigned area → [..]
+
+"#]])
+        .stderr_eq(str![""]);
+
+    let after = status_json(&env)?;
+    assert!(
+        !unassigned_contains_file(&after, "a.txt"),
+        "selected a.txt deletion should be amended into the target commit"
+    );
+    assert!(
+        unassigned_contains_file(&after, "b.txt"),
+        "unrelated b.txt deletion should remain unassigned"
+    );
+    assert!(
+        !env.projects_root().join("a.txt").exists(),
+        "selected a.txt deletion should stay applied to the worktree"
+    );
+    assert!(
+        !env.projects_root().join("b.txt").exists(),
+        "unrelated b.txt deletion should stay applied to the worktree"
+    );
+    assert!(
+        env.projects_root().join("c.txt").exists(),
+        "untouched c.txt should stay in the worktree"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn rub_matrix_unassigned_to_stack_smoke() -> anyhow::Result<()> {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks")?;
     env.setup_metadata(&["A", "B"])?;
@@ -1434,6 +1488,98 @@ Squashed [..] → [..]
 }
 
 #[test]
+fn rub_commit_without_message_to_commit() -> anyhow::Result<()> {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack")?;
+    env.setup_metadata(&["A"])?;
+
+    env.file("one.txt", "one.txt contents");
+    env.but("commit -m 'add one.txt'").assert().success();
+
+    env.but("status --no-hint")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+╭┄zz [unassigned changes] (no changes)
+┊
+┊╭┄g0 [A]
+┊●   aec35ac add one.txt
+┊●   9477ae7 add A
+├╯
+┊
+┴ 0dc3733 [origin/main] 2000-01-02 add M
+
+"#]]);
+
+    env.but("commit empty --after aec35ac").assert().success();
+
+    env.but("status --no-hint")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+╭┄zz [unassigned changes] (no changes)
+┊
+┊╭┄g0 [A]
+┊●   5e5c05a (no commit message) (no changes)
+┊●   aec35ac add one.txt
+┊●   9477ae7 add A
+├╯
+┊
+┴ 0dc3733 [origin/main] 2000-01-02 add M
+
+"#]]);
+
+    env.but("rub 5e5c05a aec35ac").assert().success();
+
+    env.but("status --no-hint")
+        .assert()
+        .success()
+        .stdout_eq(snapbox::str![[r#"
+╭┄zz [unassigned changes] (no changes)
+┊
+┊╭┄g0 [A]
+┊●   aec35ac add one.txt
+┊●   9477ae7 add A
+├╯
+┊
+┴ 0dc3733 [origin/main] 2000-01-02 add M
+
+"#]]);
+
+    Ok(())
+}
+
+#[test]
+fn rub_commit_to_commit_without_message() -> anyhow::Result<()> {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack")?;
+    env.setup_metadata(&["A"])?;
+
+    env.file("one.txt", "one.txt contents");
+    env.but("commit -m 'add one.txt'").assert().success();
+    env.but("commit empty --after aec35ac").assert().success();
+
+    env.but("rub aec35ac 5e5c05a").assert().success();
+
+    let status = status_json(&env)?;
+    let branch = status["stacks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|stack| stack["branches"].as_array().unwrap().iter())
+        .find(|branch| branch["name"].as_str().unwrap() == "A")
+        .unwrap();
+    let commit_messages = branch["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|commit| commit["message"].as_str().unwrap().trim_end_matches('\n'))
+        .collect::<Vec<_>>();
+
+    assert_eq!(commit_messages, vec!["add one.txt", "add A"]);
+
+    Ok(())
+}
+
+#[test]
 fn rub_matrix_commit_to_branch_smoke() -> anyhow::Result<()> {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks")?;
     env.setup_metadata(&["A", "B"])?;
@@ -1458,6 +1604,40 @@ Moved [..] → [B]
     assert!(
         branch_b_count_after > branch_b_count_before,
         "moving a commit to B should increase commit count on B"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn rub_matrix_commit_to_stack_smoke() -> anyhow::Result<()> {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks")?;
+    env.setup_metadata(&["A", "B"])?;
+
+    commit_two_files_as_two_hunks_each(&env, "A", "a.txt", "b.txt", "first commit");
+
+    let before = status_json(&env)?;
+    let source_commit = branch_commit_ids(&before, "A")[0].clone();
+
+    env.but(format!("rub {source_commit} B@{{stack}}"))
+        .assert()
+        .success()
+        .stdout_eq(str![[r#"
+Uncommitted [..] to [B]
+
+"#]])
+        .stderr_eq(str![""]);
+
+    let after = status_json(&env)?;
+    let commits_after = branch_commit_ids(&after, "A");
+    assert!(
+        !commits_after.contains(&source_commit),
+        "source commit should no longer be present in branch A after uncommit to stack"
+    );
+    assert!(
+        stack_assigned_contains_file(&after, "B", "a.txt")
+            && stack_assigned_contains_file(&after, "B", "b.txt"),
+        "source commit files should be assigned to branch B stack"
     );
 
     Ok(())
@@ -1698,6 +1878,46 @@ Staged all [A] changes to [B].
 }
 
 #[test]
+fn rub_matrix_stack_to_commit_smoke() -> anyhow::Result<()> {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks")?;
+    env.setup_metadata(&["A", "B"])?;
+
+    env.file("stack-to-commit.txt", "content\n");
+    env.but("rub stack-to-commit.txt A")
+        .assert()
+        .success()
+        .stdout_eq(str![[r#"
+Staged the only hunk in stack-to-commit.txt in the unassigned area → [A].
+
+"#]])
+        .stderr_eq(str![""]);
+
+    let before = status_json(&env)?;
+    let target_commit = branch_commit_ids(&before, "A")[0].clone();
+
+    env.but(format!("rub A@{{stack}} {target_commit}"))
+        .assert()
+        .success()
+        .stdout_eq(str![[r#"
+Amended files assigned to [A] → [..]
+
+"#]])
+        .stderr_eq(str![""]);
+
+    let after = status_json(&env)?;
+    assert!(
+        !stack_assigned_contains_file(&after, "A", "stack-to-commit.txt"),
+        "file should no longer be assigned to stack A"
+    );
+    assert!(
+        branch_commits_contain_file(&after, "A", "stack-to-commit.txt"),
+        "file should be amended into a commit on branch A"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn rub_matrix_committed_file_to_branch_smoke() -> anyhow::Result<()> {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks")?;
     env.setup_metadata(&["A", "B"])?;
@@ -1777,23 +1997,7 @@ Rubbed the wrong way. Operation doesn't make sense.[..]
 
 "#]]);
 
-    env.but(format!("rub {commit} A@{{stack}}"))
-        .assert()
-        .failure()
-        .stderr_eq(str![[r#"
-Rubbed the wrong way. Operation doesn't make sense.[..]
-
-"#]]);
-
     env.but("rub A invalid-a.txt")
-        .assert()
-        .failure()
-        .stderr_eq(str![[r#"
-Rubbed the wrong way. Operation doesn't make sense.[..]
-
-"#]]);
-
-    env.but(format!("rub A@{{stack}} {commit}"))
         .assert()
         .failure()
         .stderr_eq(str![[r#"

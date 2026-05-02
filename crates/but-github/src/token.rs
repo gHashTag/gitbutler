@@ -54,10 +54,8 @@ pub fn clear_all_github_accounts(storage: &but_forge_storage::Controller) -> Res
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "export-ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", tag = "type", content = "info")]
-#[cfg_attr(feature = "export-ts", ts(export, export_to = "./github/token.ts"))]
 pub enum GithubAccountIdentifier {
     OAuthUsername { username: String },
     PatUsername { username: String },
@@ -89,6 +87,21 @@ impl GithubAccountIdentifier {
             GithubAccountIdentifier::OAuthUsername { username } => username,
             GithubAccountIdentifier::PatUsername { username } => username,
             GithubAccountIdentifier::Enterprise { username, .. } => username,
+        }
+    }
+
+    /// The key used to store and look up the cached profile for this account.
+    pub fn cache_key(&self) -> String {
+        match self {
+            GithubAccountIdentifier::OAuthUsername { username } => {
+                format!("github_oauth_{username}")
+            }
+            GithubAccountIdentifier::PatUsername { username } => {
+                format!("github_pat_{username}")
+            }
+            GithubAccountIdentifier::Enterprise { host, .. } => {
+                format!("github_enterprise_{host}")
+            }
         }
     }
 
@@ -211,9 +224,15 @@ impl GitHubAccount {
 
     fn secret_key(&self) -> String {
         match self {
-            GitHubAccount::OAuth { username, .. } => format!("github_oauth_{username}"),
-            GitHubAccount::Pat { username, .. } => format!("github_pat_{username}"),
-            GitHubAccount::Enterprise { host, .. } => format!("github_enterprise_{host}"),
+            GitHubAccount::OAuth { username, .. } => {
+                GithubAccountIdentifier::oauth(username).cache_key()
+            }
+            GitHubAccount::Pat { username, .. } => {
+                GithubAccountIdentifier::pat(username).cache_key()
+            }
+            GitHubAccount::Enterprise { host, username, .. } => {
+                GithubAccountIdentifier::enterprise(username, host).cache_key()
+            }
         }
     }
 

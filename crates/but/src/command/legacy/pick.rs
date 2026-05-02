@@ -1,14 +1,14 @@
 //! Cherry-pick commits from unapplied branches into applied virtual branches.
 
+use crate::theme::{self, Paint};
 use anyhow::{Context as _, Result, bail};
 use bstr::ByteSlice;
 use but_api::legacy::{cherry_apply, virtual_branches, workspace};
 use but_cherry_apply::CherryApplyStatus;
-use but_core::{RepositoryExt, ref_metadata::StackId};
+use but_core::{RepositoryExt, ref_metadata::StackId, sync::RepoShared};
 use but_ctx::Context;
 use but_workspace::legacy::{StacksFilter, ui::StackEntry};
 use cli_prompts::DisplayPrompt;
-use colored::Colorize;
 use gitbutler_branch_actions::BranchListingFilter;
 use gitbutler_oplog::{
     OplogExt,
@@ -18,6 +18,7 @@ use gix::{revision::walk::Sorting, traverse::commit::simple::CommitTimeOrder};
 
 use crate::{
     CliId, IdMap,
+    command::legacy::workspace_target,
     utils::{OutputChannel, WriteWithUtils, shorten_hex_object_id, shorten_object_id},
 };
 
@@ -55,7 +56,7 @@ pub fn handle(
     };
 
     // Resolve the source to commit(s) (may involve interactive multi-selection for branches)
-    let commit_oids = resolve_source_commits(ctx, out, &id_map, source)?;
+    let commit_oids = resolve_source_commits(ctx, guard.read_permission(), out, &id_map, source)?;
 
     // Save an oplog snapshot before applying picks so the operation can be undone
     let _ = ctx.create_snapshot(
@@ -96,6 +97,7 @@ pub fn handle(
     }
 
     // Output results
+    let t = theme::get();
     let repo = ctx.repo.get()?.clone().for_commit_shortening();
     for (commit_hex, target_branch_name, _) in &picked {
         let commit_short = shorten_hex_object_id(&repo, commit_hex);
@@ -103,10 +105,10 @@ pub fn handle(
             writeln!(
                 out,
                 "{} {} {} {}",
-                "Picked commit".green(),
-                commit_short.yellow(),
-                "into branch".green(),
-                target_branch_name.cyan()
+                t.success.paint("Picked commit"),
+                t.commit_id.paint(&commit_short),
+                t.success.paint("into branch"),
+                t.local_branch.paint(target_branch_name)
             )?;
         }
     }
@@ -152,7 +154,8 @@ pub fn handle(
 /// 2. CLI ID (e.g., "c5")
 /// 3. Full or partial commit SHA (via rev_parse)
 fn resolve_source_commits(
-    ctx: &mut Context,
+    ctx: &Context,
+    perm: &RepoShared,
     out: &mut OutputChannel,
     id_map: &IdMap,
     source: &str,
@@ -174,7 +177,7 @@ fn resolve_source_commits(
         .find(|b| b.name.to_string() == source || b.name.to_string().to_lowercase() == source_lower)
     {
         let branch_name = branch.name.to_string();
-        return select_commits_from_branch(ctx, out, branch.head, &branch_name);
+        return select_commits_from_branch(ctx, perm, out, branch.head, &branch_name);
     }
 
     // Try using IdMap for CLI IDs
@@ -205,7 +208,8 @@ Run 'but status' to see available CLI IDs, or 'but branch list' to see branches.
 
 /// Select one or more commits from a branch, either interactively or using the head.
 fn select_commits_from_branch(
-    ctx: &mut Context,
+    ctx: &Context,
+    perm: &RepoShared,
     out: &mut OutputChannel,
     branch_head: gix::ObjectId,
     branch_name: &str,
@@ -214,29 +218,21 @@ fn select_commits_from_branch(
 
     let repo = ctx.repo.get()?;
 
-    // Get the target branch to find merge base
-    let vb_state = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-    let default_target = vb_state.get_default_target()?;
-
-    let branch_head_gix = branch_head;
-    let target_oid_gix = default_target.sha;
-
     // Find merge base
-    let merge_base = repo
-        .merge_base(branch_head_gix, target_oid_gix)
-        .context("Failed to find merge base")?;
+    let (merge_base, _) =
+        workspace_target::merge_base_with_target_with_perm(ctx, perm, branch_head)?;
 
     // Non-interactive mode: use the branch head directly (most recent commit)
     if !out.can_prompt() {
         // Verify branch_head is not the merge base itself (i.e., there are commits to pick)
-        if branch_head_gix == merge_base {
+        if branch_head == merge_base {
             bail!("No commits found on branch '{branch_name}' that aren't already in target.");
         }
-        return Ok(vec![branch_head_gix]);
+        return Ok(vec![branch_head]);
     }
 
     // Interactive mode: walk commits from branch head to merge base
-    let traversal = branch_head_gix
+    let traversal = branch_head
         .attach(&repo)
         .ancestors()
         .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst))
@@ -313,7 +309,7 @@ fn select_commits_from_branch(
 
 /// Resolve the target stack based on user input and cherry-apply status.
 fn resolve_target_stack(
-    ctx: &mut Context,
+    ctx: &Context,
     out: &mut OutputChannel,
     id_map: &IdMap,
     stacks: &[StackEntry],
@@ -390,12 +386,13 @@ fn handle_locked_to_stack(
             h.name.to_str_lossy() == target || h.name.to_string().to_lowercase() == target_lower
         });
 
+        let t = theme::get();
         if !target_matches && let Some(out) = out.for_human() {
             writeln!(
                 out,
                 "{} Commit is locked to '{}' due to conflicts. Ignoring specified target.",
-                "Warning:".yellow(),
-                locked_branch_name.cyan()
+                t.attention.paint("Warning:"),
+                t.local_branch.paint(&locked_branch_name)
             )?;
         }
     }
@@ -405,7 +402,7 @@ fn handle_locked_to_stack(
 
 /// Find a stack by CLI ID or branch name (case-insensitive).
 fn find_stack_by_target(
-    ctx: &mut Context,
+    ctx: &Context,
     id_map: &IdMap,
     stacks: &[StackEntry],
     target: &str,

@@ -1,22 +1,18 @@
 use anyhow::{Context as _, Result};
-use bstr::ByteSlice;
 use but_core::DiffSpec;
 use but_ctx::{
     Context,
     access::{RepoExclusive, RepoShared},
 };
-use but_workspace::legacy::{commit_engine, stack_heads_info, ui};
+use but_workspace::legacy::{stack_heads_info, ui};
 use gitbutler_branch::{BranchCreateRequest, BranchUpdateRequest};
 use gitbutler_operating_modes::ensure_open_workspace_mode;
 use gitbutler_oplog::{
-    OplogExt, SnapshotExt,
+    OplogExt,
     entry::{OperationKind, SnapshotDetails, Trailer},
 };
-use gitbutler_project::FetchResult;
 use gitbutler_reference::{Refname, RemoteRefname};
-use gitbutler_repo_actions::RepoActionsExt;
 use gitbutler_stack::StackId;
-use tracing::instrument;
 
 use super::r#virtual as vbranch;
 use crate::{
@@ -25,9 +21,6 @@ use crate::{
     branch_manager::BranchManagerExt,
     branch_upstream_integration,
     branch_upstream_integration::IntegrationStrategy,
-    move_branch::MoveBranchResult,
-    move_commits::{self, MoveCommitIllegalAction},
-    reorder::{self, StackOrder},
     upstream_integration::{
         self, BaseBranchResolution, BaseBranchResolutionApproach, IntegrationOutcome, Resolution,
         StackStatuses, UpstreamIntegrationContext,
@@ -225,89 +218,6 @@ pub fn unapply_stack(
     Ok(branch_name)
 }
 
-pub fn amend(
-    ctx: &mut Context,
-    stack_id: StackId,
-    commit_oid: gix::ObjectId,
-    worktree_changes: Vec<DiffSpec>,
-) -> Result<gix::ObjectId> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Amending a commit requires open workspace mode")?;
-    {
-        // commit_engine::create_commit_and_update_refs_with_project is also doing a write lock,
-        // so we want to allow this guard to be dropped first
-        let mut guard = guard;
-        let _ = ctx.create_snapshot(
-            SnapshotDetails::new(OperationKind::AmendCommit),
-            guard.write_permission(),
-        );
-    }
-    amend_with_commit_engine(ctx, stack_id, commit_oid, worktree_changes)
-}
-
-/// This is backported version of amending using the new commit engine, in the old API
-fn amend_with_commit_engine(
-    ctx: &mut Context,
-    stack_id: StackId,
-    commit_oid: gix::ObjectId,
-    worktree_changes: Vec<DiffSpec>,
-) -> Result<gix::ObjectId> {
-    let mut guard = ctx.exclusive_worktree_access();
-
-    let outcome = commit_engine::create_commit_and_update_refs_with_project(
-        &*ctx.repo.get()?,
-        &ctx.project_data_dir(),
-        Some(stack_id),
-        but_workspace::commit_engine::Destination::AmendCommit {
-            commit_id: commit_oid,
-            new_message: None,
-        },
-        worktree_changes,
-        3, // for the old API this is hardcoded
-        guard.write_permission(),
-    )?;
-    let new_commit = outcome.new_commit.ok_or(anyhow::anyhow!(
-        "Failed to amend with commit engine. Rejected specs: {:?}",
-        outcome.rejected_specs
-    ))?;
-    Ok(new_commit)
-}
-
-pub fn undo_commit(ctx: &mut Context, stack_id: StackId, commit_oid: gix::ObjectId) -> Result<()> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Undoing a commit requires open workspace mode")?;
-    let snapshot_tree = ctx.prepare_snapshot(guard.read_permission());
-    let result: Result<()> =
-        crate::undo_commit::undo_commit(ctx, stack_id, commit_oid, guard.write_permission())
-            .map(|_| ());
-    let _ = snapshot_tree.and_then(|snapshot_tree| {
-        ctx.snapshot_commit_undo(
-            snapshot_tree,
-            result.as_ref(),
-            commit_oid,
-            guard.write_permission(),
-        )
-    });
-    result
-}
-
-pub fn reorder_stack(ctx: &mut Context, stack_id: StackId, stack_order: StackOrder) -> Result<()> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Reordering a commit requires open workspace mode")?;
-    let _ = ctx.create_snapshot(
-        SnapshotDetails::new(OperationKind::ReorderCommit),
-        guard.write_permission(),
-    );
-    reorder::reorder_stack(ctx, stack_id, stack_order, guard.write_permission())?;
-    Ok(())
-}
-
 pub fn squash_commits(
     ctx: &mut Context,
     stack_id: StackId,
@@ -337,137 +247,9 @@ pub fn squash_commits_with_perm(
     crate::squash::squash_commits(ctx, stack_id, source_ids, destination_id, perm)
 }
 
-pub fn update_commit_message(
-    ctx: &mut Context,
-    stack_id: StackId,
-    commit_oid: gix::ObjectId,
-    message: &str,
-) -> Result<gix::ObjectId> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Updating a commit message requires open workspace mode")?;
-    let _ = ctx.create_snapshot(
-        SnapshotDetails::new(OperationKind::UpdateCommitMessage),
-        guard.write_permission(),
-    );
-    vbranch::update_commit_message(ctx, stack_id, commit_oid, message)
-}
-
-pub fn fetch_from_remotes(ctx: &Context, askpass: Option<String>) -> Result<FetchResult> {
-    let repo = ctx.repo.get()?;
-    let remotes = repo
-        .remote_names()
-        .iter()
-        .map(|name| name.to_str().map(str::to_owned))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let fetch_errors: Vec<_> = remotes
-        .iter()
-        .filter_map(|remote| {
-            ctx.fetch(remote, askpass.clone())
-                .err()
-                .map(|err| err.to_string())
-        })
-        .collect();
-
-    let timestamp = std::time::SystemTime::now();
-    let project_data_last_fetched = if fetch_errors.is_empty() {
-        FetchResult::Fetched { timestamp }
-    } else {
-        FetchResult::Error {
-            timestamp,
-            error: fetch_errors.join("\n"),
-        }
-    };
-    let mut state = ctx.virtual_branches();
-
-    state.garbage_collect(&*ctx.repo.get()?)?;
-
-    Ok(project_data_last_fetched)
-}
-
-pub fn move_commit(
-    ctx: &mut Context,
-    target_stack_id: StackId,
-    commit_oid: gix::ObjectId,
-    source_stack_id: StackId,
-) -> Result<Option<MoveCommitIllegalAction>> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Moving a commit requires open workspace mode")?;
-    move_commits::move_commit(
-        ctx,
-        target_stack_id,
-        commit_oid,
-        guard.write_permission(),
-        source_stack_id,
-    )
-}
-
-pub fn move_branch(
-    ctx: &mut Context,
-    target_stack_id: StackId,
-    target_branch_name: &str,
-    source_stack_id: StackId,
-    subject_branch_name: &str,
-) -> Result<MoveBranchResult> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Moving a branch requires open workspace mode")?;
-    crate::move_branch::move_branch(
-        ctx,
-        target_stack_id,
-        target_branch_name,
-        source_stack_id,
-        subject_branch_name,
-        guard.write_permission(),
-    )
-}
-
-pub fn tear_off_branch(
-    ctx: &mut Context,
-    source_stack_id: StackId,
-    subject_branch_name: &str,
-) -> Result<MoveBranchResult> {
-    let mut guard = ctx.exclusive_worktree_access();
-    ctx.verify(guard.write_permission())?;
-    ensure_open_workspace_mode(ctx, guard.read_permission())
-        .context("Moving a branch requires open workspace mode")?;
-    let _ = ctx.create_snapshot(
-        SnapshotDetails::new(OperationKind::TearOffBranch),
-        guard.write_permission(),
-    );
-    crate::move_branch::tear_off_branch(
-        ctx,
-        source_stack_id,
-        subject_branch_name,
-        guard.write_permission(),
-    )
-}
-
-#[instrument(level = "debug", skip(ctx), err(Debug))]
-pub fn create_virtual_branch_from_branch(
-    ctx: &mut Context,
-    branch: &Refname,
-    remote: Option<RemoteRefname>,
-    pr_number: Option<usize>,
-) -> Result<(StackId, Vec<StackId>, Vec<String>)> {
-    let mut guard = ctx.exclusive_worktree_access();
-    create_virtual_branch_from_branch_with_perm(
-        ctx,
-        branch,
-        remote,
-        pr_number,
-        guard.write_permission(),
-    )
-}
-
 pub fn create_virtual_branch_from_branch_with_perm(
     ctx: &mut Context,
     branch: &Refname,
-    remote: Option<RemoteRefname>,
     pr_number: Option<usize>,
     perm: &mut RepoExclusive,
 ) -> Result<(StackId, Vec<StackId>, Vec<String>)> {
@@ -475,7 +257,7 @@ pub fn create_virtual_branch_from_branch_with_perm(
     ensure_open_workspace_mode(ctx, perm.read_permission())
         .context("Creating a virtual branch from a branch open workspace mode")?;
     let branch_manager = ctx.branch_manager();
-    branch_manager.create_virtual_branch_from_branch(branch, remote, pr_number, perm)
+    branch_manager.create_virtual_branch_from_branch(branch, pr_number, perm)
 }
 
 pub fn upstream_integration_statuses(

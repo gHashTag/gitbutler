@@ -7,6 +7,7 @@ export type CommitUncommitParams = {
 	assignTo: string | null;
 };
 
+/** @public */
 export const applyBranchMutationOptions = mutationOptions({
 	mutationFn: window.lite.apply,
 	onSuccess: async (_data, _input, _ctx, { client }) => {
@@ -14,19 +15,8 @@ export const applyBranchMutationOptions = mutationOptions({
 	},
 });
 
-export const absorptionPlanMutationOptions = mutationOptions({
-	mutationFn: window.lite.absorptionPlan,
-});
-
 export const absorbMutationOptions = mutationOptions({
 	mutationFn: window.lite.absorb,
-	onSuccess: async (_data, _input, _ctx, { client }) => {
-		await client.invalidateQueries();
-	},
-});
-
-export const assignHunkMutationOptions = mutationOptions({
-	mutationFn: window.lite.assignHunk,
 	onSuccess: async (_data, _input, _ctx, { client }) => {
 		await client.invalidateQueries();
 	},

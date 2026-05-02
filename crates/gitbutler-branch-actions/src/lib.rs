@@ -1,23 +1,21 @@
 //! GitButler internal library containing functionality related to branches, i.e. the virtual branches implementation
+#![expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
+
 mod actions;
 // This is our API
 pub use actions::{
-    amend, create_virtual_branch, create_virtual_branch_from_branch,
-    create_virtual_branch_from_branch_with_perm, delete_local_branch, fetch_from_remotes,
+    create_virtual_branch, create_virtual_branch_from_branch_with_perm, delete_local_branch,
     get_initial_integration_steps_for_branch, integrate_branch_with_steps, integrate_upstream,
-    integrate_upstream_commits, move_branch, move_commit, push_base_branch, reorder_stack,
-    resolve_upstream_integration, set_base_branch, set_target_push_remote, squash_commits,
-    squash_commits_with_perm, tear_off_branch, unapply_stack, undo_commit, update_commit_message,
+    integrate_upstream_commits, push_base_branch, resolve_upstream_integration, set_base_branch,
+    set_target_push_remote, squash_commits, squash_commits_with_perm, unapply_stack,
     update_stack_order, upstream_integration_statuses,
 };
 mod squash;
 
 mod r#virtual;
-/// Avoid using these!
-/// This was previously `pub use r#virtual::*;`
-pub mod internal {
-    pub use super::{branch_upstream_integration, r#virtual::*};
-}
 
 mod branch_manager;
 pub use branch_manager::{BranchManagerExt, CreateBranchFromBranchOutcome};
@@ -36,13 +34,8 @@ pub use integration::{
 mod remote;
 
 pub mod branch_upstream_integration;
-mod move_branch;
-mod move_commits;
-pub mod reorder;
-pub use reorder::StackOrder;
-mod undo_commit;
+mod reorder;
 
-mod author;
 mod gravatar;
 use gitbutler_stack::VirtualBranchesHandle;
 
@@ -61,8 +54,6 @@ pub use branch::{
     Author, BranchListing, BranchListingDetails, BranchListingFilter, get_branch_listing_details,
     list_branches,
 };
-pub use move_branch::MoveBranchResult;
-pub use move_commits::MoveCommitIllegalAction;
 
 pub mod hooks;
 pub mod stack;

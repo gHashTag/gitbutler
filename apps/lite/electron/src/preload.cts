@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { LiteElectronApi, WatcherSubscribeResult } from "./ipc";
+import type { UpdateDownloadedEvent } from "electron-updater";
 import type {
 	CommitAbsorption,
 	ApplyOutcome,
@@ -91,6 +92,8 @@ const api: LiteElectronApi = {
 	ping: (input) => ipcRenderer.invoke("lite:ping", input) as Promise<string>,
 	pushStackLegacy: (params) =>
 		ipcRenderer.invoke("workspace:push-stack-legacy", params) as Promise<PushResult>,
+	showNativeMenu: (params) =>
+		ipcRenderer.invoke("lite:show-native-menu", params) as Promise<string | null>,
 	treeChangeDiffs: (params) =>
 		ipcRenderer.invoke("workspace:tree-change-diffs", params) as Promise<UnifiedPatch | null>,
 	unapplyStack: (params) => ipcRenderer.invoke("workspace:unapply-stack", params) as Promise<void>,
@@ -151,6 +154,13 @@ const api: LiteElectronApi = {
 		watcherListenerBySubscription.clear();
 		return ipcRenderer.invoke("workspace:watcher-stop-all") as Promise<number>;
 	},
+	onUpdateDownloaded: (callback) => {
+		const listener = (_event: Electron.IpcRendererEvent, info: UpdateDownloadedEvent) =>
+			callback(info);
+		ipcRenderer.on("updater:update-downloaded", listener);
+		return () => ipcRenderer.removeListener("updater:update-downloaded", listener);
+	},
+	quitAndInstallUpdate: () => ipcRenderer.invoke("updater:quit-and-install") as Promise<void>,
 };
 
 contextBridge.exposeInMainWorld("lite", api);

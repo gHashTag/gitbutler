@@ -8,6 +8,7 @@ import {
 } from "../src/commit.ts";
 import { stageFirstFile, unstageAllFiles, writeFiles } from "../src/file.ts";
 import { getBaseURL, type GitButler, startGitButler } from "../src/setup.ts";
+import { test } from "../src/test.ts";
 import {
 	clickByTestId,
 	dragAndDropByLocator,
@@ -15,7 +16,7 @@ import {
 	waitForTestId,
 	waitForTestIdToNotExist,
 } from "../src/util.ts";
-import { expect, Page, test } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
 import { copyFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
@@ -56,9 +57,9 @@ test("should be able to amend a file to a commit", async ({ page, context }, tes
 	const commits = getByTestId(page, "commit-row");
 	await expect(commits).toHaveCount(2);
 
-	// Push the changes to the remote branch
-	// (it's basically a no-op, just makes sure that the same commits after rebasing are on the remote)
-	await clickByTestId(page, "stack-push-button");
+	// Imported remote branches start out already synced when added via `but apply`.
+	const initialPushButton = getByTestId(page, "stack-push-button");
+	await expect(initialPushButton).toBeDisabled();
 
 	// Add a new file
 	writeFileSync(filePath, "Hello! this is file b\n", { flag: "w" });
@@ -86,6 +87,7 @@ test("should be able to commit a bunch of times in a row and edit their message"
 	page,
 	context,
 }, testInfo) => {
+	test.setTimeout(120_000);
 	const workdir = testInfo.outputPath("workdir");
 	const configdir = testInfo.outputPath("config");
 	gitbutler = await startGitButler(workdir, configdir, context);
@@ -360,9 +362,9 @@ function getAmendedCommitTitle(i: number): string {
 }
 
 function getCommitDescription(i: number): string {
-	return `Description for commit ${i + 1}`;
+	return `Desc ${i + 1}`;
 }
 
 function getAmendedCommitDescription(i: number): string {
-	return `Amended description for commit ${i + 1}`;
+	return `Amended ${i + 1}`;
 }

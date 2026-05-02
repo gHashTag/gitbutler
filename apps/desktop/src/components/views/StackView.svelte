@@ -168,6 +168,7 @@
 	class="stack-view-wrapper"
 	role="presentation"
 	class:dimmed={controller.dimmed}
+	class:stack-busy={controller.stackBusy}
 	tabindex="-1"
 	data-id={controller.stackId}
 	data-testid={TestId.Stack}
@@ -223,7 +224,6 @@
 							viewport={stackViewEl}
 							zIndex="var(--z-lifted)"
 							direction="right"
-							showBorder={!isDetailsOpen}
 							minWidth={PANEL1_RESIZER.minWidth}
 							maxWidth={PANEL1_RESIZER.maxWidth}
 							defaultValue={$persistedStackWidth ?? PANEL1_RESIZER.defaultValue}
@@ -281,7 +281,8 @@
 		margin-right: calc(var(--details-view-width) + 1.125rem);
 	}
 
-	.dimmed .stack-view {
+	.dimmed .stack-view,
+	.stack-busy .stack-view {
 		pointer-events: none;
 	}
 

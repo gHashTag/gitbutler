@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    # What follows is an attempt at crate classification.
     # Moving them up is the goal here.
     # And of course, this classification isn't truly objective,
     # and you should feel free to make adjustments.
@@ -19,6 +18,7 @@ members = [
     "crates/but-error",          # 📄Error codes to communicate specific failures; JSON Error for frontends.
     "crates/but-testsupport",    # 📄Despite lacking tests, it is the foundation for all tests.
     "crates/but-feedback",       # 📄It's very small and very special, but documented and well-enough tested.
+    "crates/but-askpass",        # 📄Broker prompts from Git back to the application.
     "crates/but-project-handle", # 📄Temporary home of ProjectHandle until `gitbutler-project` is gone and it can merge back into `but-ctx`.
 
     ##
@@ -88,7 +88,7 @@ members = [
     ##
     # Mostly supporting legacy code.
     # In big parts replaced by other crates.
-    "crates/but-fs",      # 📄filesystem utilities 👉we should be using `but-db` instead.
+    "crates/but-utils",   # 📄filesystem and general utilities; formerly `but-fs`.
     "crates/but-oxidize", # 📄Utilities to help translate between `git2` and `gix`. 👉Shouldn't be needed once `git2` is gone.
 
     ##
@@ -105,13 +105,12 @@ members = [
     ### Binaries
     ##
     # Strive for testing main functionality and journeys where applicable.
+    "crates/but-debug",
     "crates/but",
     # Should be functionally equivalent to `gitbutler-tauri`
     "crates/but-server",
     # Should be reviewed to mostly use `but-api`, to be renamed to `but-tauri` or something.
     "crates/gitbutler-tauri",
-    # Hack at will. Can be of any quality level, as long as it works for you.
-    "crates/but-testing",
     # GitButler installation binary
     "crates/but-installer",
     # Documentation binary
@@ -143,6 +142,7 @@ edition = "2024"
 rust-version = "1.89"
 
 [workspace.dependencies]
+but-debug = { path = "crates/but-debug" }
 but = { path = "crates/but" }
 but-debugging = { path = "crates/but-debugging" }
 but-testsupport = { path = "crates/but-testsupport" }
@@ -177,11 +177,12 @@ but-update = { path = "crates/but-update" }
 but-installer = { path = "crates/but-installer" }
 but-secret = { path = "crates/but-secret" }
 but-feedback = { path = "crates/but-feedback" }
+but-askpass = { path = "crates/but-askpass" }
 but-project-handle = { path = "crates/but-project-handle" }
 but-forge-storage = { path = "crates/but-forge-storage" }
 but-settings = { path = "crates/but-settings" }
 but-oxidize = { path = "crates/but-oxidize" }
-but-fs = { path = "crates/but-fs" }
+but-utils = { path = "crates/but-utils" }
 but-forge = { path = "crates/but-forge" }
 but-oplog = { path = "crates/but-oplog" }
 but-llm = { path = "crates/but-llm" }
@@ -212,12 +213,12 @@ backoff = "0.4.0"
 bstr = "1.12.1"
 # Add the `tracing` or `tracing-detail` features to see more of gitoxide in the logs. Useful to see which programs it invokes.
 # When adjusting this, update `gix-testtools` as well!
-gix = { version = "0.81.0", git = "https://github.com/GitoxideLabs/gitoxide", rev = "e51c40bd5c206305197bd635014f51930b5d8fc2", default-features = false, features = [
+gix = { version = "0.83.0", git = "https://github.com/GitoxideLabs/gitoxide", rev = "adb8328952478c443ead5f5a8c6851928b377b37", default-features = false, features = [
     "sha1",
 ] }
-gix-testtools = { version = "0.19.0", git = "https://github.com/GitoxideLabs/gitoxide", rev = "e51c40bd5c206305197bd635014f51930b5d8fc2" }
+gix-testtools = { version = "0.19.0", git = "https://github.com/GitoxideLabs/gitoxide", rev = "adb8328952478c443ead5f5a8c6851928b377b37" }
 
-ts-rs = { version = "11.1.0", features = ["serde-compat", "no-serde-warnings"] }
+
 insta = { version = "1.45.1", features = ["json"] }
 git2 = { version = "0.20.4", features = [
     "vendored-openssl",
@@ -228,6 +229,7 @@ serde = { version = "1.0", features = ["derive", "std"] }
 serde_json = "1.0.148"
 thiserror = "2.0.17"
 tokio = { version = "1.50.0", default-features = false }
+tokio-util = { version = "0.7" }
 keyring = { version = "3.6.3", features = [
     "apple-native",
     "windows-native",
@@ -242,7 +244,7 @@ toml = "0.9.10"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 tempfile = "3.24"
-rand = "0.9.2"
+rand = "0.9.3"
 notify-rust = "4.11.7"
 git2-hooks = { version = "0.5.0" }
 itertools = "0.14.0"
@@ -256,11 +258,13 @@ serde_json_lenient = "0.2.3"
 reqwest = { version = "0.12.28", default-features = false, features = [
     "rustls-tls",
     "json",
+    "multipart",
 ] }
 rust-embed = { version = "8", features = ["axum"] }
 mime_guess = "2"
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 hex = "0.4.3"
+indexmap = "2"
 md5 = "0.8.0"
 sha2 = "0.10"
 base64 = "0.22"
@@ -336,7 +340,7 @@ incremental = false
 # Assure that `gix` is always fast so debug builds aren't unnecessarily slow.
 [profile.dev.package]
 foldhash = { opt-level = 3 }
-imara-diff = { opt-level = 3 }
+gix-imara-diff = { opt-level = 3 }
 but-graph = { opt-level = 3 }
 gix = { opt-level = 3 }
 gix-diff = { opt-level = 3 }

@@ -2,10 +2,13 @@ use super::super::FileChange;
 use bstr::ByteSlice;
 use but_ctx::Context;
 use but_llm::ChatMessage;
-use colored::Colorize;
 use tracing::instrument;
 
-use crate::utils::{OutputChannel, shorten_object_id};
+use crate::{
+    command::legacy::workspace_target,
+    theme::{self, Paint},
+    utils::{OutputChannel, shorten_object_id},
+};
 
 pub fn show(
     ctx: &mut Context,
@@ -109,24 +112,6 @@ struct CommitRef {
 fn check_merge_conflicts(ctx: &Context, branch_name: &str) -> Result<MergeCheck, anyhow::Error> {
     use but_core::RepositoryExt;
 
-    let repo = ctx.repo.get()?;
-    let merge_repo = ctx.clone_repo_for_merging_non_persisting()?;
-
-    // Get the target (remote tracking branch like origin/master)
-    let stack = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-    let target = stack.get_default_target()?;
-
-    // Try to find the remote tracking branch (e.g., refs/remotes/origin/master)
-    let target_ref_name = format!(
-        "refs/remotes/{}/{}",
-        target.branch.remote(),
-        target.branch.branch()
-    );
-    let target_commit_id = match merge_repo.find_reference(&target_ref_name) {
-        Ok(mut reference) => reference.peel_to_commit()?.id,
-        Err(_) => target.sha,
-    };
-
     // Find the branch by name
     let branches = but_api::legacy::virtual_branches::list_branches(ctx, None)?;
     let branch = branches
@@ -135,9 +120,16 @@ fn check_merge_conflicts(ctx: &Context, branch_name: &str) -> Result<MergeCheck,
         .ok_or_else(|| anyhow::anyhow!("Branch '{branch_name}' not found"))?;
 
     // Find merge base
-    let merge_base = repo.merge_base(branch.head, target_commit_id)?.detach();
+    let guard = ctx.shared_worktree_access();
+    let (merge_base, target) = workspace_target::merge_base_with_target_with_perm(
+        ctx,
+        guard.read_permission(),
+        branch.head,
+    )?;
+    let repo = ctx.repo.get()?;
+    let merge_repo = ctx.clone_repo_for_merging_non_persisting()?;
     let merge_base_tree_id = repo.find_commit(merge_base)?.tree_id()?.detach();
-    let target_tree_id = repo.find_commit(target_commit_id)?.tree_id()?.detach();
+    let target_tree_id = repo.find_commit(target.oid())?.tree_id()?.detach();
     let branch_tree_id = repo.find_commit(branch.head)?.tree_id()?.detach();
 
     // Check if branch merges cleanly into target
@@ -158,7 +150,7 @@ fn check_merge_conflicts(ctx: &Context, branch_name: &str) -> Result<MergeCheck,
                 find_commits_modifying_file(&repo, &path, merge_base, branch.head)?;
 
             let upstream_commits =
-                find_commits_modifying_file(&repo, &path, merge_base, target_commit_id)?;
+                find_commits_modifying_file(&repo, &path, merge_base, target.oid())?;
 
             conflicting_files.push(ConflictingFile {
                 path,
@@ -262,23 +254,6 @@ fn get_commits_ahead(
 ) -> Result<Vec<CommitInfo>, anyhow::Error> {
     use gix::prelude::ObjectIdExt as _;
 
-    let repo = ctx.repo.get()?;
-
-    // Get the target (remote tracking branch like origin/master)
-    let stack = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-    let target = stack.get_default_target()?;
-
-    // Try to find the remote tracking branch (e.g., refs/remotes/origin/master)
-    let target_ref_name = format!(
-        "refs/remotes/{}/{}",
-        target.branch.remote(),
-        target.branch.branch()
-    );
-    let target_oid_gix = match repo.find_reference(&target_ref_name) {
-        Ok(mut reference) => reference.peel_to_commit()?.id,
-        Err(_) => target.sha,
-    };
-
     // Find the branch by name
     let branches = but_api::legacy::virtual_branches::list_branches(ctx, None)?;
     let branch = branches
@@ -289,7 +264,13 @@ fn get_commits_ahead(
     let branch_oid_gix = branch.head;
 
     // Find merge base
-    let merge_base = repo.merge_base(branch_oid_gix, target_oid_gix)?;
+    let guard = ctx.shared_worktree_access();
+    let (merge_base, _) = workspace_target::merge_base_with_target_with_perm(
+        ctx,
+        guard.read_permission(),
+        branch_oid_gix,
+    )?;
+    let repo = ctx.repo.get()?;
 
     // Walk from branch head to merge base, collecting commits
     let traversal = branch_oid_gix
@@ -508,6 +489,9 @@ fn output_human(
     out: &mut dyn std::fmt::Write,
 ) -> anyhow::Result<()> {
     use std::fmt::Write;
+
+    let t = theme::get();
+
     // Build output as a string first
     let mut buf = String::new();
 
@@ -518,18 +502,18 @@ fn output_human(
             .map(|r| format!("{}{}", r.unit_symbol, r.number))
             .collect::<Vec<String>>()
             .join(", ");
-        format!(" ({review_numbers})").blue().to_string()
+        t.info.paint(format!(" ({review_numbers})"))
     } else {
-        String::new()
+        t.default.paint("")
     };
 
     writeln!(
         buf,
         "{} {}{} ({} commits ahead)",
-        "Branch:".bold(),
-        branch_name.green(),
+        t.important.paint("Branch:"),
+        t.local_branch.paint(branch_name),
         reviews_str,
-        commits.len().to_string().cyan()
+        t.info.paint(commits.len().to_string()),
     )?;
     writeln!(buf)?;
 
@@ -537,12 +521,17 @@ fn output_human(
         writeln!(buf, "No commits ahead of base branch.")?;
     } else {
         for (i, commit) in commits.iter().enumerate() {
-            writeln!(buf, "{} {}", commit.short_sha.yellow(), commit.message)?;
+            writeln!(
+                buf,
+                "{} {}",
+                t.commit_id.paint(&commit.short_sha),
+                commit.message
+            )?;
             writeln!(
                 buf,
                 "    {} by {}",
-                format_timestamp(commit.timestamp).dimmed(),
-                commit.author_name.dimmed()
+                t.hint.paint(format_timestamp(commit.timestamp)),
+                t.hint.paint(&commit.author_name)
             )?;
 
             // Show diff stats
@@ -555,17 +544,17 @@ fn output_human(
                 commit.deletions,
                 if commit.deletions == 1 { "" } else { "s" }
             );
-            writeln!(buf, "    {}", stats_str.dimmed())?;
+            writeln!(buf, "    {}", t.hint.paint(stats_str))?;
 
             // Show per-file changes if available
             if !commit.files.is_empty() {
                 writeln!(buf)?;
                 for file in &commit.files {
                     let status_color = match file.status.as_str() {
-                        "added" => file.path.green(),
-                        "deleted" => file.path.red(),
-                        "modified" => file.path.yellow(),
-                        _ => file.path.normal(),
+                        "added" => t.addition.paint(&file.path),
+                        "deleted" => t.deletion.paint(&file.path),
+                        "modified" => t.modification.paint(&file.path),
+                        _ => t.default.paint(&file.path),
                     };
 
                     let change_str = if file.status == "added" {
@@ -594,9 +583,9 @@ fn output_human(
     if !unassigned_files.is_empty() {
         writeln!(buf)?;
         writeln!(buf)?;
-        writeln!(buf, "{}", "Unstaged Files:".bold())?;
+        writeln!(buf, "{}", t.important.paint("Unassigned Files:"))?;
         for file in unassigned_files {
-            writeln!(buf, "  {}", file.yellow())?;
+            writeln!(buf, "  {}", t.attention.paint(file))?;
         }
     }
 
@@ -604,23 +593,28 @@ fn output_human(
     if !reviews.is_empty() {
         writeln!(buf)?;
         writeln!(buf)?;
-        writeln!(buf, "{}", "Reviews:".bold())?;
+        writeln!(buf, "{}", t.important.paint("Reviews:"))?;
         for review in reviews {
             writeln!(buf)?;
             writeln!(
                 buf,
                 "  {} {}{}",
-                "PR/MR:".dimmed(),
+                t.hint.paint("PR/MR:"),
                 review.unit_symbol,
                 review.number
             )?;
-            writeln!(buf, "  {} {}", "Title:".dimmed(), review.title)?;
-            writeln!(buf, "  {} {}", "URL:".dimmed(), review.html_url.cyan())?;
+            writeln!(buf, "  {} {}", t.hint.paint("Title:"), review.title)?;
+            writeln!(
+                buf,
+                "  {} {}",
+                t.hint.paint("URL:"),
+                t.link.paint(&review.html_url)
+            )?;
 
             if let Some(body) = &review.body
                 && !body.is_empty()
             {
-                writeln!(buf, "  {}", "Description:".dimmed())?;
+                writeln!(buf, "  {}", t.hint.paint("Description:"))?;
                 // Indent each line of the description
                 for line in body.lines() {
                     writeln!(buf, "    {line}")?;
@@ -628,7 +622,12 @@ fn output_human(
             }
 
             if review.draft {
-                writeln!(buf, "  {} {}", "Status:".dimmed(), "Draft".yellow())?;
+                writeln!(
+                    buf,
+                    "  {} {}",
+                    t.hint.paint("Status:"),
+                    t.attention.paint("Draft")
+                )?;
             }
         }
     }
@@ -637,7 +636,7 @@ fn output_human(
     if let Some(summary) = ai_summary {
         writeln!(buf)?;
         writeln!(buf)?;
-        writeln!(buf, "{}", "AI Summary:".bold().cyan())?;
+        writeln!(buf, "{}", t.info.paint("AI Summary:"))?;
         writeln!(buf, "{summary}")?;
         writeln!(buf)?;
     }
@@ -650,15 +649,15 @@ fn output_human(
             writeln!(
                 buf,
                 "{} {}",
-                "Merge Check:".bold(),
-                "Merges cleanly into upstream".green()
+                t.important.paint("Merge Check:"),
+                t.success.paint("Merges cleanly into upstream")
             )?;
         } else {
             writeln!(
                 buf,
                 "{} {}",
-                "Merge Check:".bold(),
-                "Conflicts detected".red().bold()
+                t.important.paint("Merge Check:"),
+                t.error.paint("Conflicts detected"),
             )?;
             writeln!(buf)?;
             writeln!(
@@ -679,18 +678,23 @@ fn output_human(
             writeln!(buf)?;
 
             for file in &check.conflicting_files {
-                writeln!(buf, "  {}", file.path.yellow().bold())?;
+                writeln!(buf, "  {}", t.attention.paint(&file.path))?;
 
                 // Show branch commits that modified this file
                 if !file.branch_commits.is_empty() {
                     writeln!(buf, "    Modified by this branch:")?;
                     for commit in &file.branch_commits {
-                        writeln!(buf, "      {} {}", commit.short_sha.cyan(), commit.message)?;
+                        writeln!(
+                            buf,
+                            "      {} {}",
+                            t.commit_id.paint(&commit.short_sha),
+                            commit.message
+                        )?;
                         writeln!(
                             buf,
                             "        {} by {}",
-                            format_timestamp(commit.timestamp).dimmed(),
-                            commit.author_name.dimmed()
+                            t.hint.paint(format_timestamp(commit.timestamp)),
+                            t.hint.paint(&commit.author_name)
                         )?;
                     }
                     writeln!(buf)?;
@@ -703,14 +707,14 @@ fn output_human(
                         writeln!(
                             buf,
                             "      {} {}",
-                            commit.short_sha.magenta(),
+                            t.commit_id.paint(&commit.short_sha),
                             commit.message
                         )?;
                         writeln!(
                             buf,
                             "        {} by {}",
-                            format_timestamp(commit.timestamp).dimmed(),
-                            commit.author_name.dimmed()
+                            t.hint.paint(format_timestamp(commit.timestamp)),
+                            t.hint.paint(&commit.author_name)
                         )?;
                     }
                     writeln!(buf)?;

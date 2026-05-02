@@ -131,6 +131,43 @@ mod hex_hash {
 }
 pub use hex_hash::{HexHash, HexHashString};
 
+/// Shared JSON transport type for mutation workspace results.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceState {
+    /// Commits that were replaced by the operation. Maps `oldId -> newId`.
+    #[cfg_attr(
+        feature = "export-schema",
+        schemars(with = "std::collections::BTreeMap<String, String>")
+    )]
+    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// The post-operation workspace view presented to the frontend.
+    pub head_info: but_workspace::ui::RefInfo,
+}
+
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(WorkspaceState);
+
+impl TryFrom<crate::WorkspaceState> for WorkspaceState {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        crate::WorkspaceState {
+            replaced_commits,
+            head_info,
+        }: crate::WorkspaceState,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            replaced_commits: replaced_commits
+                .into_iter()
+                .map(|(old, new)| (HexHash::from(old), HexHash::from(new)))
+                .collect(),
+            head_info: head_info.try_into()?,
+        })
+    }
+}
+
 mod error {
     //! Utilities to control which errors show in the frontend.
     //!
@@ -256,7 +293,7 @@ mod error {
             );
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.unknown\",\"message\":\"err msg\"}",
+                "{\"code\":\"Unknown\",\"message\":\"err msg\"}",
                 "if there is no explicit error code or context, the original error message is shown (and chain)"
             );
         }
@@ -266,12 +303,12 @@ mod error {
             let err = anyhow!("err msg").context(Code::Validation);
             assert_eq!(
                 format!("{err:#}"),
-                "errors.validation: err msg",
+                "Validation: err msg",
                 "note how the context becomes an error, in front of the original one"
             );
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.validation\",\"message\":\"err msg\"}",
+                "{\"code\":\"Validation\",\"message\":\"err msg\"}",
                 "the 'code' is available as string, but the message is taken from the source error"
             );
         }
@@ -283,7 +320,7 @@ mod error {
 
             insta::assert_json_snapshot!(Error(err), @r#"
             {
-              "code": "errors.unknown",
+              "code": "Unknown",
               "message": "err msg\n\nCaused by:\n    1: actual cause\n"
             }
             "#);
@@ -298,12 +335,12 @@ mod error {
 
             assert_eq!(
                 format!("{err:#}"),
-                "errors.validation: err msg: actual cause",
+                "Validation: err msg: actual cause",
                 "an even longer chain, with the cause as root as one might expect"
             );
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.validation\",\"message\":\"err msg\"}",
+                "{\"code\":\"Validation\",\"message\":\"err msg\"}",
                 "in order to attach a custom message to an original cause, our messaging (and Code) is the tail"
             );
         }
@@ -314,7 +351,7 @@ mod error {
             assert_eq!(format!("{err:#}"), "ctx msg: err msg");
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.validation\",\"message\":\"ctx msg\"}",
+                "{\"code\":\"Validation\",\"message\":\"ctx msg\"}",
                 "Contexts often provide their own message, so the error message is ignored"
             );
         }
@@ -329,7 +366,7 @@ mod error {
             );
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.validation\",\"message\":\"err msg\"}",
+                "{\"code\":\"Validation\",\"message\":\"err msg\"}",
                 "Contexts without a message show the error's message as well"
             );
         }
@@ -341,12 +378,12 @@ mod error {
                 .context(Code::Validation);
             assert_eq!(
                 format!("{err:#}"),
-                "errors.validation: top msg: bottom msg",
+                "Validation: top msg: bottom msg",
                 "now it's clear why bottom is bottom"
             );
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.validation\",\"message\":\"top msg\"}",
+                "{\"code\":\"Validation\",\"message\":\"top msg\"}",
                 "the 'code' gets the message of the error that it provides context to, and it finds it down the chain"
             );
         }
@@ -359,12 +396,12 @@ mod error {
                 .context(Code::Validation);
             assert_eq!(
                 format!("{err:#}"),
-                "errors.validation: top msg: errors.projects.git.auth: bottom msg",
+                "Validation: top msg: ProjectGitAuth: bottom msg",
                 "each code is treated like its own error in the chain"
             );
             assert_eq!(
                 json(err),
-                "{\"code\":\"errors.validation\",\"message\":\"top msg\"}",
+                "{\"code\":\"Validation\",\"message\":\"top msg\"}",
                 "it finds the most recent 'code' (and the same would be true for contexts, of course)"
             );
         }

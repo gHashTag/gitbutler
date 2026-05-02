@@ -1,15 +1,15 @@
-use std::collections::BTreeMap;
-
 use anyhow::{Context as _, bail};
 use bstr::BString;
-use but_core::{ref_metadata::StackId, sync::RepoExclusive};
+use but_core::{DryRun, ref_metadata::StackId, sync::RepoExclusive};
 use but_ctx::Context;
-use colored::Colorize;
+use but_workspace::commit::squash_commits::MessageCombinationStrategy;
 use gitbutler_oplog::{
     OplogExt,
     entry::{OperationKind, SnapshotDetails},
 };
 use gix::ObjectId;
+
+use crate::theme::{self, Paint};
 
 use super::undo::stack_id_by_commit_id;
 use crate::{
@@ -166,8 +166,8 @@ fn handle_multi_commit_squash(
             other => {
                 bail!(
                     "Cannot squash {} - it is {}. All arguments must be commits.",
-                    other.to_short_string().blue().bold(),
-                    other.kind_for_humans().yellow()
+                    theme::get().cli_id.paint(other.to_short_string()),
+                    theme::get().attention.paint(other.kind_for_humans())
                 );
             }
         }
@@ -201,17 +201,6 @@ fn squash_commits_internal(
     perm: &mut RepoExclusive,
     out: &mut OutputChannel,
 ) -> anyhow::Result<()> {
-    // Validate all commits are on the same stack
-    let target_stack = stack_id_by_commit_id(ctx, target_oid)?;
-    for source_oid in &source_oids {
-        let source_stack = stack_id_by_commit_id(ctx, *source_oid)?;
-        if source_stack != target_stack {
-            bail!(
-                "Commits must be on the same stack to squash them together. Try squashing commits within a single branch or stack."
-            );
-        }
-    }
-
     // Collect commit messages if we need them for AI generation
     let (source_messages, destination_message) = if ai.is_some() {
         let repo = ctx.repo.get()?;
@@ -261,27 +250,20 @@ fn squash_commits_internal(
     // Keep the complete multi-rewrite sequence atomic: if any step fails,
     // restore the pre-squash snapshot so we don't leave partial rewrites.
     let snapshot = ctx.create_snapshot(SnapshotDetails::new(OperationKind::SquashCommit), perm)?;
-    let squash_result: anyhow::Result<ObjectId> = (|| {
-        // Perform the squash by folding sources into the current target one by one.
-        // We process from bottom to top so each next source remains adjacent to the
-        // rewritten target commit.
-        let mut new_commit_oid = target_oid;
-        let mut rewritten_commits = BTreeMap::<ObjectId, ObjectId>::new();
-        for source_oid in source_oids.iter().rev() {
-            let mut remapped_source_oid = *source_oid;
-            while let Some(next_oid) = rewritten_commits.get(&remapped_source_oid) {
-                remapped_source_oid = *next_oid;
-            }
+    let source_oids_count = source_oids.len();
+    let only_source_commit = source_oids.first().copied();
+    let source_oids_to_squash = source_oids;
 
-            let squash_result = but_api::commit::squash::commit_squash_only_with_perm(
-                ctx,
-                remapped_source_oid,
-                new_commit_oid,
-                perm,
-            )?;
-            rewritten_commits.extend(squash_result.replaced_commits.iter().map(|(k, v)| (*k, *v)));
-            new_commit_oid = squash_result.new_commit;
-        }
+    let squash_result: anyhow::Result<ObjectId> = (|| {
+        let squash_result = but_api::commit::squash::commit_squash_only_with_perm(
+            ctx,
+            source_oids_to_squash,
+            target_oid,
+            MessageCombinationStrategy::KeepBoth,
+            DryRun::No,
+            perm,
+        )?;
+        let new_commit_oid = squash_result.new_commit;
 
         // Determine the final message and apply if needed.
         let final_commit_oid = if let Some(user_summary) = ai {
@@ -296,6 +278,7 @@ fn squash_commits_internal(
                 ctx,
                 new_commit_oid,
                 BString::from(ai_message),
+                DryRun::No,
                 perm,
             )?
             .new_commit
@@ -304,6 +287,7 @@ fn squash_commits_internal(
                 ctx,
                 new_commit_oid,
                 BString::from(msg),
+                DryRun::No,
                 perm,
             )?
             .new_commit
@@ -312,6 +296,7 @@ fn squash_commits_internal(
                 ctx,
                 new_commit_oid,
                 BString::from(target_msg),
+                DryRun::No,
                 perm,
             )?
             .new_commit
@@ -333,31 +318,36 @@ fn squash_commits_internal(
     };
 
     // Output message based on context
+    let t = theme::get();
     if let Some(out) = out.for_human() {
         let repo = ctx.repo.get()?;
         let final_short = shorten_object_id(&repo, final_commit_oid);
-        if source_oids.len() == 1 {
+        if source_oids_count == 1 {
             // Single commit squash (for backwards compatibility with `but rub`)
             writeln!(
                 out,
                 "Squashed {} → {}",
-                shorten_object_id(&repo, source_oids[0]).blue(),
-                final_short.blue()
+                t.cli_id.paint(shorten_object_id(
+                    &repo,
+                    only_source_commit
+                        .context("BUG: Source commits count is one, but first item is none")?
+                )),
+                t.cli_id.paint(&final_short)
             )?
         } else {
             // Multiple commits squash
             writeln!(
                 out,
                 "Squashed {} commits → {}",
-                source_oids.len(),
-                final_short.blue()
+                source_oids_count,
+                t.cli_id.paint(&final_short)
             )?
         }
     } else if let Some(out) = out.for_json() {
         out.write_value(serde_json::json!({
             "ok": true,
             "new_commit_id": final_commit_oid.to_string(),
-            "squashed_count": source_oids.len(),
+            "squashed_count": source_oids_count,
         }))?;
     }
     Ok(())
@@ -425,11 +415,12 @@ fn squash_branch_commits(
     )?;
 
     // Add branch-specific output message
+    let t = theme::get();
     if let Some(out) = out.for_human() {
         writeln!(
             out,
             "Squashed all commits in branch '{}'",
-            branch_name.blue()
+            t.local_branch.paint(branch_name)
         )?
     }
     Ok(())

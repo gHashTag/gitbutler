@@ -1,13 +1,12 @@
-use anyhow::bail;
-use but_core::sync::RepoExclusive;
-use but_ctx::Context;
-use but_rebase::graph_rebase::mutate::{InsertSide, RelativeTo};
-use colored::Colorize;
-
 use crate::{
     CliId,
+    theme::{self, Paint},
     utils::{OutputChannel, shorten_object_id},
 };
+use anyhow::bail;
+use but_core::{DryRun, sync::RepoExclusive};
+use but_ctx::Context;
+use but_rebase::graph_rebase::mutate::{InsertSide, RelativeTo};
 
 pub(crate) fn handle_resolved_with_perm(
     ctx: &mut Context,
@@ -17,6 +16,7 @@ pub(crate) fn handle_resolved_with_perm(
     after: bool,
     perm: &mut RepoExclusive,
 ) -> anyhow::Result<()> {
+    let t = theme::get();
     // Validate --after flag usage
     if after {
         // Check if target is a branch (--after only makes sense for commit-to-commit moves)
@@ -42,14 +42,61 @@ pub(crate) fn handle_resolved_with_perm(
         bail!(
             "Cannot move {} ({}) to {} ({}).\n\
             Valid moves: commit→commit, commit→branch, or committed-file→commit",
-            source_id.to_short_string().blue().bold(),
-            source_id.kind_for_humans().yellow(),
-            target_id.to_short_string().blue().bold(),
-            target_id.kind_for_humans().yellow()
+            t.cli_id.paint(source_id.to_short_string()),
+            t.attention.paint(source_id.kind_for_humans()),
+            t.cli_id.paint(target_id.to_short_string()),
+            t.attention.paint(target_id.kind_for_humans())
         );
     };
 
     operation.execute_with_perm(ctx, out, perm)
+}
+
+pub(crate) fn handle_multiple_resolved_with_perm(
+    ctx: &mut Context,
+    out: &mut OutputChannel,
+    source_ids: &[CliId],
+    target_id: &CliId,
+    after: bool,
+    perm: &mut RepoExclusive,
+) -> anyhow::Result<()> {
+    let t = theme::get();
+    if source_ids.is_empty() {
+        bail!("No source commits provided.");
+    }
+
+    let sources = source_ids
+        .iter()
+        .map(|id| match id {
+            CliId::Commit { commit_id, .. } => Ok(*commit_id),
+            _ => bail!(
+                "Cannot move {} as part of a multi-commit operation. Only commits are supported.",
+                t.cli_id.paint(id.to_short_string())
+            ),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    match target_id {
+        CliId::Commit { commit_id, .. } => {
+            move_commit_to_commit_with_perm(ctx, sources, *commit_id, after, out, perm)
+        }
+        CliId::Branch { name, .. } => {
+            if after {
+                bail!(
+                    "The {} flag only makes sense when moving a commit to another commit.\n\
+                    When moving to a branch, the commit is placed at the top of the stack by default.",
+                    "--after"
+                );
+            }
+            move_commit_to_branch_with_perm(ctx, sources, name, out, perm)
+        }
+        _ => bail!(
+            "Cannot move multiple commits to {} ({}).\n\
+            Valid multi-commit moves: commit→commit or commit→branch",
+            t.cli_id.paint(target_id.to_short_string()),
+            t.attention.paint(target_id.kind_for_humans())
+        ),
+    }
 }
 
 /// Represents the operation to perform for a given source and target combination in `but move`.
@@ -87,11 +134,11 @@ impl<'a> MoveOperation<'a> {
                 source,
                 target,
                 after,
-            } => move_commit_to_commit_with_perm(ctx, source, target, after, out, perm),
+            } => move_commit_to_commit_with_perm(ctx, vec![source], target, after, out, perm),
             MoveOperation::CommitToBranch {
                 source,
                 target_branch,
-            } => move_commit_to_branch_with_perm(ctx, source, target_branch, out, perm),
+            } => move_commit_to_branch_with_perm(ctx, vec![source], target_branch, out, perm),
             MoveOperation::CommittedFileToCommit {
                 path,
                 source_commit,
@@ -108,10 +155,10 @@ impl<'a> MoveOperation<'a> {
     }
 }
 
-/// Mova a commit to a new position relative to another one.
+/// Move a commit to a new position relative to another one.
 pub fn move_commit_to_commit_with_perm(
     ctx: &mut Context,
-    source: gix::ObjectId,
+    sources: Vec<gix::ObjectId>,
     target: gix::ObjectId,
     after: bool,
     out: &mut OutputChannel,
@@ -123,10 +170,16 @@ pub fn move_commit_to_commit_with_perm(
         InsertSide::Below
     };
 
-    // Check if source and target are the same commit
-    if source == target {
+    if sources.contains(&target) {
         if let Some(out) = out.for_human() {
-            writeln!(out, "Source and target are the same commit. Nothing to do.")?;
+            if sources.len() == 1 {
+                writeln!(out, "Source and target are the same commit. Nothing to do.")?;
+            } else {
+                writeln!(
+                    out,
+                    "At least one source commit is the same as the target commit. Nothing to do."
+                )?;
+            }
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
         }
@@ -135,22 +188,35 @@ pub fn move_commit_to_commit_with_perm(
 
     but_api::commit::move_commit::commit_move_with_perm(
         ctx,
-        source,
+        sources.clone(),
         RelativeTo::Commit(target),
         side,
+        DryRun::No,
         perm,
     )?;
 
+    let t = theme::get();
     if let Some(out) = out.for_human() {
         let repo = ctx.repo.get()?;
         let action = if after { "after" } else { "before" };
-        writeln!(
-            out,
-            "Moved {} → {} {}",
-            shorten_object_id(&repo, source).blue(),
-            action,
-            shorten_object_id(&repo, target).green(),
-        )?;
+        if sources.len() == 1 {
+            let source = sources[0];
+            writeln!(
+                out,
+                "Moved {} → {} {}",
+                t.cli_id.paint(shorten_object_id(&repo, source)),
+                action,
+                t.commit_id.paint(shorten_object_id(&repo, target)),
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Moved {} commits → {} {}",
+                t.cli_id.paint(sources.len().to_string()),
+                action,
+                t.commit_id.paint(shorten_object_id(&repo, target)),
+            )?;
+        }
     } else if let Some(out) = out.for_json() {
         out.write_value(serde_json::json!({"ok": true}))?;
     }
@@ -159,7 +225,7 @@ pub fn move_commit_to_commit_with_perm(
 
 pub fn move_commit_to_branch_with_perm(
     ctx: &mut Context,
-    source: gix::ObjectId,
+    sources: Vec<gix::ObjectId>,
     target_branch: &str,
     out: &mut OutputChannel,
     perm: &mut RepoExclusive,
@@ -167,20 +233,32 @@ pub fn move_commit_to_branch_with_perm(
     let target_full_name = gix::refs::FullName::try_from(format!("refs/heads/{target_branch}"))?;
     but_api::commit::move_commit::commit_move_with_perm(
         ctx,
-        source,
+        sources.clone(),
         RelativeTo::Reference(target_full_name),
         InsertSide::Below,
+        DryRun::No,
         perm,
     )?;
 
+    let t = theme::get();
     if let Some(out) = out.for_human() {
         let repo = ctx.repo.get()?;
-        writeln!(
-            out,
-            "Moved {} → {}",
-            shorten_object_id(&repo, source).blue(),
-            format!("[{target_branch}]").green()
-        )?;
+        if sources.len() == 1 {
+            let source = sources[0];
+            writeln!(
+                out,
+                "Moved {} → {}",
+                t.cli_id.paint(shorten_object_id(&repo, source)),
+                t.local_branch.paint(format!("[{target_branch}]"))
+            )?;
+        } else {
+            writeln!(
+                out,
+                "Moved {} commits → {}",
+                t.cli_id.paint(sources.len().to_string()),
+                t.local_branch.paint(format!("[{target_branch}]"))
+            )?;
+        }
     } else if let Some(out) = out.for_json() {
         out.write_value(serde_json::json!({"ok": true}))?;
     }

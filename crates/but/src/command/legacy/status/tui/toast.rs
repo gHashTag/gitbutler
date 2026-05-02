@@ -7,11 +7,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 
+use crate::theme::Theme;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ToastKind {
     Error,
     #[expect(dead_code)]
     Info,
+    Debug,
 }
 
 #[derive(Debug, Default)]
@@ -46,17 +49,25 @@ impl Toasts {
     }
 }
 
-pub(super) fn render_toasts(frame: &mut Frame, area: Rect, toasts: &Toasts) {
-    for (idx, toast) in toasts.toasts.iter().enumerate() {
-        render_toast(
+pub(super) fn render_toasts(frame: &mut Frame, area: Rect, toasts: &Toasts, theme: &'static Theme) {
+    let mut bottom_margin = 1;
+    for toast in &toasts.toasts {
+        if bottom_margin >= area.height {
+            break;
+        }
+
+        let rendered_height = render_toast(
             frame,
             area,
             ToastMargin {
-                right: 1 + idx as u16,
-                bottom: idx as u16,
+                right: 1,
+                bottom: bottom_margin,
             },
             toast,
+            theme,
         );
+
+        bottom_margin = bottom_margin.saturating_add(rendered_height);
     }
 }
 
@@ -65,7 +76,13 @@ struct ToastMargin {
     bottom: u16,
 }
 
-fn render_toast(frame: &mut Frame, area: Rect, margin: ToastMargin, toast: &Toast) {
+fn render_toast(
+    frame: &mut Frame,
+    area: Rect,
+    margin: ToastMargin,
+    toast: &Toast,
+    theme: &'static Theme,
+) -> u16 {
     let horizontal_padding: u16 = 1;
     let vertical_padding: u16 = 0;
     let border_width: u16 = 2;
@@ -131,8 +148,9 @@ fn render_toast(frame: &mut Frame, area: Rect, margin: ToastMargin, toast: &Toas
     frame.render_widget(Clear, toast_area);
 
     let border_style = match toast.kind {
-        ToastKind::Error => Style::default().red(),
-        ToastKind::Info => Style::default().green(),
+        ToastKind::Error => theme.error,
+        ToastKind::Info => theme.info,
+        ToastKind::Debug => theme.hint,
     };
 
     let widget = Paragraph::new(toast_text)
@@ -150,4 +168,6 @@ fn render_toast(frame: &mut Frame, area: Rect, margin: ToastMargin, toast: &Toas
         .wrap(Wrap { trim: false });
 
     frame.render_widget(widget, toast_area);
+
+    height
 }

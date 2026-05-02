@@ -1,3 +1,8 @@
+#![expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
+
 use anyhow::{Result, bail};
 use but_core::{DiffSpec, TreeChange, sync::RepoExclusive};
 use but_ctx::Context;
@@ -48,11 +53,10 @@ pub fn remove_changes_from_commit_in_stack(
 
     let result = {
         let repo = ctx.repo.get()?;
-        let cache = ctx.cache.get_cache()?;
         let mut rebase = Rebase::new(&repo, base, None)?;
         rebase.steps(steps)?;
         rebase.rebase_noops(false);
-        rebase.rebase(&cache)?
+        rebase.rebase()?
     };
     let commit_mapping =
         rebase_mapping_with_overrides(&result, [(source_commit_id, rewritten_source_commit)]);

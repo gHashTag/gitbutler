@@ -5,6 +5,8 @@
 	import MainViewport from "$components/views/MainViewport.svelte";
 	import MultiStackView from "$components/views/MultiStackView.svelte";
 	import UnassignedView from "$components/views/UnassignedView.svelte";
+	import OrchestratorPanel from "$components/orchestrator/OrchestratorPanel.svelte";
+	import OrchestratorToggleButton from "$components/orchestrator/OrchestratorToggleButton.svelte";
 	import { FILE_SELECTION_MANAGER } from "$lib/selection/fileSelectionManager.svelte";
 	import { createWorktreeSelection } from "$lib/selection/key";
 	import { UNCOMMITTED_SERVICE } from "$lib/selection/uncommittedService.svelte";
@@ -12,6 +14,9 @@
 	import { UI_STATE } from "$lib/state/uiState.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import { TestId } from "@gitbutler/ui";
+	import OrchestratorPanel from "$components/orchestrator/OrchestratorPanel.svelte";
+	import OrchestratorToggleButton from "$components/orchestrator/OrchestratorToggleButton.svelte";
+	import { orchestratorOpen } from "$lib/orchestrator";
 
 	interface Props {
 		projectId: string;
@@ -29,6 +34,8 @@
 	const selectionId = createWorktreeSelection({ stackId: undefined });
 	const worktreeSelection = $derived(idSelection.getById(selectionId));
 	const stacksQuery = $derived(stackService.stacks(projectId));
+
+	let orchestratorOpenLocal = $state(false);
 
 	const lastAdded = $derived(worktreeSelection.lastAdded);
 	const previewOpen = $derived(!!$lastAdded?.key);
@@ -96,4 +103,23 @@
 			{/snippet}
 		</ReduxResult>
 	{/snippet}
+	{#snippet right()}
+		<OrchestratorToggleButton
+			isOpen={orchestratorOpenLocal}
+			onClick={() => orchestratorOpenLocal = !orchestratorOpenLocal}
+		/>
+		<OrchestratorPanel
+			isOpen={orchestratorOpenLocal}
+			onClose={() => orchestratorOpenLocal = false}
+			{projectId}
+		/>
+	{/snippet}
 </MainViewport>
+
+{#if $orchestratorOpen}
+	<OrchestratorPanel
+		open={$orchestratorOpen}
+		onClose={() => orchestratorOpen.set(false)}
+		{projectId}
+	/>
+{/if}

@@ -1,6 +1,7 @@
 import { getBaseURL, type GitButler, startGitButler } from "../src/setup.ts";
-import { dragAndDropByLocator, sleep, waitForTestId } from "../src/util.ts";
-import { expect, test } from "@playwright/test";
+import { test } from "../src/test.ts";
+import { dragAndDropByLocator, waitForTestId } from "../src/util.ts";
+import { expect } from "@playwright/test";
 
 let gitbutler: GitButler;
 
@@ -114,25 +115,23 @@ test("move branch to the middle of other stack", async ({ page, context }, testI
 	stacks = page.getByTestId("stack");
 	await expect(stacks).toHaveCount(2);
 
-	await sleep(500); // It seems that we need to wait a bit for the DOM to stabilize
-
 	branchHeaders = page.getByTestId("branch-header");
 	await expect(branchHeaders).toHaveCount(3);
 	// Move branch3 on top of branch 1 (which is now in the middle of stack)
 	const branch3Locator = branchHeaders.filter({ hasText: "branch3" });
 	branch1Locator = branchHeaders.filter({ hasText: "branch1" });
 
-	// After merge, there's one stack with branch2 on top and branch1 below
-	// Drag to branch1 with position offset to hit the dropzone above it
+	// After merge, there's one stack with branch2 on top and branch1 below.
+	// Drag to the top of branch1's header to hit the between-branch dropzone.
 	await dragAndDropByLocator(page, branch3Locator, branch1Locator, {
 		force: true,
 		position: {
 			x: 120,
-			y: -10,
+			y: 0,
 		},
 	});
 
-	// Should have moved branch1 to the top of stack2
+	// Should have moved branch3 into the same stack
 	stacks = page.getByTestId("stack");
 	await expect(stacks).toHaveCount(1);
 	branchHeaders = page.getByTestId("branch-header");

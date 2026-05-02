@@ -185,24 +185,22 @@ if [ "$OS" = "windows" ]; then
 	#          Should it be re-added, please ensure that `but` is built
 	#          as part of the 'beforeBuildCommand' in tauri.conf AND it must be injected
 	#          via 'inject-git-binaries.sh'.
-	EXTERNAL_BIN='["gitbutler-git-askpass", "gitbutler-git-setsid", "but"]'
+	EXTERNAL_BIN='["gitbutler-git-askpass", "but"]'
 	FEATURES="windows"
 elif [ "$OS" = "linux" ]; then
 	EXTERNAL_BIN='["gitbutler-git-askpass"]'
 	FEATURES="builtin-but packaged-but-distribution"
 elif [ "$OS" = "macos" ]; then
-	# we need to include the gitbutler-git-setsid dummy binary as
-	# installers bundled with version <=0.19.3 will validate that it's there for macOS.
-	EXTERNAL_BIN='["gitbutler-git-askpass", "gitbutler-git-setsid"]'
+	EXTERNAL_BIN='["gitbutler-git-askpass"]'
 	FEATURES="builtin-but"
 else
 	echo "Unsupported OS: $OS"
 	exit 1
 fi
 
-# Enable IRC collaboration feature for dev and nightly, but not release.
+# Enable IRC collaboration and remote features for dev and nightly, but not release.
 if [ "$CHANNEL" != "release" ]; then
-	FEATURES="$FEATURES irc"
+	FEATURES="$FEATURES irc remote"
 fi
 
 # update the version in the tauri release config

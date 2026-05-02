@@ -1,3 +1,5 @@
+#![expect(deprecated, reason = "calls stacks_v3")]
+
 use anyhow::Context as _;
 use but_meta::VirtualBranchesTomlMetadata;
 use but_workspace::legacy::{StacksFilter, stacks_v3};
@@ -18,13 +20,11 @@ fn can_create_worktree_from_feature_a() -> anyhow::Result<()> {
             .join("virtual_branches.toml"),
     )?;
     let feature_a = {
-        let mut cache = test_ctx.ctx.cache.get_cache_mut()?;
         let stacks = stacks_v3(
             &*test_ctx.ctx.repo.get()?,
             &meta,
             StacksFilter::InWorkspace,
             None,
-            &mut cache,
         )?;
         stacks
             .into_iter()
@@ -74,13 +74,11 @@ fn can_create_worktree_from_feature_b() -> anyhow::Result<()> {
             .join("virtual_branches.toml"),
     )?;
     let feature_b = {
-        let mut cache = test_ctx.ctx.cache.get_cache_mut()?;
         let stacks = stacks_v3(
             &*test_ctx.ctx.repo.get()?,
             &meta,
             StacksFilter::InWorkspace,
             None,
-            &mut cache,
         )?;
         stacks
             .into_iter()
@@ -130,13 +128,11 @@ fn can_create_worktree_from_feature_c() -> anyhow::Result<()> {
             .join("virtual_branches.toml"),
     )?;
     let feature_c = {
-        let mut cache = test_ctx.ctx.cache.get_cache_mut()?;
         let stacks = stacks_v3(
             &*test_ctx.ctx.repo.get()?,
             &meta,
             StacksFilter::InWorkspace,
             None,
-            &mut cache,
         )?;
         stacks
             .into_iter()

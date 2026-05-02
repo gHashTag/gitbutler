@@ -1,8 +1,8 @@
 use std::fmt::Write;
 
-use but_core::sync::LockScope;
+use crate::theme::{self, Paint};
+use but_core::{WORKSPACE_REF_NAME, sync::LockScope};
 use but_ctx::Context;
-use colored::Colorize;
 use command_group::AsyncCommandGroup;
 
 use crate::{
@@ -387,7 +387,9 @@ fn spawn_background_sync(
         writeln!(
             out,
             "{}",
-            format!("{msg}Initiated a background sync...").dimmed()
+            theme::get()
+                .hint
+                .paint(format!("{msg}Initiated a background sync..."))
         )
         .ok();
     }
@@ -410,7 +412,7 @@ fn prompt_for_setup(out: &mut OutputChannel, message: &str) -> SetupPromptResult
         progress,
         "The current project is not configured to be managed by GitButler.\n"
     );
-    writeln!(progress, "{}\n", message.red()).ok();
+    writeln!(progress, "{}\n", theme::get().error.paint(message)).ok();
 
     // Check if we have an interactive terminal and prompt the user
     let user_declined_in_interactive_mode = if let Some(mut inout) =
@@ -438,7 +440,9 @@ fn prompt_for_setup(out: &mut OutputChannel, message: &str) -> SetupPromptResult
         _ = writeln!(
             progress,
             "{}",
-            "Please run `but setup` to switch to GitButler management.\n".yellow()
+            theme::get()
+                .attention
+                .paint("Please run `but setup` to switch to GitButler management.\n")
         );
     }
 
@@ -453,7 +457,9 @@ fn prompt_for_setup(out: &mut OutputChannel, message: &str) -> SetupPromptResult
         _ = writeln!(
             progress,
             "{}",
-            "Please run `but setup` to switch to GitButler management.\n".yellow()
+            theme::get()
+                .attention
+                .paint("Please run `but setup` to switch to GitButler management.\n")
         );
     };
     SetupPromptResult::Declined
@@ -477,7 +483,7 @@ fn check_workspace_commits_before_init(
     }
 
     // Check the HEAD commit message
-    let mut workspace_ref = repo.find_reference("refs/heads/gitbutler/workspace")?;
+    let mut workspace_ref = repo.find_reference(WORKSPACE_REF_NAME)?;
     let workspace_commit = workspace_ref.peel_to_commit()?;
     let message = workspace_commit.message_raw()?;
     let message_str = String::from_utf8_lossy(message);
@@ -490,15 +496,15 @@ fn check_workspace_commits_before_init(
             writeln!(
                 writer,
                 "{}",
-                "⚠ Detected commits on top of gitbutler/workspace"
-                    .yellow()
-                    .bold()
+                theme::get()
+                    .attention
+                    .paint("⚠ Detected commits on top of gitbutler/workspace")
             )?;
             writeln!(writer)?;
             writeln!(
                 writer,
                 "{}",
-                "GitButler detected that you have committed directly on the\ngitbutler/workspace branch. To preserve your work and\nfix up things, please run `but teardown`.".dimmed()
+                theme::get().hint.paint("GitButler detected that you have committed directly on the\ngitbutler/workspace branch. To preserve your work and\nfix up things, please run `but teardown`.")
             )?;
             writeln!(writer)?;
         }

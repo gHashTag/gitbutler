@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use but_core::commit::SignCommit;
-use but_rebase::graph_rebase::cherry_pick::{CherryPickOutcome, PickMode, cherry_pick};
+use but_rebase::graph_rebase::cherry_pick::{
+    CherryPickOutcome, PickMode, TreeMergeMode, cherry_pick,
+};
 use but_testsupport::{visualize_commit_graph_all, visualize_tree};
 use gix::prelude::ObjectIdExt;
 
@@ -27,6 +29,7 @@ fn basic_cherry_pick_clean() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -64,12 +67,13 @@ fn basic_cherry_pick_cp_conflicts() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     ConflictedCommit(
-        Sha1(e9ee7b59aff786fc970c30f6965d1de1913c7ec4),
+        Sha1(9661555c611ff64e8c597f7f5a0575f211eb2e12),
     )
     ");
 
@@ -80,7 +84,7 @@ fn basic_cherry_pick_cp_conflicts() -> Result<()> {
     assert_eq!(&get_parents(&id.attach(&repo))?, &[onto]);
 
     insta::assert_snapshot!(visualize_tree(id.attach(&repo)), @r#"
-    0367fb7
+    1090f8a
     ├── .auto-resolution:aa3d213 
     │   ├── base-f:100644:7898192 "a\n"
     │   └── target-f:100644:eb5a316 "target\n"
@@ -95,7 +99,6 @@ fn basic_cherry_pick_cp_conflicts() -> Result<()> {
     │   ├── base-f:100644:7898192 "a\n"
     │   ├── clean-f:100644:8312630 "clean\n"
     │   └── target-f:100644:9b1719f "conflict\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── base-f:100644:7898192 "a\n"
     └── target-f:100644:eb5a316 "target\n"
     "#);
@@ -114,6 +117,7 @@ fn basic_cherry_pick_identity() -> Result<()> {
         target.detach(),
         &parents,
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -139,6 +143,7 @@ fn single_parent_to_multiple_parents_clean() -> Result<()> {
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -179,12 +184,13 @@ fn single_parent_to_multiple_parents_cp_conflicts() -> Result<()> {
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     ConflictedCommit(
-        Sha1(0fcbe01202743fa55f1a1e07342ad26f2e7a0abe),
+        Sha1(c8779c405b92941176effe9eb7a72c0dd410c3fd),
     )
     ");
 
@@ -195,7 +201,7 @@ fn single_parent_to_multiple_parents_cp_conflicts() -> Result<()> {
     assert_eq!(&get_parents(&id.attach(&repo))?, &[onto, onto2]);
 
     insta::assert_snapshot!(visualize_tree(id.attach(&repo)), @r#"
-    1804f3d
+    4c6dc70
     ├── .auto-resolution:744efa9 
     │   ├── base-f:100644:7898192 "a\n"
     │   ├── target-2-f:100644:caac8f9 "target 2\n"
@@ -212,7 +218,6 @@ fn single_parent_to_multiple_parents_cp_conflicts() -> Result<()> {
     │   ├── base-f:100644:7898192 "a\n"
     │   ├── clean-f:100644:8312630 "clean\n"
     │   └── target-f:100644:9b1719f "conflict\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── base-f:100644:7898192 "a\n"
     ├── target-2-f:100644:caac8f9 "target 2\n"
     └── target-f:100644:eb5a316 "target\n"
@@ -235,6 +240,7 @@ fn single_parent_to_multiple_parents_parents_conflict() -> Result<()> {
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -268,6 +274,7 @@ fn multiple_parents_to_single_parent_clean() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -306,12 +313,13 @@ fn multiple_parents_to_single_parent_cp_conflicts() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     ConflictedCommit(
-        Sha1(28fa7c91af8652f4e69c1e3184f92569a3468a34),
+        Sha1(2d4dcd916020924f2412642b842a791dfea74571),
     )
     ");
 
@@ -322,7 +330,7 @@ fn multiple_parents_to_single_parent_cp_conflicts() -> Result<()> {
     assert_eq!(&get_parents(&id.attach(&repo))?, &[onto]);
 
     insta::assert_snapshot!(visualize_tree(id.attach(&repo)), @r#"
-    91fe014
+    8c4acd1
     ├── .auto-resolution:aa3d213 
     │   ├── base-f:100644:7898192 "a\n"
     │   └── target-f:100644:eb5a316 "target\n"
@@ -339,7 +347,6 @@ fn multiple_parents_to_single_parent_cp_conflicts() -> Result<()> {
     │   ├── clean-2-f:100644:13e9394 "clean 2\n"
     │   ├── clean-f:100644:8312630 "clean\n"
     │   └── target-f:100644:9b1719f "conflict\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── base-f:100644:7898192 "a\n"
     └── target-f:100644:eb5a316 "target\n"
     "#);
@@ -362,6 +369,7 @@ fn multiple_parents_to_single_parent_parents_conflict() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -396,6 +404,7 @@ fn multiple_parents_to_multiple_parents_clean() -> Result<()> {
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -436,12 +445,13 @@ fn multiple_parents_to_multiple_parents_cp_conflicts() -> Result<()> {
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     ConflictedCommit(
-        Sha1(2e6cb06fe98780bb8c7a301a522edd98805d1499),
+        Sha1(bf66deb17cc4e84faa063a3253566004aabaf7fe),
     )
     ");
 
@@ -452,7 +462,7 @@ fn multiple_parents_to_multiple_parents_cp_conflicts() -> Result<()> {
     assert_eq!(&get_parents(&id.attach(&repo))?, &[onto, onto2]);
 
     insta::assert_snapshot!(visualize_tree(id.attach(&repo)), @r#"
-    0aeaf79
+    1620d95
     ├── .auto-resolution:744efa9 
     │   ├── base-f:100644:7898192 "a\n"
     │   ├── target-2-f:100644:caac8f9 "target 2\n"
@@ -471,7 +481,6 @@ fn multiple_parents_to_multiple_parents_cp_conflicts() -> Result<()> {
     │   ├── clean-2-f:100644:13e9394 "clean 2\n"
     │   ├── clean-f:100644:8312630 "clean\n"
     │   └── target-f:100644:9b1719f "conflict\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── base-f:100644:7898192 "a\n"
     ├── target-2-f:100644:caac8f9 "target 2\n"
     └── target-f:100644:eb5a316 "target\n"
@@ -496,6 +505,7 @@ fn multiple_parents_to_multiple_parents_base_parents_conflict() -> Result<()> {
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -529,6 +539,7 @@ fn multiple_parents_to_multiple_parents_target_parents_conflict() -> Result<()> 
         target,
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -562,6 +573,7 @@ fn multiple_parents_to_multiple_parents_identity() -> Result<()> {
         target.detach(),
         &parents,
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -586,6 +598,7 @@ fn no_parents_identity() -> Result<()> {
         target.detach(),
         &[],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -610,6 +623,7 @@ fn single_parent_to_no_parents_clean() -> Result<()> {
         target,
         &[],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -646,6 +660,7 @@ fn no_parents_to_single_parent_clean() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -683,12 +698,13 @@ fn no_parents_to_single_parent_cp_conflicts() -> Result<()> {
         target,
         &[onto],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     ConflictedCommit(
-        Sha1(28f862257bff139659b763a2c873b8d3f0f780b0),
+        Sha1(2ee47b5cbe2705d5d81f4b4067ef4753d87b3b02),
     )
     ");
 
@@ -699,7 +715,7 @@ fn no_parents_to_single_parent_cp_conflicts() -> Result<()> {
     assert_eq!(&get_parents(&id.attach(&repo))?, &[onto]);
 
     insta::assert_snapshot!(visualize_tree(id.attach(&repo)), @r#"
-    1267a55
+    38edd44
     ├── .auto-resolution:aa3d213 
     │   ├── base-f:100644:7898192 "a\n"
     │   └── target-f:100644:eb5a316 "target\n"
@@ -711,7 +727,6 @@ fn no_parents_to_single_parent_cp_conflicts() -> Result<()> {
     ├── .conflict-side-1:144e5f5 
     │   ├── base-f:100644:7898192 "a\n"
     │   └── target-f:100644:9b1719f "conflict\n"
-    ├── CONFLICT-README.txt:100644:2af04b7 "You have checked out a GitButler Conflicted commit. You probably didn\'t mean to do this."
     ├── base-f:100644:7898192 "a\n"
     └── target-f:100644:eb5a316 "target\n"
     "#);
@@ -733,12 +748,13 @@ fn cherry_pick_back_to_original_parents_unconflicts() -> Result<()> {
         target.detach(),
         &[onto, onto2],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     ConflictedCommit(
-        Sha1(2e6cb06fe98780bb8c7a301a522edd98805d1499),
+        Sha1(bf66deb17cc4e84faa063a3253566004aabaf7fe),
     )
     ");
 
@@ -753,12 +769,13 @@ fn cherry_pick_back_to_original_parents_unconflicts() -> Result<()> {
         id,
         &parents,
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
     insta::assert_debug_snapshot!(result, @"
     Commit(
-        Sha1(3d7dfa09a071658d3b84eb1ee195ea0ebfeb601f),
+        Sha1(2a307db18bf263e3a802ac71282c5d8016ea75a1),
     )
     ");
 
@@ -804,6 +821,7 @@ fn cherry_pick_recursive_merge() -> Result<()> {
         target.detach(),
         &[onto, onto2, onto3],
         PickMode::IfChanged,
+        TreeMergeMode::WithRenames,
         SignCommit::IfSignCommitsEnabled,
     )?;
 
@@ -824,6 +842,64 @@ fn cherry_pick_recursive_merge() -> Result<()> {
     ├── base-f:100644:718e7e9 "a\nx\nc\nd\n"
     └── foo-f:100644:2d07937 "1\nx\n2\n"
     "#);
+
+    Ok(())
+}
+
+/// Workspace merges surface delete-vs-modify conflicts instead of hiding
+/// them behind false-positive renames.
+///
+/// Scenario: two stacks share a common base with file-a.txt and file-b.txt.
+/// - Stack 1 modifies file-b.txt
+/// - Stack 2 deletes both files and adds file-combined.txt (similar content to file-b.txt)
+///
+/// With rename detection enabled, gix would match file-b.txt to
+/// file-combined.txt as a rename, hiding the real delete-vs-modify conflict
+/// and silently dropping file-a.txt's deletion. With `TreeMergeMode::WithoutRenames`
+/// (which disables rename detection), the conflict is correctly surfaced.
+#[test]
+fn workspace_merge_surfaces_delete_vs_modify_conflict() -> Result<()> {
+    let (repo, _tmpdir, _meta) = fixture_writable("cherry-pick-rename-detection")?;
+
+    insta::assert_snapshot!(visualize_commit_graph_all(&repo)?, @r"
+    * 8ef051f (stack-2-after) stack-2-after: combine files
+    | *   978e614 (HEAD -> workspace-before) GitButler Workspace Commit
+    | |\  
+    | | * b8f64ac (stack-2-before) stack-2-before: unrelated change
+    | |/  
+    |/|   
+    | * f02613a (stack-1) stack-1: modify file-b
+    |/  
+    * 57993f6 (main, base) base
+    ");
+
+    let workspace = repo.rev_parse_single("workspace-before")?.detach();
+    let stack1 = repo.rev_parse_single("stack-1")?.detach();
+    let stack2_after = repo.rev_parse_single("stack-2-after")?.detach();
+
+    // The workspace commit currently has parents [stack-1, stack-2-before].
+    // We want to rebase it onto [stack-1, stack-2-after] where stack-2-after
+    // deletes file-a.txt and file-b.txt, replacing them with file-combined.txt.
+    //
+    // Stack-1 modifies file-b.txt while stack-2-after deletes it — this is a
+    // genuine cross-stack conflict. Previously, rename detection hid this conflict
+    // by treating file-b → file-combined as a rename, producing a wrong tree
+    // where file-a.txt's deletion was silently dropped.
+    //
+    // With rename detection disabled, this correctly reports a conflict.
+    let result = cherry_pick(
+        &repo,
+        workspace,
+        &[stack1, stack2_after],
+        PickMode::Force,
+        TreeMergeMode::WithoutRenames,
+        SignCommit::IfSignCommitsEnabled,
+    )?;
+
+    assert!(
+        matches!(result, CherryPickOutcome::FailedToMergeBases { .. }),
+        "Expected a conflict due to delete-vs-modify on file-b.txt, got: {result:?}"
+    );
 
     Ok(())
 }

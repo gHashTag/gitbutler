@@ -1,9 +1,7 @@
 import { InjectionToken } from "@gitbutler/core/context";
 import { chipToasts } from "@gitbutler/ui";
-import type { DiffSpec } from "$lib/hunks/hunk";
-import type { BackendApi } from "$lib/state/clientState.svelte";
-
-export type { HookStatus, MessageHookStatus } from "$lib/git/gitEndpoints";
+import type { BackendApi } from "$lib/state/backendApi";
+import type { DiffSpec } from "@gitbutler/but-sdk";
 
 export const HOOKS_SERVICE = new InjectionToken<HooksService>("HooksService");
 
@@ -26,7 +24,7 @@ export class HooksService {
 
 			if (result?.status === "failure") {
 				chipToasts.removeChipToast(loadingToastId);
-				throw new Error(formatError(result.error));
+				throw newHookError(formatError(result.error));
 			}
 
 			chipToasts.removeChipToast(loadingToastId);
@@ -47,7 +45,7 @@ export class HooksService {
 
 			if (result?.status === "failure") {
 				chipToasts.removeChipToast(loadingToastId);
-				throw new Error(formatError(result.error));
+				throw newHookError(formatError(result.error));
 			}
 
 			chipToasts.removeChipToast(loadingToastId);
@@ -57,6 +55,12 @@ export class HooksService {
 			throw e;
 		}
 	}
+}
+
+function newHookError(message: string): Error {
+	const error = new Error(message);
+	error.name = "Git hook failed";
+	return error;
 }
 
 function formatError(error: string): string {

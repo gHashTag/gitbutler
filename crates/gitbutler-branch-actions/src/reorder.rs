@@ -32,12 +32,13 @@ pub fn reorder_stack(
     let current_order = commits_order(ctx, &stack)?;
     new_order.validate(current_order.clone())?;
 
+    let target_branch_tip = {
+        let (_repo, workspace, _db) = ctx.workspace_and_db_with_perm(perm.read_permission())?;
+        workspace
+            .target_ref_tip_commit_id()
+            .context("failed to get target branch tip")?
+    };
     let repo = ctx.repo.get()?;
-    let default_target = state.get_default_target()?;
-    let target_branch_tip = repo
-        .find_reference(&default_target.branch.to_string())?
-        .peel_to_commit()?
-        .id;
     let merge_base = repo
         .merge_base(target_branch_tip, stack.head_oid(ctx)?)?
         .detach();
@@ -57,7 +58,7 @@ pub fn reorder_stack(
     let mut builder = but_rebase::Rebase::new(&repo, Some(merge_base), None)?;
     let builder = builder.steps(steps)?;
     builder.rebase_noops(false);
-    let output = builder.rebase(&*ctx.cache.get_cache()?)?;
+    let output = builder.rebase()?;
 
     // Ensure the stack head is set to the new oid after rebasing
     stack.set_stack_head(&mut state, &repo, output.top_commit)?;
@@ -75,24 +76,34 @@ pub fn reorder_stack(
 
 /// Represents the order of series (branches) and changes (commits) in a stack.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StackOrder {
     /// The series are ordered from newest to oldest (most recent stacks go first)
     pub series: Vec<SeriesOrder>,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(StackOrder);
 
 /// Represents the order of changes (commits) in a series (branch).
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SeriesOrder {
     /// Unique name of the series (branch). Must already exist in the stack.
     pub name: String,
-    /// This is the desired commit order for the series. Because the commits will be rabased,
-    /// naturally, the the commit ids will be different after updating.
+    /// This is the desired commit order for the series. Because the commits will be rebased,
+    /// naturally, the commit ids will be different after updating.
     /// The changes are ordered from newest to oldest (most recent changes go first)
     #[serde(with = "but_serde::object_id_vec")]
+    #[cfg_attr(
+        feature = "export-schema",
+        schemars(schema_with = "but_schemars::object_id_vec")
+    )]
     pub commit_ids: Vec<ObjectId>,
 }
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(SeriesOrder);
 
 impl StackOrder {
     fn validate(&self, current_order: StackOrder) -> Result<()> {

@@ -1,20 +1,21 @@
 use std::collections::BTreeMap;
 
+use crate::theme::{self, Paint};
 use anyhow::{Context as _, bail};
 use bstr::BStr;
 use but_api::commit::types::{
-    CommitCreateResult, CommitMoveResult, CommitSquashResult, CommitUndoResult, MoveChangesResult,
+    CommitCreateResult, CommitMoveResult, CommitSquashResult, MoveChangesResult, UncommitResult,
 };
-use but_core::{DiffSpec, ref_metadata::StackId, sync::RepoExclusive};
+use but_core::{DiffSpec, DryRun, ref_metadata::StackId, sync::RepoExclusive};
 use but_ctx::Context;
-use but_hunk_assignment::{HunkAssignment, HunkAssignmentRequest};
+use but_hunk_assignment::{HunkAssignment, HunkAssignmentRequest, HunkAssignmentTarget};
 use but_rebase::graph_rebase::mutate::{InsertSide, RelativeTo};
-use colored::Colorize;
 mod amend;
 mod assign;
 pub(crate) mod squash;
 mod undo;
 pub(crate) use assign::branch_name_to_stack_id;
+use but_workspace::commit::squash_commits::MessageCombinationStrategy;
 use gitbutler_oplog::{
     OplogExt,
     entry::{OperationKind, SnapshotDetails},
@@ -99,6 +100,14 @@ pub(crate) struct StackToBranchOperation<'a> {
     pub(crate) to: &'a str,
 }
 
+/// Represents squashing all assignments from a stack to a commit.
+#[derive(Debug)]
+pub(crate) struct StackToCommitOperation {
+    /// The source stack id.
+    pub(crate) from: StackId,
+    pub(crate) to: gix::ObjectId,
+}
+
 /// Represents amending all unassigned hunks into a commit.
 #[derive(Debug)]
 pub(crate) struct UnassignedToCommitOperation {
@@ -122,9 +131,18 @@ pub(crate) struct UnassignedToStackOperation {
 
 /// Represents undoing a commit.
 #[derive(Debug)]
-pub(crate) struct UndoCommitOperation {
+pub(crate) struct CommitToUnassignedOperation {
     /// The commit id to undo.
     pub(crate) oid: gix::ObjectId,
+}
+
+/// Represents undoing a commit to a stack.
+#[derive(Debug)]
+pub(crate) struct CommitToStackOperation {
+    /// The commit id to undo.
+    pub(crate) oid: gix::ObjectId,
+    /// The stack to assign the changes to.
+    pub(crate) stack: StackId,
 }
 
 /// Represents squashing one commit into another.
@@ -134,6 +152,7 @@ pub(crate) struct SquashCommitsOperation {
     pub(crate) source: gix::ObjectId,
     /// The destination commit id.
     pub(crate) destination: gix::ObjectId,
+    pub(crate) how_to_combine_messages: MessageCombinationStrategy,
 }
 
 /// Represents moving a commit to a branch.
@@ -221,10 +240,12 @@ pub(crate) enum RubOperation<'a> {
     StackToUnassigned(StackToUnassignedOperation),
     StackToStack(StackToStackOperation),
     StackToBranch(StackToBranchOperation<'a>),
+    StackToCommit(StackToCommitOperation),
     UnassignedToCommit(UnassignedToCommitOperation),
     UnassignedToBranch(UnassignedToBranchOperation<'a>),
     UnassignedToStack(UnassignedToStackOperation),
-    UndoCommit(UndoCommitOperation),
+    CommitToUnassigned(CommitToUnassignedOperation),
+    CommitToStack(CommitToStackOperation),
     SquashCommits(SquashCommitsOperation),
     MoveCommitToBranch(MoveCommitToBranchOperation<'a>),
     BranchToUnassigned(BranchToUnassignedOperation<'a>),
@@ -267,7 +288,10 @@ impl<'a> UncommittedToCommitOperation<'a> {
                 .map(|c| {
                     let short = shorten_object_id(&repo, c);
                     let (lead, rest) = split_short_id(&short, 2);
-                    format!("{}{}", lead.blue().bold(), rest.blue())
+                    {
+                        let t = theme::get();
+                        format!("{}{}", t.cli_id.paint(lead), t.cli_id.paint(rest))
+                    }
                 })
                 .unwrap_or_default();
             writeln!(out, "Amended {} → {new_commit}", self.description)?;
@@ -290,7 +314,7 @@ impl<'a> UncommittedToCommitOperation<'a> {
             &rename_previous_path_by_path,
         );
         let changes = but_workspace::flatten_diff_specs(changes);
-        but_api::commit::amend::commit_amend(ctx, self.oid, changes)
+        but_api::commit::amend::commit_amend(ctx, self.oid, changes, DryRun::No)
     }
 }
 
@@ -299,11 +323,12 @@ impl<'a> UncommittedToBranchOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged {} → {}.",
                 self.description,
-                format!("[{}]", self.name).green()
+                t.local_branch.paint(format!("[{}]", self.name))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -325,11 +350,12 @@ impl<'a> UncommittedToStackOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged {} → stack {}.",
                 self.description,
-                format!("[{}]", self.stack_id).green()
+                t.local_branch.paint(format!("[{}]", self.stack_id))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -352,12 +378,13 @@ impl StackToUnassignedOperation {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Unstaged all {} changes.",
                 stack_id_to_branch_name(ctx, self.stack_id)
-                    .map(|b| format!("[{b}]").green())
-                    .unwrap_or_else(|| "stack".to_string().bold())
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack"))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -376,15 +403,16 @@ impl StackToStackOperation {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged all {} changes to {}.",
                 stack_id_to_branch_name(ctx, self.from)
-                    .map(|b| format!("[{b}]").green())
-                    .unwrap_or_else(|| "stack".to_string().bold()),
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack")),
                 stack_id_to_branch_name(ctx, self.to)
-                    .map(|b| format!("[{b}]").green())
-                    .unwrap_or_else(|| "stack".to_string().bold())
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack"))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -403,13 +431,14 @@ impl<'a> StackToBranchOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged all {} changes to {}.",
                 stack_id_to_branch_name(ctx, self.from)
-                    .map(|b| format!("[{b}]").green())
-                    .unwrap_or_else(|| "stack".to_string().bold()),
-                format!("[{}]", self.to).green(),
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack")),
+                t.local_branch.paint(format!("[{}]", self.to)),
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -425,6 +454,48 @@ impl<'a> StackToBranchOperation<'a> {
     }
 }
 
+impl StackToCommitOperation {
+    /// Executes this operation.
+    pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
+        let result = self.execute_inner(ctx)?;
+        if let Some(out) = out.for_human() {
+            let t = theme::get();
+            let repo = ctx.repo.get()?;
+            let new_commit = result
+                .new_commit
+                .map(|c| {
+                    let short = shorten_object_id(&repo, c);
+                    let (lead, rest) = split_short_id(&short, 2);
+                    {
+                        let t = theme::get();
+                        format!("{}{}", t.cli_id.paint(lead), t.cli_id.paint(rest))
+                    }
+                })
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "Amended files assigned to {} → {}",
+                stack_id_to_branch_name(ctx, self.from)
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack")),
+                new_commit,
+            )?;
+        } else if let Some(out) = out.for_json() {
+            out.write_value(serde_json::json!({
+                "ok": true,
+                "new_commit_id": result.new_commit.map(|c| c.to_string()),
+            }))?;
+        }
+        Ok(())
+    }
+
+    /// Executes `StackToCommit` by squashing all hunks from the source stack to the target commit.
+    pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<CommitCreateResult> {
+        let changes = changes_for_stack_assignment(ctx, Some(self.from))?;
+        but_api::commit::amend::commit_amend(ctx, self.to, changes, DryRun::No)
+    }
+}
+
 impl UnassignedToCommitOperation {
     /// Executes this operation.
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
@@ -436,7 +507,10 @@ impl UnassignedToCommitOperation {
                 .map(|c| {
                     let short = shorten_object_id(&repo, c);
                     let (lead, rest) = split_short_id(&short, 2);
-                    format!("{}{}", lead.blue().bold(), rest.blue())
+                    {
+                        let t = theme::get();
+                        format!("{}{}", t.cli_id.paint(lead), t.cli_id.paint(rest))
+                    }
                 })
                 .unwrap_or_default();
             writeln!(out, "Amended unassigned files → {new_commit}")?;
@@ -452,7 +526,7 @@ impl UnassignedToCommitOperation {
     /// Executes `UnassignedToCommit` and returns the exact commit-amend API result.
     pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<CommitCreateResult> {
         let changes = changes_for_stack_assignment(ctx, None)?;
-        but_api::commit::amend::commit_amend(ctx, self.oid, changes)
+        but_api::commit::amend::commit_amend(ctx, self.oid, changes, DryRun::No)
     }
 }
 
@@ -461,11 +535,12 @@ impl<'a> UnassignedToBranchOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged all {} changes to {}.",
-                "unstaged".to_string().bold(),
-                format!("[{}]", self.to).green(),
+                t.important.paint("unstaged"),
+                t.local_branch.paint(format!("[{}]", self.to)),
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -485,13 +560,14 @@ impl UnassignedToStackOperation {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged all {} changes to {}.",
-                "unstaged".bold(),
+                t.important.paint("unstaged"),
                 stack_id_to_branch_name(ctx, self.to)
-                    .map(|b| format!("[{b}]").green())
-                    .unwrap_or_else(|| "stack".bold())
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack"))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -505,16 +581,17 @@ impl UnassignedToStackOperation {
     }
 }
 
-impl UndoCommitOperation {
+impl CommitToUnassignedOperation {
     /// Executes this operation.
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             let repo = ctx.repo.get()?;
             writeln!(
                 out,
                 "Uncommitted {}",
-                shorten_object_id(&repo, self.oid).blue()
+                t.cli_id.paint(shorten_object_id(&repo, self.oid))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -523,8 +600,40 @@ impl UndoCommitOperation {
     }
 
     /// Executes `UndoCommit` by uncommitting all changes from the selected commit.
-    pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<CommitUndoResult> {
-        but_api::commit::undo::commit_undo(ctx, self.oid)
+    pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<UncommitResult> {
+        but_api::commit::uncommit::commit_uncommit(ctx, vec![self.oid], None, DryRun::No)
+    }
+}
+
+impl CommitToStackOperation {
+    /// Executes this operation.
+    pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
+        self.execute_inner(ctx)?;
+        if let Some(out) = out.for_human() {
+            let t = theme::get();
+            let repo = ctx.repo.get()?;
+            writeln!(
+                out,
+                "Uncommitted {} to {}",
+                t.cli_id.paint(shorten_object_id(&repo, self.oid)),
+                stack_id_to_branch_name(ctx, self.stack)
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack")),
+            )?;
+        } else if let Some(out) = out.for_json() {
+            out.write_value(serde_json::json!({"ok": true}))?;
+        }
+        Ok(())
+    }
+
+    /// Uncommits all changes from the selected commit to the given stack.
+    pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<UncommitResult> {
+        but_api::commit::uncommit::commit_uncommit(
+            ctx,
+            vec![self.oid],
+            Some(self.stack),
+            DryRun::No,
+        )
     }
 }
 
@@ -533,12 +642,13 @@ impl SquashCommitsOperation {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         let result = self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             let repo = ctx.repo.get()?;
             writeln!(
                 out,
                 "Squashed {} → {}",
-                shorten_object_id(&repo, self.source).blue(),
-                shorten_object_id(&repo, result.new_commit).blue(),
+                t.cli_id.paint(shorten_object_id(&repo, self.source)),
+                t.cli_id.paint(shorten_object_id(&repo, result.new_commit)),
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({
@@ -552,7 +662,13 @@ impl SquashCommitsOperation {
 
     /// Executes `SquashCommits` by squashing source into target.
     pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<CommitSquashResult> {
-        but_api::commit::squash::commit_squash(ctx, self.source, self.destination)
+        but_api::commit::squash::commit_squash(
+            ctx,
+            vec![self.source],
+            self.destination,
+            self.how_to_combine_messages,
+            DryRun::No,
+        )
     }
 }
 
@@ -561,12 +677,13 @@ impl<'a> MoveCommitToBranchOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             let repo = ctx.repo.get()?;
             writeln!(
                 out,
                 "Moved {} → {}",
-                shorten_object_id(&repo, self.oid).blue(),
-                format!("[{}]", self.name).green()
+                t.cli_id.paint(shorten_object_id(&repo, self.oid)),
+                t.local_branch.paint(format!("[{}]", self.name))
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -579,9 +696,10 @@ impl<'a> MoveCommitToBranchOperation<'a> {
         let target_full_name = FullName::try_from(format!("refs/heads/{}", self.name))?;
         but_api::commit::move_commit::commit_move(
             ctx,
-            self.oid,
+            vec![self.oid],
             RelativeTo::Reference(target_full_name),
             InsertSide::Below,
+            DryRun::No,
         )
     }
 }
@@ -591,10 +709,11 @@ impl<'a> BranchToUnassignedOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Unstaged all {} changes.",
-                format!("[{}]", self.from).green(),
+                t.local_branch.paint(format!("[{}]", self.from)),
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -614,13 +733,14 @@ impl<'a> BranchToStackOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged all {} changes to {}.",
-                format!("[{}]", self.from).green(),
+                t.local_branch.paint(format!("[{}]", self.from)),
                 stack_id_to_branch_name(ctx, self.to)
-                    .map(|b| format!("[{b}]").green())
-                    .unwrap_or_else(|| "stack".to_string().bold()),
+                    .map(|b| t.local_branch.paint(format!("[{b}]")))
+                    .unwrap_or_else(|| t.important.paint("stack")),
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -640,19 +760,23 @@ impl<'a> BranchToCommitOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         let result = self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             let repo = ctx.repo.get()?;
             let new_commit = result
                 .new_commit
                 .map(|c| {
                     let short = shorten_object_id(&repo, c);
                     let (lead, rest) = split_short_id(&short, 2);
-                    format!("{}{}", lead.blue().bold(), rest.blue())
+                    {
+                        let t = theme::get();
+                        format!("{}{}", t.cli_id.paint(lead), t.cli_id.paint(rest))
+                    }
                 })
                 .unwrap_or_default();
             writeln!(
                 out,
                 "Amended assigned files {} → {}",
-                format!("[{}]", self.name).green(),
+                t.local_branch.paint(format!("[{}]", self.name)),
                 new_commit,
             )?;
         } else if let Some(out) = out.for_json() {
@@ -671,7 +795,7 @@ impl<'a> BranchToCommitOperation<'a> {
     pub(crate) fn execute_inner(&self, ctx: &mut Context) -> anyhow::Result<CommitCreateResult> {
         let stack_id = stack_id_for_branch_name(ctx, self.name)?;
         let changes = changes_for_stack_assignment(ctx, stack_id)?;
-        but_api::commit::amend::commit_amend(ctx, self.oid, changes)
+        but_api::commit::amend::commit_amend(ctx, self.oid, changes, DryRun::No)
     }
 }
 
@@ -680,11 +804,12 @@ impl<'a> BranchToBranchOperation<'a> {
     pub(crate) fn execute(self, ctx: &mut Context, out: &mut OutputChannel) -> anyhow::Result<()> {
         self.execute_inner(ctx)?;
         if let Some(out) = out.for_human() {
+            let t = theme::get();
             writeln!(
                 out,
                 "Staged all {} changes to {}.",
-                format!("[{}]", self.from).green(),
-                format!("[{}]", self.to).green(),
+                t.local_branch.paint(format!("[{}]", self.from)),
+                t.local_branch.paint(format!("[{}]", self.to)),
             )?;
         } else if let Some(out) = out.for_json() {
             out.write_value(serde_json::json!({"ok": true}))?;
@@ -724,6 +849,7 @@ impl<'a> CommittedFileToBranchOperation<'a> {
             self.commit_oid,
             relevant_changes,
             stack_id,
+            DryRun::No,
         )
     }
 }
@@ -748,6 +874,7 @@ impl<'a> CommittedFileToCommitOperation<'a> {
             self.commit_oid,
             self.oid,
             relevant_changes,
+            DryRun::No,
         )
     }
 }
@@ -772,6 +899,7 @@ impl<'a> CommittedFileToUnassignedOperation<'a> {
             self.commit_oid,
             relevant_changes,
             None,
+            DryRun::No,
         )
     }
 }
@@ -790,7 +918,8 @@ impl<'a> RubOperation<'a> {
             RubOperation::UnassignedToCommit(operation) => operation.execute(ctx, out),
             RubOperation::UnassignedToBranch(operation) => operation.execute(ctx, out),
             RubOperation::UnassignedToStack(operation) => operation.execute(ctx, out),
-            RubOperation::UndoCommit(operation) => operation.execute(ctx, out),
+            RubOperation::CommitToUnassigned(operation) => operation.execute(ctx, out),
+            RubOperation::CommitToStack(operation) => operation.execute(ctx, out),
             RubOperation::SquashCommits(operation) => operation.execute(ctx, out),
             RubOperation::MoveCommitToBranch(operation) => operation.execute(ctx, out),
             RubOperation::BranchToUnassigned(operation) => operation.execute(ctx, out),
@@ -800,6 +929,7 @@ impl<'a> RubOperation<'a> {
             RubOperation::CommittedFileToBranch(operation) => operation.execute(ctx, out),
             RubOperation::CommittedFileToCommit(operation) => operation.execute(ctx, out),
             RubOperation::CommittedFileToUnassigned(operation) => operation.execute(ctx, out),
+            RubOperation::StackToCommit(operation) => operation.execute(ctx, out),
         }
     }
 }
@@ -812,6 +942,7 @@ impl<'a> RubOperation<'a> {
 pub(crate) fn route_operation<'a>(
     source: &'a CliId,
     target: &'a CliId,
+    how_to_combine_messages: MessageCombinationStrategy,
 ) -> Option<RubOperation<'a>> {
     use CliId::*;
 
@@ -946,6 +1077,12 @@ pub(crate) fn route_operation<'a>(
                 to,
             }))
         }
+        (Stack { stack_id, .. }, Commit { commit_id, .. }) => {
+            Some(RubOperation::StackToCommit(StackToCommitOperation {
+                from: *stack_id,
+                to: *commit_id,
+            }))
+        }
         // Unassigned -> *
         (Unassigned { .. }, Commit { commit_id, .. }) => Some(RubOperation::UnassignedToCommit(
             UnassignedToCommitOperation { oid: *commit_id },
@@ -957,11 +1094,9 @@ pub(crate) fn route_operation<'a>(
             UnassignedToStackOperation { to: *stack_id },
         )),
         // Commit -> *
-        (Commit { commit_id, .. }, Unassigned { .. }) => {
-            Some(RubOperation::UndoCommit(UndoCommitOperation {
-                oid: *commit_id,
-            }))
-        }
+        (Commit { commit_id, .. }, Unassigned { .. }) => Some(RubOperation::CommitToUnassigned(
+            CommitToUnassignedOperation { oid: *commit_id },
+        )),
         (
             Commit {
                 commit_id: source, ..
@@ -973,6 +1108,7 @@ pub(crate) fn route_operation<'a>(
         ) => Some(RubOperation::SquashCommits(SquashCommitsOperation {
             source: *source,
             destination: *destination,
+            how_to_combine_messages,
         })),
         (Commit { commit_id, .. }, Branch { name, .. }) => Some(RubOperation::MoveCommitToBranch(
             MoveCommitToBranchOperation {
@@ -980,6 +1116,12 @@ pub(crate) fn route_operation<'a>(
                 name,
             },
         )),
+        (Commit { commit_id, .. }, Stack { stack_id, .. }) => {
+            Some(RubOperation::CommitToStack(CommitToStackOperation {
+                oid: *commit_id,
+                stack: *stack_id,
+            }))
+        }
         // Branch -> *
         (Branch { name, .. }, Unassigned { .. }) => Some(RubOperation::BranchToUnassigned(
             BranchToUnassignedOperation { from: name },
@@ -1052,12 +1194,13 @@ pub(crate) fn handle(
     out: &mut OutputChannel,
     source_str: &str,
     target_str: &str,
+    how_to_combine_messages: MessageCombinationStrategy,
 ) -> anyhow::Result<()> {
     let id_map = IdMap::legacy_new_from_context(ctx, None)?;
     let (sources, target) = ids(ctx, &id_map, source_str, target_str, out)?;
 
     for source in sources {
-        let Some(operation) = route_operation(&source, &target) else {
+        let Some(operation) = route_operation(&source, &target, how_to_combine_messages) else {
             bail!(makes_no_sense_error(&source, &target))
         };
 
@@ -1067,12 +1210,13 @@ pub(crate) fn handle(
 }
 
 fn makes_no_sense_error(source: &CliId, target: &CliId) -> String {
+    let t = theme::get();
     format!(
         "Operation doesn't make sense. Source {} is {} and target {} is {}.",
-        source.to_short_string().blue().bold(),
-        source.kind_for_humans().yellow(),
-        target.to_short_string().blue().bold(),
-        target.kind_for_humans().yellow()
+        t.cli_id.paint(source.to_short_string()),
+        t.attention.paint(source.kind_for_humans()),
+        t.cli_id.paint(target.to_short_string()),
+        t.attention.paint(target.kind_for_humans())
     )
 }
 
@@ -1101,9 +1245,10 @@ fn ids(
     let valid_targets: Vec<CliId> = target_result
         .into_iter()
         .filter(|target_candidate| {
-            sources
-                .iter()
-                .all(|src| route_operation(src, target_candidate).is_some())
+            sources.iter().all(|src| {
+                route_operation(src, target_candidate, MessageCombinationStrategy::KeepBoth)
+                    .is_some()
+            })
         })
         .collect();
 
@@ -1195,6 +1340,7 @@ pub(crate) fn handle_uncommit(
     source_str: &str,
     discard: bool,
 ) -> anyhow::Result<()> {
+    let t = theme::get();
     let id_map = IdMap::legacy_new_from_context(ctx, None)?;
     let sources = parse_sources_with_disambiguation(ctx, &id_map, source_str, out)?;
 
@@ -1207,8 +1353,8 @@ pub(crate) fn handle_uncommit(
             _ => {
                 bail!(
                     "Cannot uncommit {} - it is {}. Only commits and files-in-commits can be uncommitted.",
-                    source_str.blue().bold(),
-                    source.kind_for_humans().yellow()
+                    t.cli_id.paint(source_str),
+                    t.attention.paint(source.kind_for_humans())
                 );
             }
         }
@@ -1220,14 +1366,14 @@ pub(crate) fn handle_uncommit(
         for source in sources {
             match source {
                 CliId::Commit { commit_id, .. } => {
-                    but_api::commit::discard_commit::commit_discard(ctx, commit_id)?;
+                    but_api::commit::discard_commit::commit_discard(ctx, commit_id, DryRun::No)?;
 
                     if !json_mode && let Some(out) = out.for_human() {
                         let repo = ctx.repo.get()?;
                         writeln!(
                             out,
                             "Discarded {}",
-                            shorten_object_id(&repo, commit_id).blue()
+                            t.cli_id.paint(shorten_object_id(&repo, commit_id))
                         )?;
                     }
                 }
@@ -1256,7 +1402,13 @@ pub(crate) fn handle_uncommit(
     }
 
     // Call the main rub handler with "zz" as target
-    handle(ctx, out, source_str, "zz")
+    handle(
+        ctx,
+        out,
+        source_str,
+        "zz",
+        MessageCombinationStrategy::KeepBoth,
+    )
 }
 
 /// Handler for `but amend <file> <commit>` - runs `but rub <file> <commit>`
@@ -1267,6 +1419,7 @@ pub(crate) fn handle_amend(
     file_str: &str,
     commit_str: &str,
 ) -> anyhow::Result<()> {
+    let t = theme::get();
     let mut guard = ctx.exclusive_worktree_access();
     let id_map = IdMap::new_from_context(ctx, None, guard.read_permission())?;
     let files = parse_sources_with_disambiguation(ctx, &id_map, file_str, out)?;
@@ -1281,8 +1434,8 @@ pub(crate) fn handle_amend(
             _ => {
                 bail!(
                     "Cannot amend {} - it is {}. Only uncommitted files and hunks can be amended.",
-                    file.to_short_string().blue().bold(),
-                    file.kind_for_humans().yellow()
+                    t.cli_id.paint(file.to_short_string()),
+                    t.attention.paint(file.kind_for_humans())
                 );
             }
         }
@@ -1318,8 +1471,8 @@ pub(crate) fn handle_amend(
         other => {
             bail!(
                 "Cannot amend into {} - it is {}. Target must be a commit.",
-                other.to_short_string().blue().bold(),
-                other.kind_for_humans().yellow()
+                t.cli_id.paint(other.to_short_string()),
+                t.attention.paint(other.kind_for_humans())
             );
         }
     }
@@ -1334,6 +1487,7 @@ pub(crate) fn handle_stage(
     file_or_hunk_str: &str,
     branch_str: &str,
 ) -> anyhow::Result<()> {
+    let t = theme::get();
     let id_map = IdMap::legacy_new_from_context(ctx, None)?;
     let files = parse_sources_with_disambiguation(ctx, &id_map, file_or_hunk_str, out)?;
     let branch = resolve_single_id(ctx, &id_map, branch_str, "Branch", out)?;
@@ -1347,8 +1501,8 @@ pub(crate) fn handle_stage(
             _ => {
                 bail!(
                     "Cannot stage {} - it is {}. Only uncommitted files and hunks can be staged.",
-                    file.to_short_string().blue().bold(),
-                    file.kind_for_humans().yellow()
+                    t.cli_id.paint(file.to_short_string()),
+                    t.attention.paint(file.kind_for_humans())
                 );
             }
         }
@@ -1362,14 +1516,20 @@ pub(crate) fn handle_stage(
         other => {
             bail!(
                 "Cannot stage to {} - it is {}. Target must be a branch.",
-                other.to_short_string().blue().bold(),
-                other.kind_for_humans().yellow()
+                t.cli_id.paint(other.to_short_string()),
+                t.attention.paint(other.kind_for_humans())
             );
         }
     }
 
     // Call the main rub handler
-    handle(ctx, out, file_or_hunk_str, branch_str)
+    handle(
+        ctx,
+        out,
+        file_or_hunk_str,
+        branch_str,
+        MessageCombinationStrategy::KeepBoth,
+    )
 }
 
 /// Handler for `but stage --tui` - interactive hunk selection TUI.
@@ -1379,6 +1539,7 @@ pub(crate) fn handle_stage_tui(
     out: &mut OutputChannel,
     branch_str: Option<&str>,
 ) -> anyhow::Result<()> {
+    let t = theme::get();
     use crate::tui::stage_viewer::{StageFileEntry, StageResult};
 
     let id_map = IdMap::legacy_new_from_context(ctx, None)?;
@@ -1391,8 +1552,8 @@ pub(crate) fn handle_stage_tui(
             other => {
                 bail!(
                     "Cannot stage to {} - it is {}. Target must be a branch.",
-                    other.to_short_string().blue().bold(),
-                    other.kind_for_humans().yellow()
+                    t.cli_id.paint(other.to_short_string()),
+                    t.attention.paint(other.kind_for_humans())
                 );
             }
         }
@@ -1464,10 +1625,11 @@ pub(crate) fn handle_stage_tui(
             )?);
             assign::do_assignments(ctx, reqs)?;
             if let Some(out) = out.for_human() {
+                let t = theme::get();
                 writeln!(
                     out,
                     "Staged selected hunks → {}.",
-                    format!("[{branch_name}]").green()
+                    t.local_branch.paint(format!("[{branch_name}]"))
                 )?;
             }
             Ok(())
@@ -1490,6 +1652,7 @@ pub(crate) fn handle_unstage(
     file_or_hunk_str: &str,
     branch_str: Option<&str>,
 ) -> anyhow::Result<()> {
+    let t = theme::get();
     let id_map = IdMap::legacy_new_from_context(ctx, None)?;
     let files = parse_sources_with_disambiguation(ctx, &id_map, file_or_hunk_str, out)?;
 
@@ -1502,8 +1665,8 @@ pub(crate) fn handle_unstage(
             _ => {
                 bail!(
                     "Cannot unstage {} - it is {}. Only uncommitted files and hunks can be unstaged.",
-                    file.to_short_string().blue().bold(),
-                    file.kind_for_humans().yellow()
+                    t.cli_id.paint(file.to_short_string()),
+                    t.attention.paint(file.kind_for_humans())
                 );
             }
         }
@@ -1519,15 +1682,21 @@ pub(crate) fn handle_unstage(
             other => {
                 bail!(
                     "Cannot unstage from {} - it is {}. Target must be a branch.",
-                    other.to_short_string().blue().bold(),
-                    other.kind_for_humans().yellow()
+                    t.cli_id.paint(other.to_short_string()),
+                    t.attention.paint(other.kind_for_humans())
                 );
             }
         }
     }
 
     // Call the main rub handler with "zz" as target to unassign
-    handle(ctx, out, file_or_hunk_str, "zz")
+    handle(
+        ctx,
+        out,
+        file_or_hunk_str,
+        "zz",
+        MessageCombinationStrategy::KeepBoth,
+    )
 }
 
 /// Builds assignment requests for selected hunks and assigns them to `target_stack_id`.
@@ -1539,8 +1708,7 @@ fn assignment_requests_for_selected_hunks<'a>(
         .map(|assignment| HunkAssignmentRequest {
             hunk_header: assignment.hunk_header,
             path_bytes: assignment.path_bytes.to_owned(),
-            stack_id: target_stack_id,
-            branch_ref_bytes: None,
+            target: target_stack_id.map(|stack_id| HunkAssignmentTarget::Stack { stack_id }),
         })
         .collect()
 }
@@ -1570,8 +1738,7 @@ fn reassign_all_from_stack_to_stack(
         .map(|assignment| HunkAssignmentRequest {
             hunk_header: assignment.hunk_header,
             path_bytes: assignment.path_bytes,
-            stack_id: target_stack_id,
-            branch_ref_bytes: None,
+            target: target_stack_id.map(|stack_id| HunkAssignmentTarget::Stack { stack_id }),
         })
         .collect::<Vec<_>>();
 
@@ -1714,22 +1881,64 @@ mod tests {
         let uncommitted = uncommitted_id();
 
         // Valid: Uncommitted -> Unassigned
-        assert!(route_operation(&uncommitted, &unassigned_id()).is_some());
+        assert!(
+            route_operation(
+                &uncommitted,
+                &unassigned_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Uncommitted -> Commit
-        assert!(route_operation(&uncommitted, &commit_id()).is_some());
+        assert!(
+            route_operation(
+                &uncommitted,
+                &commit_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Uncommitted -> Branch
-        assert!(route_operation(&uncommitted, &branch_id()).is_some());
+        assert!(
+            route_operation(
+                &uncommitted,
+                &branch_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Uncommitted -> Stack
-        assert!(route_operation(&uncommitted, &stack_id()).is_some());
+        assert!(
+            route_operation(
+                &uncommitted,
+                &stack_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Invalid: Uncommitted -> Uncommitted
-        assert!(route_operation(&uncommitted, &uncommitted_id()).is_none());
+        assert!(
+            route_operation(
+                &uncommitted,
+                &uncommitted_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: Uncommitted -> CommittedFile
-        assert!(route_operation(&uncommitted, &committed_file_id()).is_none());
+        assert!(
+            route_operation(
+                &uncommitted,
+                &committed_file_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1737,22 +1946,49 @@ mod tests {
         let commit = commit_id();
 
         // Valid: Commit -> Unassigned
-        assert!(route_operation(&commit, &unassigned_id()).is_some());
+        assert!(
+            route_operation(
+                &commit,
+                &unassigned_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Commit -> Commit
-        assert!(route_operation(&commit, &commit_id()).is_some());
+        assert!(
+            route_operation(&commit, &commit_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Valid: Commit -> Branch
-        assert!(route_operation(&commit, &branch_id()).is_some());
+        assert!(
+            route_operation(&commit, &branch_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
+
+        // Valid: Commit -> Stack
+        assert!(
+            route_operation(&commit, &stack_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Invalid: Commit -> Uncommitted
-        assert!(route_operation(&commit, &uncommitted_id()).is_none());
-
-        // Invalid: Commit -> Stack
-        assert!(route_operation(&commit, &stack_id()).is_none());
+        assert!(
+            route_operation(
+                &commit,
+                &uncommitted_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: Commit -> CommittedFile
-        assert!(route_operation(&commit, &committed_file_id()).is_none());
+        assert!(
+            route_operation(
+                &commit,
+                &committed_file_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1760,22 +1996,49 @@ mod tests {
         let branch = branch_id();
 
         // Valid: Branch -> Unassigned
-        assert!(route_operation(&branch, &unassigned_id()).is_some());
+        assert!(
+            route_operation(
+                &branch,
+                &unassigned_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Branch -> Stack
-        assert!(route_operation(&branch, &stack_id()).is_some());
+        assert!(
+            route_operation(&branch, &stack_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Valid: Branch -> Commit
-        assert!(route_operation(&branch, &commit_id()).is_some());
+        assert!(
+            route_operation(&branch, &commit_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Valid: Branch -> Branch
-        assert!(route_operation(&branch, &branch_id()).is_some());
+        assert!(
+            route_operation(&branch, &branch_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Invalid: Branch -> Uncommitted
-        assert!(route_operation(&branch, &uncommitted_id()).is_none());
+        assert!(
+            route_operation(
+                &branch,
+                &uncommitted_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: Branch -> CommittedFile
-        assert!(route_operation(&branch, &committed_file_id()).is_none());
+        assert!(
+            route_operation(
+                &branch,
+                &committed_file_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1783,22 +2046,49 @@ mod tests {
         let stack = stack_id();
 
         // Valid: Stack -> Unassigned
-        assert!(route_operation(&stack, &unassigned_id()).is_some());
+        assert!(
+            route_operation(
+                &stack,
+                &unassigned_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Stack -> Stack
-        assert!(route_operation(&stack, &stack_id()).is_some());
+        assert!(
+            route_operation(&stack, &stack_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Valid: Stack -> Branch
-        assert!(route_operation(&stack, &branch_id()).is_some());
+        assert!(
+            route_operation(&stack, &branch_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
+
+        // Valid: Stack -> Commit
+        assert!(
+            route_operation(&stack, &commit_id(), MessageCombinationStrategy::KeepBoth).is_some()
+        );
 
         // Invalid: Stack -> Uncommitted
-        assert!(route_operation(&stack, &uncommitted_id()).is_none());
-
-        // Invalid: Stack -> Commit
-        assert!(route_operation(&stack, &commit_id()).is_none());
+        assert!(
+            route_operation(
+                &stack,
+                &uncommitted_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: Stack -> CommittedFile
-        assert!(route_operation(&stack, &committed_file_id()).is_none());
+        assert!(
+            route_operation(
+                &stack,
+                &committed_file_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1806,22 +2096,64 @@ mod tests {
         let unassigned = unassigned_id();
 
         // Valid: Unassigned -> Commit
-        assert!(route_operation(&unassigned, &commit_id()).is_some());
+        assert!(
+            route_operation(
+                &unassigned,
+                &commit_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Unassigned -> Branch
-        assert!(route_operation(&unassigned, &branch_id()).is_some());
+        assert!(
+            route_operation(
+                &unassigned,
+                &branch_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: Unassigned -> Stack
-        assert!(route_operation(&unassigned, &stack_id()).is_some());
+        assert!(
+            route_operation(
+                &unassigned,
+                &stack_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Invalid: Unassigned -> Uncommitted
-        assert!(route_operation(&unassigned, &uncommitted_id()).is_none());
+        assert!(
+            route_operation(
+                &unassigned,
+                &uncommitted_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: Unassigned -> Unassigned
-        assert!(route_operation(&unassigned, &unassigned_id()).is_none());
+        assert!(
+            route_operation(
+                &unassigned,
+                &unassigned_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: Unassigned -> CommittedFile
-        assert!(route_operation(&unassigned, &committed_file_id()).is_none());
+        assert!(
+            route_operation(
+                &unassigned,
+                &committed_file_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1829,22 +2161,64 @@ mod tests {
         let committed_file = committed_file_id();
 
         // Valid: CommittedFile -> Branch
-        assert!(route_operation(&committed_file, &branch_id()).is_some());
+        assert!(
+            route_operation(
+                &committed_file,
+                &branch_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: CommittedFile -> Commit
-        assert!(route_operation(&committed_file, &commit_id()).is_some());
+        assert!(
+            route_operation(
+                &committed_file,
+                &commit_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Valid: CommittedFile -> Unassigned
-        assert!(route_operation(&committed_file, &unassigned_id()).is_some());
+        assert!(
+            route_operation(
+                &committed_file,
+                &unassigned_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_some()
+        );
 
         // Invalid: CommittedFile -> Uncommitted
-        assert!(route_operation(&committed_file, &uncommitted_id()).is_none());
+        assert!(
+            route_operation(
+                &committed_file,
+                &uncommitted_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: CommittedFile -> Stack
-        assert!(route_operation(&committed_file, &stack_id()).is_none());
+        assert!(
+            route_operation(
+                &committed_file,
+                &stack_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
 
         // Invalid: CommittedFile -> CommittedFile
-        assert!(route_operation(&committed_file, &committed_file_id()).is_none());
+        assert!(
+            route_operation(
+                &committed_file,
+                &committed_file_id(),
+                MessageCombinationStrategy::KeepBoth
+            )
+            .is_none()
+        );
     }
 
     /// Verifies that route_operation returns the correct variant (not just Some/None).
@@ -1862,49 +2236,69 @@ mod tests {
         // We use match with wildcard to verify the variant type without destructuring all fields
 
         // Uncommitted -> Unassigned should be UnassignUncommitted
-        match route_operation(&uncommitted, &unassigned) {
+        match route_operation(
+            &uncommitted,
+            &unassigned,
+            MessageCombinationStrategy::KeepBoth,
+        ) {
             Some(RubOperation::UnassignUncommitted(..)) => {}
             _ => panic!("Expected UnassignUncommitted variant"),
         }
 
         // Uncommitted -> Commit should be UncommittedToCommit
-        match route_operation(&uncommitted, &commit) {
+        match route_operation(&uncommitted, &commit, MessageCombinationStrategy::KeepBoth) {
             Some(RubOperation::UncommittedToCommit(..)) => {}
             _ => panic!("Expected UncommittedToCommit variant"),
         }
 
         // Commit -> Commit should be SquashCommits
-        match route_operation(&commit, &commit_id()) {
+        match route_operation(&commit, &commit_id(), MessageCombinationStrategy::KeepBoth) {
             Some(RubOperation::SquashCommits(..)) => {}
             _ => panic!("Expected SquashCommits variant"),
         }
 
-        // Commit -> Unassigned should be UndoCommit
-        match route_operation(&commit, &unassigned) {
-            Some(RubOperation::UndoCommit(..)) => {}
-            _ => panic!("Expected UndoCommit variant"),
+        // Commit -> Unassigned should be CommitToUnassigned
+        match route_operation(&commit, &unassigned, MessageCombinationStrategy::KeepBoth) {
+            Some(RubOperation::CommitToUnassigned(..)) => {}
+            _ => panic!("Expected CommitToUnassigned variant"),
+        }
+
+        // Commit -> Stack should be CommitToStack
+        match route_operation(&commit, &stack, MessageCombinationStrategy::KeepBoth) {
+            Some(RubOperation::CommitToStack(..)) => {}
+            _ => panic!("Expected CommitToStack variant"),
         }
 
         // Branch -> Stack should be BranchToStack
-        match route_operation(&branch, &stack) {
+        match route_operation(&branch, &stack, MessageCombinationStrategy::KeepBoth) {
             Some(RubOperation::BranchToStack(..)) => {}
             _ => panic!("Expected BranchToStack variant"),
         }
 
         // Stack -> Branch should be StackToBranch
-        match route_operation(&stack, &branch) {
+        match route_operation(&stack, &branch, MessageCombinationStrategy::KeepBoth) {
             Some(RubOperation::StackToBranch(..)) => {}
             _ => panic!("Expected StackToBranch variant"),
         }
 
+        // Stack -> Commit should be StackToCommit
+        match route_operation(&stack, &commit, MessageCombinationStrategy::KeepBoth) {
+            Some(RubOperation::StackToCommit(..)) => {}
+            _ => panic!("Expected StackToCommit variant"),
+        }
+
         // CommittedFile -> Commit should be CommittedFileToCommit
-        match route_operation(&committed_file, &commit) {
+        match route_operation(
+            &committed_file,
+            &commit,
+            MessageCombinationStrategy::KeepBoth,
+        ) {
             Some(RubOperation::CommittedFileToCommit(..)) => {}
             _ => panic!("Expected CommittedFileToCommit variant"),
         }
 
         // Unassigned -> Stack should be UnassignedToStack
-        match route_operation(&unassigned, &stack) {
+        match route_operation(&unassigned, &stack, MessageCombinationStrategy::KeepBoth) {
             Some(RubOperation::UnassignedToStack(..)) => {}
             _ => panic!("Expected UnassignedToStack variant"),
         }

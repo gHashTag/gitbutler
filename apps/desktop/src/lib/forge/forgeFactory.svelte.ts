@@ -10,9 +10,11 @@ import type { ForgeProvider } from "$lib/baseBranch/baseBranch";
 import type { GitLabClient } from "$lib/forge/gitlab/gitlabClient.svelte";
 import type { Forge, ForgeName } from "$lib/forge/interface/forge";
 import type { RepoInfo } from "$lib/git/gitUrl";
-import type { AppDispatch, BackendApi, GitHubApi, GitLabApi } from "$lib/state/clientState.svelte";
+import type { BackendApi } from "$lib/state/backendApi";
+import type { AppDispatch, GitHubApi, GitLabApi } from "$lib/state/clientState.svelte";
 import type { ReduxTag } from "$lib/state/tags";
 import type { PostHogWrapper } from "$lib/telemetry/posthog";
+import type { Code } from "@gitbutler/but-sdk";
 import type { Reactive } from "@gitbutler/shared/storeUtils";
 import type { TagDescription } from "@reduxjs/toolkit/query";
 
@@ -22,7 +24,7 @@ export type ForgeConfig = {
 	baseBranch?: string;
 	githubAuthenticated?: boolean;
 	forgeIsLoading?: boolean;
-	githubError?: { code: string; message: string };
+	githubError?: { code?: Code; message: string };
 	gitlabAuthenticated?: boolean;
 	detectedForgeProvider: ForgeProvider | undefined;
 	forgeOverride?: ForgeName;
@@ -35,10 +37,10 @@ export class DefaultForgeFactory implements Reactive<Forge> {
 	private _forge = $state<Forge>(this.default);
 	private _config: any = undefined;
 	private _determinedForgeType = $state<ForgeName>("default");
-	private _githubError = $state<{ code: string; message: string } | undefined>(undefined);
+	private _githubError = $state<{ code?: Code; message: string } | undefined>(undefined);
 	private _canSetupIntegration = $derived.by(() => {
 		// Don't show the setup prompt if there's a network error
-		if (this._githubError?.code === "errors.network") {
+		if (this._githubError?.code === "NetworkError") {
 			return undefined;
 		}
 		return isAvalilableForge(this._determinedForgeType) &&

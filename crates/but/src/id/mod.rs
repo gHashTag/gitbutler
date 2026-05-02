@@ -13,8 +13,8 @@ use bstr::{BStr, BString, ByteSlice};
 use but_core::sync::RepoShared;
 use but_core::{ChangeId, ref_metadata::StackId};
 use but_ctx::Context;
+use but_graph::projection::{Stack, StackCommit, StackSegment};
 use but_hunk_assignment::HunkAssignment;
-use but_workspace::{branch::Stack, ref_info::LocalCommitRelation};
 use nonempty::NonEmpty;
 use self_cell::self_cell;
 
@@ -35,7 +35,7 @@ mod tests;
 /// A helper to indicate that this is a short-id as a user would see.
 pub(crate) type ShortId = String;
 
-const UNASSIGNED: &str = "zz";
+pub(crate) const UNASSIGNED: &str = "zz";
 
 /// Create a CLI ID for the given staged file (if `stack_id` is `Some`) or the
 /// given unstaged file or committed file (if `stack_id` is `None`).
@@ -154,20 +154,16 @@ pub struct WorkspaceCommitWithId {
     /// The short ID.
     pub short_id: ShortId,
     /// The original workspace commit.
-    pub inner: but_workspace::ref_info::LocalCommit,
+    pub inner: StackCommit,
 }
 impl WorkspaceCommitWithId {
     /// The object ID of the commit.
     pub fn commit_id(&self) -> gix::ObjectId {
-        self.inner.inner.id
+        self.inner.id
     }
     /// The ID of the first parent if the commit has parents.
     pub fn first_parent_id(&self) -> Option<gix::ObjectId> {
-        self.inner.inner.parent_ids.first().cloned()
-    }
-    /// State in relation to its remote tracking branch.
-    pub fn relation(&self) -> LocalCommitRelation {
-        self.inner.relation
+        self.inner.parent_ids.first().cloned()
     }
 }
 /// Methods to calculate the short IDs of committed files.
@@ -251,7 +247,7 @@ pub struct RemoteCommitWithId {
     /// The short ID.
     pub short_id: ShortId,
     /// The original remote commit.
-    pub inner: but_workspace::ref_info::Commit,
+    pub inner: StackCommit,
 }
 impl RemoteCommitWithId {
     /// The object ID of the commit.
@@ -291,7 +287,7 @@ pub struct SegmentWithId {
     pub is_auto_id: bool,
     /// The original segment except that `commits` and `commits_on_remote` are
     /// blank to save memory.
-    pub inner: but_workspace::ref_info::Segment,
+    pub inner: StackSegment,
     /// The original `inner.commits` with additional information.
     pub workspace_commits: Vec<WorkspaceCommitWithId>,
     /// The original `inner.commits_on_remote` with additional information.
@@ -551,24 +547,10 @@ impl IdMap {
     /// # NOTE: claims a read-only workspace lock!
     /// TODO(ctx|ai): Use a `ws` directly instead of creating a whole new RefInfo uncached.
     pub fn new_from_context(
-        ctx: &mut Context,
+        ctx: &Context,
         assignments: Option<Vec<HunkAssignment>>,
         perm: &RepoShared,
     ) -> anyhow::Result<Self> {
-        let meta = ctx.meta()?;
-        let head_info = {
-            let repo = ctx.clone_repo_for_merging_non_persisting()?;
-            let mut cache = ctx.cache.get_cache_mut()?;
-            but_workspace::head_info(
-                &repo,
-                &meta,
-                but_workspace::ref_info::Options {
-                    expensive_commit_info: false,
-                    ..Default::default()
-                },
-                &mut cache,
-            )?
-        };
         let context_lines = ctx.settings.context_lines;
         let (repo, ws, mut db) = ctx.workspace_and_db_mut_with_perm(perm)?;
 
@@ -587,7 +569,7 @@ impl IdMap {
             }
         };
 
-        Self::new(head_info.stacks, hunk_assignments)
+        Self::new(ws.stacks.clone(), hunk_assignments)
     }
 }
 

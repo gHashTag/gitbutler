@@ -14,7 +14,6 @@ import type {
 	NavigationContext,
 	NavigationAction,
 } from "$lib/focus/focusTypes";
-export type { FocusableOptions } from "./focusTypes";
 
 export const FOCUS_MANAGER: InjectionToken<FocusManager> = new InjectionToken("FocusManager");
 
@@ -1009,7 +1008,7 @@ export class FocusManager {
 		if (!element || !element.isConnected) return;
 
 		if (element.tabIndex !== -1) {
-			element.focus();
+			element.focus({ preventScroll: skipScroll });
 		} else {
 			const activeElement = document.activeElement;
 			if (activeElement instanceof HTMLElement && !element.contains(activeElement)) {

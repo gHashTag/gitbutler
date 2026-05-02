@@ -1,7 +1,14 @@
 import { showToast } from "$lib/notifications/toasts";
 import { TestId } from "@gitbutler/ui";
 import type { BranchIconName } from "$lib/branches/branchIcon";
-import type { Workspace, WorkspaceLegacy } from "@gitbutler/core/api";
+import type { DropResult } from "$lib/dragging/dropResult";
+import type {
+	BranchDetails,
+	PushStatus,
+	StackDetails,
+	StackEntry,
+	StackHeadInfo,
+} from "@gitbutler/but-sdk";
 
 export type CreateBranchFromBranchOutcome = {
 	stackId: string;
@@ -51,7 +58,7 @@ You can always re-apply them later from the branches page.`,
 /**
  * Return type of Tauri `stacks` command.
  */
-export type Stack = WorkspaceLegacy.StackEntry;
+export type Stack = StackEntry;
 
 export type GerritPushFlag =
 	| { type: "wip" }
@@ -80,7 +87,7 @@ export type StackOpt = {
 	/**
 	 * Information about the branches contained in the stack.
 	 */
-	heads: WorkspaceLegacy.StackHeadInfo[];
+	heads: StackHeadInfo[];
 	/**
 	 * The commit hash of the tip of the stack.
 	 */
@@ -108,9 +115,6 @@ export function getStackName(stack: Stack): string {
 export function getStackBranchNames(stack: Stack): string[] {
 	return stack.heads.map((head) => head.name);
 }
-
-/** Represents the pushable status for the current stack */
-export type PushStatus = Workspace.PushStatus;
 
 /**
  * Converts push status directly to a CSS color string.
@@ -140,9 +144,6 @@ export function pushStatusToIcon(pushStatus: PushStatus): BranchIconName {
 			return "branch";
 	}
 }
-
-export type BranchDetails = Workspace.BranchDetails;
-export type StackDetails = Workspace.StackDetails;
 
 export function stackRequiresForcePush(stack: StackDetails): boolean {
 	return stack.pushStatus === "unpushedCommitsRequiringForce";
@@ -256,18 +257,16 @@ export type InteractiveIntegrationStep =
 			};
 	  };
 
-export type MoveBranchResult = {
-	deletedStacks: string[];
-	unappliedStacks: string[];
-};
-
-export function handleMoveBranchResult(result: MoveBranchResult) {
-	if (result.unappliedStacks.length > 0) {
-		showToast({
-			testId: TestId.StacksUnappliedToast,
-			title: "Heads up: We had to unapply some stacks to move this branch",
-			message: `It seems that the branch moved couldn't be applied cleanly alongside your other ${result.unappliedStacks.length} ${result.unappliedStacks.length === 1 ? "stack" : "stacks"}.
+/**
+ * Converts an unapplied-stack count into a `DropResult` warning if stacks were unapplied.
+ */
+export function toMoveBranchWarning(unappliedStackCount: number): DropResult | undefined {
+	if (unappliedStackCount === 0) return undefined;
+	return {
+		type: "warning",
+		title: "Heads up: We had to unapply some stacks to move this branch",
+		message: `It seems that the branch moved couldn't be applied cleanly alongside your other ${unappliedStackCount} ${unappliedStackCount === 1 ? "stack" : "stacks"}.
 You can always re-apply them later from the branches page.`,
-		});
-	}
+		testId: TestId.StacksUnappliedToast,
+	};
 }

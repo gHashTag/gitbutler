@@ -20,7 +20,7 @@ import { UI_STATE } from "$lib/state/uiState.svelte";
 import { inject } from "@gitbutler/core/context";
 import { getContext, setContext } from "svelte";
 import type { FileSelectionManager } from "$lib/selection/fileSelectionManager.svelte";
-import type { ProjectSettingsPageId } from "$lib/settings/projectSettingsPages";
+import type { ProjectSettingsPageId } from "$lib/state/uiState.svelte";
 
 const STACK_CTX = Symbol("StackController");
 
@@ -116,6 +116,18 @@ export class StackController {
 		return this.selection.current?.commitId;
 	}
 
+	/** All selected commit IDs. Falls back to `[commitId]` when multi-select isn't active. */
+	get selectedCommitIds(): string[] {
+		const sel = this.selection.current;
+		if (sel?.commitIds && sel.commitIds.length > 0) return sel.commitIds;
+		if (sel?.commitId) return [sel.commitId];
+		return [];
+	}
+
+	isCommitSelected(commitId: string): boolean {
+		return this.selectedCommitIds.includes(commitId);
+	}
+
 	get branchName(): string | undefined {
 		return this.selection.current?.branchName;
 	}
@@ -148,6 +160,20 @@ export class StackController {
 		return (
 			this.exclusiveAction?.type === "commit" && this.exclusiveAction?.stackId !== this.stackId
 		);
+	}
+
+	private get stackBusyState() {
+		return this.projectState.stackBusy.current;
+	}
+
+	/** True when this stack is involved in a busy operation and should block interaction. */
+	get stackBusy(): boolean {
+		const stackIds = this.stackBusyState?.stackIds;
+		return !!stackIds && !!this.stackId && stackIds.includes(this.stackId);
+	}
+
+	get busyCommitId(): string | undefined {
+		return this.stackBusyState?.commitId;
 	}
 
 	get activeSelectionId(): SelectionId | undefined {

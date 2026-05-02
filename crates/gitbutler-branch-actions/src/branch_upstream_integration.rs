@@ -1,3 +1,8 @@
+#![expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
+
 use anyhow::{Result, bail};
 use but_ctx::{Context, access::RepoExclusive};
 use but_rebase::{Rebase, RebaseStep};
@@ -40,6 +45,7 @@ pub enum InteractiveIntegrationStep {
 ///
 /// This basically just lists the upstream and local commits in the display order (child to parent) and creates a `Pick` step for each.
 /// The user can then modify this in the UI.
+#[expect(deprecated, reason = "calls but_workspace::legacy::stack_details_v3")]
 pub fn get_initial_integration_steps_for_branch(
     ctx: &Context,
     stack_id: Option<StackId>,
@@ -47,9 +53,7 @@ pub fn get_initial_integration_steps_for_branch(
 ) -> Result<Vec<InteractiveIntegrationStep>> {
     let repo = ctx.repo.get()?;
     let meta = ctx.legacy_meta()?;
-    let mut cache = ctx.cache.get_cache_mut()?;
-    let stack_details =
-        but_workspace::legacy::stack_details_v3(stack_id, &repo, &meta, &mut cache)?;
+    let stack_details = but_workspace::legacy::stack_details_v3(stack_id, &repo, &meta)?;
 
     let branch_details = stack_details
         .branch_details
@@ -159,7 +163,7 @@ pub fn integrate_branch_with_steps(
     let mut rebase = Rebase::new(&repo, merge_base, None)?;
     rebase.steps(new_rebase_steps)?;
     rebase.rebase_noops(false);
-    let result = rebase.rebase(&*ctx.cache.get_cache()?)?;
+    let result = rebase.rebase()?;
 
     source_stack.set_stack_head(&mut vb_state, &repo, result.top_commit)?;
     let new_workspace = WorkspaceState::create(ctx, perm.read_permission())?;

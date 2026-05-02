@@ -11,9 +11,11 @@
 		projectId: string;
 		branchName: string;
 		prUpdatedAt?: string;
+		mergeableState?: string;
 		hasChecks?: boolean;
 		isFork?: boolean;
 		isMerged?: boolean;
+		onrefetch?: () => void;
 	};
 
 	type StatusInfo = {
@@ -29,9 +31,11 @@
 		projectId,
 		branchName,
 		prUpdatedAt,
+		mergeableState,
 		isFork,
 		isMerged,
 		hasChecks = $bindable(),
+		onrefetch,
 	}: Props = $props();
 
 	const forge = inject(DEFAULT_FORGE_FACTORY);
@@ -83,6 +87,29 @@
 		}
 
 		if (checks) {
+			// When checks pass but the PR is blocked, it's typically because
+			// review approval is still required — not a CI issue.
+			if (checks.completed && checks.success && mergeableState === "blocked") {
+				return {
+					style: "warning",
+					icon: "eye",
+					text: "Needs review",
+					reducedText: "Needs review",
+					tooltip: "Checks passed but the PR still needs approval.",
+				};
+			}
+
+			// Merge conflicts can prevent checks from running at all.
+			if (mergeableState === "dirty") {
+				return {
+					style: "danger",
+					icon: "warning",
+					text: "Has conflicts",
+					reducedText: "Conflicts",
+					tooltip: "The PR has merge conflicts that need to be resolved.",
+				};
+			}
+
 			const style = checks.completed ? (checks.success ? "safe" : "danger") : "warning";
 			// Keep the terminal icon stable during background re-fetches
 			const icon = checks.completed ? (checks.success ? "tick" : "danger") : "spinner";
@@ -207,6 +234,7 @@
 			elapsedMs = 0;
 		}
 		checksQuery?.result.refetch();
+		onrefetch?.();
 	}}
 >
 	<span data-pr-text={checksTagInfo.reducedText} class="truncate">

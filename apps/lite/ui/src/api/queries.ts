@@ -1,7 +1,9 @@
 import type {
+	AbsorptionPlanParams,
 	BranchDetailsParams,
 	BranchDiffParams,
 	CommitDetailsWithLineStatsParams,
+	ListBranchesParams,
 	TreeChangeDiffParams,
 } from "#electron/ipc.ts";
 import { queryOptions } from "@tanstack/react-query";
@@ -15,6 +17,7 @@ export enum QueryKey {
 	Branches = "branches",
 	Projects = "projects",
 	TreeChangeDiffs = "treeChangeDiffs",
+	AbsorptionPlan = "absorptionPlan",
 }
 
 export const branchDetailsQueryOptions = (params: BranchDetailsParams) =>
@@ -47,17 +50,17 @@ export const headInfoQueryOptions = (projectId: string) =>
 		queryFn: () => window.lite.headInfo(projectId),
 	});
 
-export const listBranchesQueryOptions = (projectId: string) =>
+/** @public */
+export const listBranchesQueryOptions = (params: ListBranchesParams) =>
 	queryOptions({
-		queryKey: [QueryKey.Branches, projectId],
-		queryFn: () => window.lite.listBranches(projectId, null),
+		queryKey: [QueryKey.Branches, params],
+		queryFn: () => window.lite.listBranches(params.projectId, params.filter),
 	});
 
-export const listProjectsQueryOptions = () =>
-	queryOptions({
-		queryKey: [QueryKey.Projects],
-		queryFn: () => window.lite.listProjects(),
-	});
+export const listProjectsQueryOptions = queryOptions({
+	queryKey: [QueryKey.Projects],
+	queryFn: () => window.lite.listProjects(),
+});
 
 export const treeChangeDiffsQueryOptions = (params: TreeChangeDiffParams) => {
 	const { projectId, change } = params;
@@ -66,3 +69,9 @@ export const treeChangeDiffsQueryOptions = (params: TreeChangeDiffParams) => {
 		queryFn: () => window.lite.treeChangeDiffs({ projectId, change }),
 	});
 };
+
+export const absorptionPlanQueryOptions = (params: AbsorptionPlanParams) =>
+	queryOptions({
+		queryKey: [QueryKey.AbsorptionPlan, params],
+		queryFn: () => window.lite.absorptionPlan(params),
+	});

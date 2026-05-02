@@ -1,0 +1,16 @@
+export type CommandGroup =
+	| "Branch"
+	| "Branches"
+	| "Changes file"
+	| "Changes"
+	| "Commit file"
+	| "Commit"
+	| "Details"
+	| "Files"
+	| "Global"
+	| "Outline"
+	| "Operation mode"
+	| "Panels"
+	| "Rename branch"
+	| "Reword commit"
+	| "Stack";

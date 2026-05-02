@@ -1,3 +1,5 @@
+#![expect(deprecated, reason = "calls stack_details_v3")]
+
 use super::*;
 use crate::util::test_ctx;
 
@@ -27,16 +29,10 @@ fn can_apply_to_foo_stack() -> anyhow::Result<()> {
         .rev_parse_single("refs/gitbutler/clean-commit")?
         .detach();
 
-    let foo_id = test_ctx
-        .handle
-        .list_stacks_in_workspace()?
-        .iter()
-        .find(|s| s.name() == "foo")
-        .unwrap()
-        .id;
+    drop(repo);
+    let foo_id = test_ctx.stack_id("foo")?;
 
     // Apply should succeed
-    drop(repo);
     test_ctx.apply(commit_id, foo_id)?;
 
     // Verify the commit is now in the foo stack by checking for its message
@@ -47,8 +43,7 @@ fn can_apply_to_foo_stack() -> anyhow::Result<()> {
             .join("virtual_branches.toml"),
     )?;
     let repo = test_ctx.ctx.repo.get()?;
-    let mut cache = test_ctx.ctx.cache.get_cache_mut()?;
-    let details = stack_details_v3(Some(foo_id), &repo, &meta, &mut cache)?;
+    let details = stack_details_v3(Some(foo_id), &repo, &meta)?;
 
     let has_commit = details
         .branch_details
@@ -78,16 +73,10 @@ fn can_apply_to_bar_stack() -> anyhow::Result<()> {
         .rev_parse_single("refs/gitbutler/clean-commit")?
         .detach();
 
-    let bar_id = test_ctx
-        .handle
-        .list_stacks_in_workspace()?
-        .iter()
-        .find(|s| s.name() == "bar")
-        .unwrap()
-        .id;
+    drop(repo);
+    let bar_id = test_ctx.stack_id("bar")?;
 
     // Apply should succeed
-    drop(repo);
     test_ctx.apply(commit_id, bar_id)?;
 
     // Verify the commit is now in the bar stack by checking for its message
@@ -98,8 +87,7 @@ fn can_apply_to_bar_stack() -> anyhow::Result<()> {
             .join("virtual_branches.toml"),
     )?;
     let repo = test_ctx.ctx.repo.get()?;
-    let mut cache = test_ctx.ctx.cache.get_cache_mut()?;
-    let details = stack_details_v3(Some(bar_id), &repo, &meta, &mut cache)?;
+    let details = stack_details_v3(Some(bar_id), &repo, &meta)?;
 
     let has_commit = details
         .branch_details

@@ -15,9 +15,13 @@ export default defineConfig({
 			},
 		}),
 	],
+	base: "./",
 	build: {
 		outDir: "../dist/ui",
 		emptyOutDir: true,
+	},
+	worker: {
+		format: "es",
 	},
 	server: {
 		port: 5173,

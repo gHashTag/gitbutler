@@ -1,20 +1,22 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use anyhow::Context as _;
 use assignment::FileAssignment;
 use bstr::{BStr, BString, ByteSlice};
 use but_api::diff::ComputeLineStats;
 use but_core::{RepositoryExt, TreeStatus, ui};
 use but_ctx::Context;
 use but_forge::ForgeReview;
-use but_workspace::{ref_info::LocalCommitRelation, ui::PushStatus};
+use but_graph::SegmentIndex;
+use but_workspace::{
+    ref_info::{Commit, LocalCommit, LocalCommitRelation, Segment},
+    ui::PushStatus,
+};
 use gitbutler_branch_actions::upstream_integration::BranchStatus as UpstreamBranchStatus;
 use gitbutler_operating_modes::OperatingMode;
 use gitbutler_stack::StackId;
 use gix::date::time::CustomFormat;
-use ratatui::{
-    style::{Modifier, Style},
-    text::Span,
-};
+use ratatui::{style::Modifier, text::Span};
 use serde::Serialize;
 
 use crate::{
@@ -24,6 +26,7 @@ use crate::{
         status::output::{
             BranchLineContent, CommitLineContent, FileLineContent, StatusOutput, StatusOutputLine,
         },
+        workspace_target,
     },
     id::{SegmentWithId, ShortId, StackWithId, TreeChangeWithId},
     tui::text::truncate_text,
@@ -61,6 +64,16 @@ impl StatusFlags {
             hint: false,
         }
     }
+
+    pub fn for_tui() -> Self {
+        Self {
+            show_files: FilesStatusFlag::None,
+            verbose: false,
+            refresh_prs: false,
+            show_upstream: false,
+            hint: false,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -82,6 +95,7 @@ impl FilesStatusFlag {
         }
     }
 
+    #[expect(dead_code)]
     pub fn is_none(self) -> bool {
         matches!(self, Self::None)
     }
@@ -156,6 +170,9 @@ struct StatusContext<'a> {
     is_paged: bool,
     should_truncate_for_terminal: bool,
     id_map: IdMap,
+    push_statuses_by_segment_id: HashMap<SegmentIndex, but_workspace::ui::PushStatus>,
+    local_commits_by_id: HashMap<gix::ObjectId, LocalCommit>,
+    remote_commits_by_id: HashMap<gix::ObjectId, Commit>,
     base_branch: Option<gitbutler_branch_actions::BaseBranch>,
     mode: &'a gitbutler_operating_modes::OperatingMode,
 }
@@ -231,23 +248,57 @@ async fn build_status_context<'a>(
     render_mode: StatusRenderMode,
 ) -> anyhow::Result<StatusContext<'a>> {
     // Process rules with exclusive access to create repo and workspace
-    let head_info = {
+    let (
+        push_statuses_by_segment_id,
+        local_commits_by_id,
+        remote_commits_by_id,
+        stacks,
+        resolved_target,
+    ) = {
         let mut guard = ctx.exclusive_worktree_access();
         but_rules::process_rules(ctx, guard.write_permission()).ok(); // TODO: this is doing double work (hunk-dependencies can be reused)
 
         // TODO: use this for JSON status information (regular status information
         //       already uses this)
         let meta = ctx.meta()?;
-        let mut cache = ctx.cache.get_cache_mut()?;
-        but_workspace::head_info(
+        let head_info = but_workspace::head_info(
             &*ctx.repo.get()?,
             &meta,
             but_workspace::ref_info::Options {
                 expensive_commit_info: true,
                 ..Default::default()
             },
-            &mut cache,
-        )?
+        )?;
+        let mut push_statuses_by_segment_id = HashMap::<SegmentIndex, PushStatus>::new();
+        let mut local_commits_by_id = HashMap::<gix::ObjectId, LocalCommit>::new();
+        let mut remote_commits_by_id = HashMap::<gix::ObjectId, Commit>::new();
+        for stack in head_info.stacks {
+            for segment in stack.segments {
+                let Segment {
+                    commits,
+                    commits_on_remote,
+                    push_status,
+                    ..
+                } = segment;
+                for local_commit in commits {
+                    local_commits_by_id.insert(local_commit.id, local_commit);
+                }
+                for remote_commit in commits_on_remote {
+                    remote_commits_by_id.insert(remote_commit.id, remote_commit);
+                }
+                push_statuses_by_segment_id.insert(segment.id, push_status);
+            }
+        }
+
+        let (_repo, ws, _db) = ctx.workspace_and_db_with_perm(guard.read_permission())?;
+        let resolved_target = workspace_target::ResolvedTarget::from_workspace(&ws)?;
+        (
+            push_statuses_by_segment_id,
+            local_commits_by_id,
+            remote_commits_by_id,
+            ws.stacks.clone(),
+            resolved_target,
+        )
     };
 
     let cache_config = if flags.refresh_prs {
@@ -259,7 +310,7 @@ async fn build_status_context<'a>(
 
     let worktree_changes = but_api::diff::changes_in_worktree(ctx)?;
 
-    let id_map = IdMap::new(head_info.stacks, worktree_changes.assignments.clone())?;
+    let id_map = IdMap::new(stacks, worktree_changes.assignments.clone())?;
 
     let stacks = id_map.stacks();
     // Store the count of stacks for hint logic later
@@ -276,16 +327,23 @@ async fn build_status_context<'a>(
         let assignments = assignment::filter_by_stack_id(assignments_by_file.values(), &stack.id);
         stack_details.push((stack.id, (Some(stack.clone()), assignments)));
     }
-    let ci_map = ci_map(ctx, &cache_config, &stack_details)?;
+    let ci_map = ci_map(
+        ctx,
+        &cache_config,
+        &stack_details,
+        &push_statuses_by_segment_id,
+    )?;
 
     // Calculate common_merge_base data and upstream state in a scope
     // to ensure repo reference is dropped before any async operations
     let (common_merge_base_data, upstream_state, last_fetched_ms, base_branch) = {
-        let stack = gitbutler_stack::VirtualBranchesHandle::new(ctx.project_data_dir());
-        let target = stack.get_default_target()?;
-        let target_name = format!("{}/{}", target.branch.remote(), target.branch.branch());
+        let base_branch = but_api::legacy::virtual_branches::get_base_branch_data(ctx)
+            .ok()
+            .flatten();
+        let status_target = resolved_target.for_status(base_branch.as_ref());
         let repo = ctx.repo.get()?;
-        let base_commit = repo.find_commit(target.sha)?;
+        let target_commit_id = status_target.commit_id;
+        let base_commit = repo.find_commit(target_commit_id)?;
         let base_commit_decoded = base_commit.decode()?;
         let full_message = base_commit_decoded.message.to_string();
         let formatted_date = base_commit_decoded
@@ -294,62 +352,60 @@ async fn build_status_context<'a>(
             .format_or_unix(DATE_ONLY);
         let author = base_commit_decoded.author()?;
         let common_merge_base_data = CommonMergeBase {
-            target_name: target_name.clone(),
-            common_merge_base: shorten_object_id(&repo, target.sha),
+            target_name: status_target.display_name,
+            common_merge_base: shorten_object_id(&repo, target_commit_id),
             message: full_message,
             commit_date: formatted_date,
-            commit_id: target.sha,
+            commit_id: target_commit_id,
             created_at: base_commit_decoded.committer()?.time()?.seconds as i128 * 1000,
             author_name: author.name.to_string(),
             author_email: author.email.to_string(),
         };
 
         // Get cached upstream state information (without fetching)
-        let (upstream_state, last_fetched_ms, base_branch) =
-            but_api::legacy::virtual_branches::get_base_branch_data(ctx)
-                .ok()
-                .flatten()
-                .map(|base_branch| {
-                    let last_fetched = base_branch.last_fetched_ms;
-                    let state = if base_branch.behind > 0 {
-                        // Get the latest commit on the upstream branch (current_sha is the tip of the remote branch)
-                        let commit_id = base_branch.current_sha;
-                        repo.find_commit(commit_id).ok().and_then(|commit_obj| {
-                            let commit = commit_obj.decode().ok()?;
-                            let message = out.truncate_if_unpaged(
-                                &commit.message.to_string().replace('\n', " "),
-                                30,
-                            );
+        let (upstream_state, last_fetched_ms) = base_branch
+            .as_ref()
+            .map(|base_branch| {
+                let last_fetched = base_branch.last_fetched_ms;
+                let state = if base_branch.behind > 0 {
+                    // Get the latest commit on the upstream branch (current_sha is the tip of the remote branch)
+                    let commit_id = base_branch.current_sha;
+                    repo.find_commit(commit_id).ok().and_then(|commit_obj| {
+                        let commit = commit_obj.decode().ok()?;
+                        let message = out.truncate_if_unpaged(
+                            &commit.message.to_string().replace('\n', " "),
+                            30,
+                        );
 
-                            let formatted_date = commit
-                                .committer()
-                                .ok()?
-                                .time()
-                                .ok()?
-                                .format_or_unix(DATE_ONLY);
+                        let formatted_date = commit
+                            .committer()
+                            .ok()?
+                            .time()
+                            .ok()?
+                            .format_or_unix(DATE_ONLY);
 
-                            let author = commit.author().ok()?;
+                        let author = commit.author().ok()?;
 
-                            Some(UpstreamState {
-                                target_name: base_branch.branch_name.clone(),
-                                behind_count: base_branch.behind,
-                                latest_commit: shorten_object_id(&repo, commit_id),
-                                message,
-                                commit_date: formatted_date,
-                                last_fetched_ms: last_fetched,
-                                commit_id,
-                                created_at: commit.committer().ok()?.time().ok()?.seconds as i128
-                                    * 1000,
-                                author_name: author.name.to_string(),
-                                author_email: author.email.to_string(),
-                            })
+                        Some(UpstreamState {
+                            target_name: base_branch.branch_name.clone(),
+                            behind_count: base_branch.behind,
+                            latest_commit: shorten_object_id(&repo, commit_id),
+                            message,
+                            commit_date: formatted_date,
+                            last_fetched_ms: last_fetched,
+                            commit_id,
+                            created_at: commit.committer().ok()?.time().ok()?.seconds as i128
+                                * 1000,
+                            author_name: author.name.to_string(),
+                            author_email: author.email.to_string(),
                         })
-                    } else {
-                        None
-                    };
-                    (state, last_fetched, Some(base_branch))
-                })
-                .unwrap_or((None, None, None));
+                    })
+                } else {
+                    None
+                };
+                (state, last_fetched)
+            })
+            .unwrap_or((None, None));
 
         // repo, base_commit, and base_commit_decoded are automatically dropped here at end of scope
         (
@@ -386,6 +442,9 @@ async fn build_status_context<'a>(
         is_paged,
         should_truncate_for_terminal,
         id_map,
+        push_statuses_by_segment_id,
+        local_commits_by_id,
+        remote_commits_by_id,
         base_branch,
         mode,
     })
@@ -479,7 +538,10 @@ fn print_hint(
         "Hint: run `but help` for all commands"
     };
 
-    output.hint(Vec::from([Span::styled(hint_text, Style::default().dim())]))?;
+    output.hint(Vec::from([Span::styled(
+        hint_text,
+        crate::theme::get().hint,
+    )]))?;
 
     Ok(())
 }
@@ -507,7 +569,8 @@ fn print_upstream_state(
             .unwrap_or_default()
     };
 
-    let dot = Span::styled("●", Style::default().yellow());
+    let t = crate::theme::get();
+    let dot = Span::styled("●", t.success);
 
     if status_ctx.flags.show_upstream {
         // When showing detailed commits, only show count in summary
@@ -517,10 +580,7 @@ fn print_upstream_state(
         ))]);
         if !last_checked_text.is_empty() {
             upstream_summary.push(Span::raw(" "));
-            upstream_summary.push(Span::styled(
-                last_checked_text.clone(),
-                Style::default().dim(),
-            ));
+            upstream_summary.push(Span::styled(last_checked_text.clone(), t.hint));
         }
         output.upstream_changes(Vec::from([Span::raw("┊╭┄")]), upstream_summary)?;
 
@@ -541,9 +601,9 @@ fn print_upstream_state(
                     Vec::from([
                         dot.clone(),
                         Span::raw(" "),
-                        Span::styled(commit_short, Style::default().yellow()),
+                        Span::styled(commit_short, t.commit_id),
                         Span::raw(" "),
-                        Span::styled(truncated_msg, Style::default().dim()),
+                        Span::styled(truncated_msg, t.hint),
                     ]),
                 )?;
             }
@@ -551,10 +611,7 @@ fn print_upstream_state(
             if hidden_commits > 0 {
                 output.upstream_changes(
                     Vec::from([Span::raw("┊    ")]),
-                    Vec::from([Span::styled(
-                        format!("and {hidden_commits} more…"),
-                        Style::default().dim(),
-                    )]),
+                    Vec::from([Span::styled(format!("and {hidden_commits} more…"), t.hint)]),
                 )?;
             }
         }
@@ -562,7 +619,7 @@ fn print_upstream_state(
     } else {
         // Without --upstream, show the summary with latest commit info
         let mut upstream_summary = Vec::from([
-            Span::styled(upstream.latest_commit.clone(), Style::default().dim()),
+            Span::styled(upstream.latest_commit.clone(), t.hint),
             Span::raw(format!(
                 " (upstream) ⏫ {} new commits",
                 upstream.behind_count
@@ -570,7 +627,7 @@ fn print_upstream_state(
         ]);
         if !last_checked_text.is_empty() {
             upstream_summary.push(Span::raw(" "));
-            upstream_summary.push(Span::styled(last_checked_text, Style::default().dim()));
+            upstream_summary.push(Span::styled(last_checked_text, t.hint));
         }
         output.upstream_changes(
             Vec::from([Span::raw("┊"), dot, Span::raw(" ")]),
@@ -597,23 +654,24 @@ fn print_common_merge_base_summary(
     } else {
         "┴"
     };
+    let t = crate::theme::get();
     let first_line = truncate_when_needed(first_line, 40, status_ctx.should_truncate_for_terminal);
     output.merge_base(
         Vec::from([Span::raw(connector), Span::raw(" ")]),
         Vec::from([
             Span::styled(
                 status_ctx.common_merge_base_data.common_merge_base.clone(),
-                Style::default().dim(),
+                t.hint,
             ),
             Span::raw(" ["),
             Span::styled(
                 status_ctx.common_merge_base_data.target_name.clone(),
-                Style::default().green().bold(),
+                t.remote_branch,
             ),
             Span::raw("] "),
             Span::styled(
                 status_ctx.common_merge_base_data.commit_date.clone(),
-                Style::default().dim(),
+                t.hint,
             ),
             Span::raw(" "),
             Span::raw(first_line.to_string()),
@@ -632,7 +690,7 @@ fn print_worktree_status(
     {
         let mut stack_mark = stack_id.and_then(|stack_id| {
             if crate::command::legacy::mark::stack_marked(ctx, stack_id).unwrap_or_default() {
-                Some(Span::styled("◀ Marked ▶", Style::default().red().bold()))
+                Some(Span::styled("◀ Marked ▶", crate::theme::get().attention))
             } else {
                 None
             }
@@ -671,16 +729,21 @@ fn print_worktree_status(
 }
 
 fn ci_map(
-    ctx: &mut Context,
+    ctx: &Context,
     cache_config: &but_forge::CacheConfig,
     stack_details: &[StackEntry],
+    push_statuses_by_segment_id: &HashMap<SegmentIndex, PushStatus>,
 ) -> Result<BTreeMap<String, Vec<but_forge::CiCheck>>, anyhow::Error> {
     let mut ci_map = BTreeMap::new();
     for (_, (stack_with_id, _)) in stack_details {
         if let Some(stack_with_id) = stack_with_id {
             for segment in &stack_with_id.segments {
+                let push_status = push_statuses_by_segment_id.get(&segment.inner.id);
+                if push_status.is_none() {
+                    eprintln!("warning: head_info does not contain segment that graph has");
+                }
                 if segment.pr_number().is_some()
-                    && !matches!(segment.inner.push_status, PushStatus::Integrated)
+                    && !matches!(push_status, Some(PushStatus::Integrated))
                     && let Some(branch_name) = segment.branch_name()
                     && let Ok(checks) = but_api::legacy::forge::list_ci_checks_and_update_cache(
                         ctx,
@@ -705,28 +768,26 @@ fn print_assignments(
     unstaged: bool,
     output: &mut StatusOutput<'_>,
 ) -> anyhow::Result<()> {
-    // if there are no assignments and we're in the unstaged section, print "(no changes)" and return
-    if assignments.is_empty() && unstaged {
-        output.no_assignments_unstaged(
-            Vec::from([Span::raw("┊     ")]),
-            Vec::from([Span::styled("no changes", Style::default().dim().italic())]),
-        )?;
-        return Ok(());
-    }
-
+    let t = crate::theme::get();
     let id = stack
         .and_then(|s| status_ctx.id_map.resolve_stack(s))
-        .map(|s| Span::styled(s.to_short_string(), Style::default().bold().blue()))
+        .map(|s| Span::styled(s.to_short_string(), t.cli_id))
         .unwrap_or_default();
 
-    if !unstaged && !assignments.is_empty() {
-        let staged_changes_cli_id = stack
-            .and_then(|stack_id| status_ctx.id_map.resolve_stack(stack_id).cloned())
-            .ok_or_else(|| anyhow::anyhow!("Could not resolve stack CLI id for staged changes"))?;
+    if let Some(stack) = stack
+        && (!unstaged && !assignments.is_empty())
+    {
+        let staged_changes_cli_id = status_ctx
+            .id_map
+            .resolve_stack(stack)
+            .cloned()
+            .with_context(|| {
+                format!("Could not resolve stack CLI id for staged changes. stack_id={stack:?}")
+            })?;
 
         output.staged_changes(
             Vec::from([Span::raw("┊  ╭┄")]),
-            Vec::from([
+            [
                 id,
                 Span::raw(" ["),
                 Span::styled(
@@ -734,10 +795,19 @@ fn print_assignments(
                         .as_ref()
                         .map(|name| format!("staged to {name}"))
                         .unwrap_or_else(|| "staged to ".to_string()),
-                    Style::default().cyan().bold(),
+                    t.info,
                 ),
                 Span::raw("]"),
-            ]),
+            ]
+            .into_iter()
+            .chain(
+                assignments
+                    .is_empty()
+                    .then(|| [Span::raw(" "), Span::styled("(no changes)", t.hint)])
+                    .into_iter()
+                    .flatten(),
+            )
+            .collect(),
             staged_changes_cli_id,
         )?;
     }
@@ -773,7 +843,7 @@ fn print_assignments(
         let file_line = FileLineContent {
             id: Vec::from([
                 Span::raw(id_padding.clone()),
-                Span::styled(cli_id.to_string(), Style::default().bold().blue()),
+                Span::styled(cli_id.to_string(), t.cli_id),
                 Span::raw(" "),
             ]),
             status: Vec::from([Span::raw(status.to_string()), Span::raw(" ")]),
@@ -803,6 +873,7 @@ fn print_group(
     first: bool,
     output: &mut StatusOutput<'_>,
 ) -> anyhow::Result<()> {
+    let t = crate::theme::get();
     let repo = ctx
         .legacy_project
         .open_isolated_repo()?
@@ -864,16 +935,16 @@ fn print_group(
                         .get(&branch_name.to_string())
                 })
                 .map(|status| match status {
-                    UpstreamBranchStatus::SaflyUpdatable => {
-                        Span::styled(" [✓ upstream merges cleanly]", Style::default().blue())
+                    UpstreamBranchStatus::SafelyUpdatable => {
+                        Span::styled(" [✓ upstream merges cleanly]", t.success)
                     }
                     UpstreamBranchStatus::Integrated => {
-                        Span::styled(" [⬆ integrated upstream]", Style::default().magenta())
+                        Span::styled(" [⬆ integrated upstream]", t.remote_branch)
                     }
                     UpstreamBranchStatus::Conflicted { .. } => {
-                        Span::styled(" [⚠ upstream conflicts]", Style::default().red())
+                        Span::styled(" [⚠ upstream conflicts]", t.error)
                     }
-                    UpstreamBranchStatus::Empty => Span::styled(" ○ empty", Style::default().dim()),
+                    UpstreamBranchStatus::Empty => Span::styled(" ○ empty", t.hint),
                 })
                 .unwrap_or(Span::raw(""));
 
@@ -906,7 +977,7 @@ fn print_group(
             branch_suffix.extend(review_spans);
             if !no_commits.is_empty() {
                 branch_suffix.push(Span::raw(" "));
-                branch_suffix.push(Span::styled(no_commits, Style::default().dim().italic()));
+                branch_suffix.push(Span::styled(no_commits, t.hint));
             }
             if let Some(stack_mark) = stack_mark.as_ref().cloned() {
                 branch_suffix.push(Span::raw(" "));
@@ -916,13 +987,10 @@ fn print_group(
             output.branch(
                 Vec::from([Span::raw(format!("┊{notch}┄"))]),
                 BranchLineContent {
-                    id: Vec::from([Span::styled(
-                        segment.short_id.clone(),
-                        Style::default().blue().bold(),
-                    )]),
+                    id: Vec::from([Span::styled(segment.short_id.clone(), t.cli_id)]),
                     decoration_start: Vec::from([Span::raw(" [")]),
                     branch_name: Vec::from([
-                        Span::styled(branch, Style::default().green().bold()),
+                        Span::styled(branch, t.local_branch),
                         Span::raw(workspace),
                     ]),
                     decoration_end: Vec::from([Span::raw("]")]),
@@ -946,11 +1014,17 @@ fn print_group(
                     Vec::from([Span::raw("┊╭┄┄")]),
                     Vec::from([Span::styled(
                         format!("(upstream: on {})", BStr::new(tracking_branch)),
-                        Style::default().yellow(),
+                        t.attention,
                     )]),
                 )?;
             }
+            let mut remote_commit_printed = false;
             for commit in &segment.remote_commits {
+                let Some(inner) = status_ctx.remote_commits_by_id.get(&commit.commit_id()) else {
+                    // This was filtered out because there is a corresponding
+                    // local commit, so don't show it.
+                    continue;
+                };
                 let details =
                     but_api::diff::commit_details(ctx, commit.commit_id(), ComputeLineStats::No)?;
                 print_commit(
@@ -958,24 +1032,29 @@ fn print_group(
                     status_ctx,
                     stack_with_id.id,
                     commit.short_id.clone(),
-                    &commit.inner,
+                    inner,
                     CommitChanges::Remote(&details.diff_with_first_parent),
                     CommitClassification::Upstream,
                     false,
                     None,
                     output,
                 )?;
+                remote_commit_printed = true;
             }
-            if !segment.remote_commits.is_empty() {
+            if remote_commit_printed {
                 output.connector(Vec::from([Span::raw("┊-")]))?;
             }
             for commit in segment.workspace_commits.iter() {
+                let inner = status_ctx
+                    .local_commits_by_id
+                    .get(&commit.commit_id())
+                    .context("BUG: head_info does not contain local commit that graph has")?;
                 let marked = crate::command::legacy::mark::commit_marked(
                     ctx,
                     commit.commit_id().to_string(),
                 )
                 .unwrap_or_default();
-                let classification = match commit.relation() {
+                let classification = match inner.relation {
                     LocalCommitRelation::LocalOnly => CommitClassification::LocalOnly,
                     LocalCommitRelation::LocalAndRemote(object_id) => {
                         if object_id == commit.commit_id() {
@@ -992,7 +1071,7 @@ fn print_group(
                     status_ctx,
                     stack_with_id.id,
                     commit.short_id.clone(),
-                    &commit.inner.inner,
+                    &inner.inner,
                     CommitChanges::Workspace(&commit.tree_changes_using_repo(&repo)?),
                     classification,
                     marked,
@@ -1007,20 +1086,21 @@ fn print_group(
     } else {
         let cli_id = status_ctx.id_map.unassigned();
         let mut line = Vec::from([
-            Span::styled(
-                cli_id.to_short_string().to_string(),
-                Style::default().bold().blue(),
-            ),
+            Span::styled(cli_id.to_short_string().to_string(), t.cli_id),
             Span::raw(" ["),
-            Span::styled("unstaged changes", Style::default().bold().cyan()),
+            Span::styled("unassigned changes", t.info),
             Span::raw("]"),
         ]);
+        if assignments.is_empty() {
+            line.extend([Span::raw(" "), Span::styled("(no changes)", t.hint)]);
+        }
         if let Some(stack_mark) = stack_mark {
-            line.push(Span::raw(" "));
-            line.push(stack_mark.clone());
+            line.extend([Span::raw(" "), stack_mark.clone()]);
         }
         output.unstaged_changes(Vec::from([Span::raw("╭┄")]), line, cli_id.clone())?;
-        print_assignments(&repo, status_ctx, None, None, assignments, true, output)?;
+        if !assignments.is_empty() {
+            print_assignments(&repo, status_ctx, None, None, assignments, true, output)?;
+        }
     }
     if !first {
         output.connector(Vec::from([Span::raw("├╯")]))?;
@@ -1069,20 +1149,22 @@ pub fn status_letter_ui(status: &ui::TreeStatus) -> char {
 }
 
 pub fn path_with_color_ui(status: &ui::TreeStatus, path: String) -> Span<'static> {
+    let t = crate::theme::get();
     match status {
-        ui::TreeStatus::Addition { .. } => Span::styled(path, Style::default().green()),
-        ui::TreeStatus::Deletion { .. } => Span::styled(path, Style::default().red()),
-        ui::TreeStatus::Modification { .. } => Span::styled(path, Style::default().yellow()),
-        ui::TreeStatus::Rename { .. } => Span::styled(path, Style::default().magenta()),
+        ui::TreeStatus::Addition { .. } => Span::styled(path, t.addition),
+        ui::TreeStatus::Deletion { .. } => Span::styled(path, t.deletion),
+        ui::TreeStatus::Modification { .. } => Span::styled(path, t.modification),
+        ui::TreeStatus::Rename { .. } => Span::styled(path, t.renaming),
     }
 }
 
 fn path_with_color(status: &TreeStatus, path: String) -> Span<'static> {
+    let t = crate::theme::get();
     match status {
-        TreeStatus::Addition { .. } => Span::styled(path, Style::default().green()),
-        TreeStatus::Deletion { .. } => Span::styled(path, Style::default().red()),
-        TreeStatus::Modification { .. } => Span::styled(path, Style::default().yellow()),
-        TreeStatus::Rename { .. } => Span::styled(path, Style::default().magenta()),
+        TreeStatus::Addition { .. } => Span::styled(path, t.addition),
+        TreeStatus::Deletion { .. } => Span::styled(path, t.deletion),
+        TreeStatus::Modification { .. } => Span::styled(path, t.modification),
+        TreeStatus::Rename { .. } => Span::styled(path, t.renaming),
     }
 }
 
@@ -1114,12 +1196,13 @@ fn print_commit(
     review_url: Option<String>,
     output: &mut StatusOutput<'_>,
 ) -> anyhow::Result<()> {
+    let t = crate::theme::get();
     let dot = match classification {
-        CommitClassification::Upstream => Span::styled("●", Style::default().yellow()),
+        CommitClassification::Upstream => Span::styled("●", t.attention),
         CommitClassification::LocalOnly => Span::raw("●"),
-        CommitClassification::Pushed => Span::styled("●", Style::default().green()),
-        CommitClassification::Modified => Span::styled("◐", Style::default().green()),
-        CommitClassification::Integrated => Span::styled("●", Style::default().magenta()),
+        CommitClassification::Pushed => Span::styled("●", t.success),
+        CommitClassification::Modified => Span::styled("◐", t.success),
+        CommitClassification::Integrated => Span::styled("●", t.remote_branch),
     };
 
     let upstream_commit = matches!(commit_changes, CommitChanges::Remote(_));
@@ -1163,21 +1246,13 @@ fn print_commit(
                         [
                             Span::raw(" "),
                             Span::raw("◖"),
-                            Span::styled(
-                                review_url.to_owned(),
-                                Style::default().underlined().blue(),
-                            ),
+                            Span::styled(review_url.to_owned(), t.link),
                             Span::raw("◗"),
                         ]
                     }))
                     .chain(
                         marked
-                            .then(|| {
-                                [
-                                    Span::raw(" "),
-                                    Span::styled("◀ Marked ▶", Style::default().red().bold()),
-                                ]
-                            })
+                            .then(|| [Span::raw(" "), Span::styled("◀ Marked ▶", t.attention)])
                             .into_iter()
                             .flatten(),
                     )
@@ -1193,7 +1268,7 @@ fn print_commit(
             status_ctx.is_paged,
             |truncated| {
                 if upstream_commit {
-                    Span::styled(truncated, Style::default().dim())
+                    Span::styled(truncated, t.hint)
                 } else {
                     Span::raw(truncated)
                 }
@@ -1219,21 +1294,13 @@ fn print_commit(
                         [
                             Span::raw(" "),
                             Span::raw("◖"),
-                            Span::styled(
-                                review_url.to_owned(),
-                                Style::default().underlined().blue(),
-                            ),
+                            Span::styled(review_url.to_owned(), t.link),
                             Span::raw("◗"),
                         ]
                     }))
                     .chain(
                         marked
-                            .then(|| {
-                                [
-                                    Span::raw(" "),
-                                    Span::styled("◀ Marked ▶", Style::default().red().bold()),
-                                ]
-                            })
+                            .then(|| [Span::raw(" "), Span::styled("◀ Marked ▶", t.attention)])
                             .into_iter()
                             .flatten(),
                     )
@@ -1259,7 +1326,7 @@ fn print_commit(
                         Vec::from([Span::raw("┊│     ")]),
                         FileLineContent {
                             id: Vec::from([
-                                Span::styled(short_id.to_owned(), Style::default().blue().bold()),
+                                Span::styled(short_id.to_owned(), t.cli_id),
                                 Span::raw(" "),
                             ]),
                             status: Vec::from([status]),
@@ -1321,6 +1388,7 @@ fn display_cli_commit_details(
     verbose: bool,
     is_paged: bool,
 ) -> (CommitLineContent, bool) {
+    let t = crate::theme::get();
     let commit_id_short = shorten_object_id(repo, commit.id);
     let end_id = if short_id.len() >= commit_id_short.len() {
         Span::raw("")
@@ -1330,22 +1398,19 @@ fn display_cli_commit_details(
                 .get(short_id.len()..commit_id_short.len())
                 .unwrap_or("")
                 .to_string(),
-            Style::default().dim(),
+            t.hint,
         )
     };
-    let start_id = Span::styled(short_id.to_string(), Style::default().blue().bold());
+    let start_id = Span::styled(short_id.to_string(), t.cli_id);
 
     let no_changes = if has_changes {
         None
     } else {
-        Some(Span::styled(
-            "(no changes)",
-            Style::default().dim().italic(),
-        ))
+        Some(Span::styled("(no changes)", t.hint))
     };
 
     let conflicted = if commit.has_conflicts {
-        Some(Span::styled("{conflicted}", Style::default().red()))
+        Some(Span::styled("{conflicted}", t.error))
     } else {
         None
     };
@@ -1360,12 +1425,9 @@ fn display_cli_commit_details(
                 author: Vec::from_iter([Span::raw(" "), Span::raw(commit.author.name.to_string())]),
                 message: Vec::new(),
                 suffix: Vec::from_iter(
-                    [
-                        Span::raw(" "),
-                        Span::styled(formatted_time, Style::default().dim()),
-                    ]
-                    .into_iter()
-                    .chain(maybe_with_leading_space(no_changes, conflicted)),
+                    [Span::raw(" "), Span::styled(formatted_time, t.hint)]
+                        .into_iter()
+                        .chain(maybe_with_leading_space(no_changes, conflicted)),
                 ),
             },
             false,
@@ -1463,7 +1525,7 @@ fn commit_message_display_cli(
 
     if text.is_empty() {
         (
-            Span::styled("(no commit message)", Style::default().dim().italic()),
+            Span::styled("(no commit message)", crate::theme::get().hint),
             true,
         )
     } else if is_paged {
@@ -1492,15 +1554,13 @@ impl CliDisplay for ForgeReview {
         verbose: bool,
         should_truncate_for_terminal: bool,
     ) -> impl IntoIterator<Item = Span<'static>> {
+        let t = crate::theme::get();
         if verbose {
             Vec::from([
                 Span::raw("#"),
-                Span::styled(self.number.to_string(), Style::default().bold()),
+                Span::styled(self.number.to_string(), t.important),
                 Span::raw(": "),
-                Span::styled(
-                    self.html_url.to_string(),
-                    Style::default().underlined().blue(),
-                ),
+                Span::styled(self.html_url.to_string(), t.link),
             ])
         } else {
             let trimmed: String = self
@@ -1510,7 +1570,7 @@ impl CliDisplay for ForgeReview {
             let title = truncate_when_needed(&trimmed, 50, should_truncate_for_terminal);
             Vec::from([
                 Span::raw("#"),
-                Span::styled(self.number.to_string(), Style::default().bold()),
+                Span::styled(self.number.to_string(), t.important),
                 Span::raw(": "),
                 Span::raw(title),
             ])
@@ -1588,6 +1648,7 @@ impl CliDisplay for but_update::AvailableUpdate {
         verbose: bool,
         _should_truncate_for_terminal: bool,
     ) -> impl IntoIterator<Item = Span<'static>> {
+        let t = crate::theme::get();
         let upgrade_hint = {
             #[cfg(feature = "packaged-but-distribution")]
             {
@@ -1601,27 +1662,21 @@ impl CliDisplay for but_update::AvailableUpdate {
 
         let mut spans = Vec::from([
             Span::raw("Update available: "),
-            Span::styled(self.current_version.to_string(), Style::default().dim()),
+            Span::styled(self.current_version.to_string(), t.hint),
             Span::raw(" → "),
-            Span::styled(
-                self.available_version.to_string(),
-                Style::default().green().bold(),
-            ),
+            Span::styled(self.available_version.to_string(), t.attention),
         ]);
 
         if verbose {
             if let Some(url) = &self.url {
                 spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    url.to_string(),
-                    Style::default().underlined().blue(),
-                ));
+                spans.push(Span::styled(url.to_string(), t.link));
             }
         } else {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!("({upgrade_hint} or `but update suppress` to dismiss)"),
-                Style::default().dim(),
+                t.hint,
             ));
         }
 

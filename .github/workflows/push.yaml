@@ -92,27 +92,6 @@ jobs:
       - uses: ./.github/actions/init-env-node
       - run: pnpm prettier
 
-  generate-ts-definitions:
-    needs: changes
-    if: ${{ needs.changes.outputs.node == 'true' || needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          shared-key: ts-def-gen
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      # Node is needed for the formatting of typescript files.
-      - uses: ./.github/actions/init-env-node
-      - name: Dependencies for 'keyring'
-        run: sudo ./scripts/install-minimal-debian-dependencies.sh
-      - run: ./scripts/generate-ts-definitions-from-rust.sh
-
   lint-node:
     needs: changes
     if: ${{ needs.changes.outputs.node == 'true' }}
@@ -145,9 +124,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/init-env-node
       - id: get_playwright_version
-        uses: eviden-actions/get-playwright-version@4ab3bd9361d018d7931275b5106f2290fa54cfb6 # v1
+        uses: eviden-actions/get-playwright-version@dbf7574765e85d04661ac1717f3cb8a99474ffd7 # v1
       - name: Cache playwright binaries
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         id: playwright-cache
         with:
           path: |
@@ -168,7 +147,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Cache apt archives
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
           path: .apt-cache
           key: ${{ runner.os }}-apt-but-sdk-${{ hashFiles('scripts/install-minimal-debian-dependencies.sh') }}
@@ -184,6 +163,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Build but-sdk
         run: pnpm --filter @gitbutler/but-sdk build
+      - name: Verify generated types are up-to-date
+        run: ./scripts/generate-sdk-types.sh
       - name: Check but-sdk
         run: pnpm --filter @gitbutler/but-sdk check
 
@@ -255,7 +236,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979 # v2.0.15
+      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
         with:
           command: check bans licenses sources
 
@@ -301,11 +282,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Dependencies for 'keyring'
         run: sudo ./scripts/install-minimal-debian-dependencies.sh
-      - run: cargo test --workspace --exclude gitbutler-tauri --exclude but-server --exclude but-api-macros-tests
+      - run: cargo test --workspace --exclude gitbutler-tauri --exclude but-api-macros-tests
       # It's intentional to use 'name equals run-script' so it's easy to re-run locally on failure.
-      - run: cargo test -p but
       - run: make test-modern-but
-      - run: cargo test -p but-server
       - name: test vendored
         run: |
           set -x
@@ -435,7 +414,7 @@ jobs:
           test -x target/${{matrix.target}}/release/but-installer
           file target/${{matrix.target}}/release/but-installer
       - name: Upload Artifacts
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: "but-installer-${{ matrix.artifact_id }}-${{ github.run_number }}"
           path: target/${{matrix.target}}/release/but-installer
@@ -644,9 +623,9 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/init-env-node
       - id: get_playwright_version
-        uses: eviden-actions/get-playwright-version@4ab3bd9361d018d7931275b5106f2290fa54cfb6 # v1
+        uses: eviden-actions/get-playwright-version@dbf7574765e85d04661ac1717f3cb8a99474ffd7 # v1
       - name: cache playwright binaries
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         id: playwright-cache
         with:
           path: |
@@ -657,7 +636,7 @@ jobs:
       - name: run playwright tests
         run: pnpm test:ct
         if: ${{ github.ref != 'refs/heads/master' }}
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: playwright-report

@@ -12,7 +12,7 @@ use but_api::{
     },
     diff::ComputeLineStats,
 };
-use but_core::DiffSpec;
+use but_core::{DiffSpec, DryRun, diff::CommitDetails};
 use but_ctx::Context;
 use but_rebase::graph_rebase::mutate::{InsertSide, RelativeTo};
 use gitbutler_operating_modes::OperatingMode;
@@ -74,6 +74,7 @@ pub(super) fn create_empty_commit_relative_to_branch(
         ctx,
         RelativeTo::Reference(full_name),
         InsertSide::Below,
+        DryRun::No,
     )
 }
 
@@ -85,6 +86,7 @@ pub(super) fn create_empty_commit_relative_to_commit(
         ctx,
         RelativeTo::Commit(commit_id),
         InsertSide::Above,
+        DryRun::No,
     )
 }
 
@@ -170,28 +172,21 @@ pub(super) fn create_commit_legacy(
         changes_to_commit,
         // we reword the commit with the editor before the next render
         String::new(),
+        DryRun::No,
         guard.write_permission(),
     )
     .context("failed to create commit")
     .map(Some)
 }
 
-pub(super) fn rub_legacy(
-    ctx: &mut Context,
-    out: &mut OutputChannel,
-    operation: RubOperation<'_>,
-) -> anyhow::Result<()> {
-    operation.execute(ctx, out)
-}
-
-pub(super) fn rub_using_but_api(
+pub(super) fn rub(
     ctx: &mut Context,
     operation: &RubOperation<'_>,
 ) -> anyhow::Result<Option<SelectAfterReload>> {
     // `perform_operation` is in a legacy module but it's explicitly written to not use legacy code.
     // When it has reached feature parity with `but rub` it'll be promoted to a non-legacy module.
     // Hence why this function doesn't have the legacy postfix.
-    legacy::status::tui::rub_api::perform_operation(ctx, operation)
+    legacy::status::tui::rub::perform_operation(ctx, operation)
 }
 
 pub(super) fn reword_commit_with_editor_legacy(
@@ -200,11 +195,21 @@ pub(super) fn reword_commit_with_editor_legacy(
 ) -> anyhow::Result<Option<CommitRewordResult>> {
     let commit_details = but_api::diff::commit_details(ctx, commit_id, ComputeLineStats::No)?;
     let current_message = commit_details.commit.inner.message.to_string();
+    reword_commit_with_editor_with_message_legacy(ctx, commit_details, current_message)
+}
 
+pub(super) fn reword_commit_with_editor_with_message_legacy(
+    ctx: &mut Context,
+    commit_details: CommitDetails,
+    editor_initial_message: String,
+) -> anyhow::Result<Option<CommitRewordResult>> {
+    let commit_id = commit_details.commit.id;
+    let current_message = commit_details.commit.inner.message.to_string();
     let new_message = legacy::reword::get_commit_message_from_editor(
         ctx,
         commit_details,
-        current_message.clone(),
+        editor_initial_message,
+        &current_message,
         ShowDiffInEditor::Unspecified,
     )?;
 
@@ -216,9 +221,14 @@ pub(super) fn reword_commit_with_editor_legacy(
         return Ok(None);
     }
 
-    but_api::commit::reword::commit_reword_only(ctx, commit_id, BString::from(new_message))
-        .with_context(|| format!("failed to reword {}", commit_id.to_hex_with_len(7)))
-        .map(Some)
+    but_api::commit::reword::commit_reword_only(
+        ctx,
+        commit_id,
+        BString::from(new_message),
+        DryRun::No,
+    )
+    .with_context(|| format!("failed to reword {}", commit_id.to_hex_with_len(7)))
+    .map(Some)
 }
 
 pub(super) fn current_commit_message(
@@ -233,7 +243,7 @@ pub(super) fn commit_message_has_multiple_lines_legacy(message: &str) -> bool {
     legacy::commit_message_prep::commit_message_has_multiple_lines(message)
 }
 
-pub(super) fn reword_commit_inline_legacy(
+pub(super) fn reword_commit_legacy(
     ctx: &mut Context,
     commit_id: gix::ObjectId,
     new_message: &str,
@@ -247,9 +257,14 @@ pub(super) fn reword_commit_inline_legacy(
         return Ok(None);
     }
 
-    but_api::commit::reword::commit_reword_only(ctx, commit_id, BString::from(new_message))
-        .with_context(|| format!("failed to reword {}", commit_id.to_hex_with_len(7)))
-        .map(Some)
+    but_api::commit::reword::commit_reword_only(
+        ctx,
+        commit_id,
+        BString::from(new_message),
+        DryRun::No,
+    )
+    .with_context(|| format!("failed to reword {}", commit_id.to_hex_with_len(7)))
+    .map(Some)
 }
 
 pub(super) fn move_commit_to_branch(
@@ -266,9 +281,10 @@ pub(super) fn move_commit_to_branch(
     drop(repo);
     but_api::commit::move_commit::commit_move(
         ctx,
-        subject_commit_id,
+        vec![subject_commit_id],
         RelativeTo::Reference(target_branch_name),
         InsertSide::Below,
+        DryRun::No,
     )
     .context("failed to move commit")
 }
@@ -281,9 +297,10 @@ pub(super) fn move_commit_to_commit(
 ) -> anyhow::Result<but_api::commit::types::CommitMoveResult> {
     but_api::commit::move_commit::commit_move(
         ctx,
-        subject_commit_id,
+        vec![subject_commit_id],
         RelativeTo::Commit(target_commit_id),
         insert_side,
+        DryRun::No,
     )
     .context("failed to move commit")
 }
@@ -297,7 +314,7 @@ pub(super) fn move_branch_onto_branch(
     let source_ref = repo.find_reference(source_branch_name)?.name().to_owned();
     let target_ref = repo.find_reference(target_branch_name)?.name().to_owned();
     drop(repo);
-    but_api::branch::move_branch(ctx, source_ref.as_ref(), target_ref.as_ref())
+    but_api::branch::move_branch(ctx, source_ref.as_ref(), target_ref.as_ref(), DryRun::No)
         .context("failed to move branch")?;
     Ok(())
 }
@@ -306,8 +323,8 @@ pub(super) fn tear_off_branch(ctx: &mut Context, source_branch_name: &str) -> an
     let repo = ctx.repo.get()?;
     let source_ref = repo.find_reference(source_branch_name)?.name().to_owned();
     drop(repo);
-    but_api::branch::tear_off_branch(ctx, source_ref.as_ref())
-        .context("failed to tear off branch")?;
+    but_api::branch::tear_off_branch(ctx, source_ref.as_ref(), DryRun::No)
+        .context("failed to unstack branch")?;
     Ok(())
 }
 
@@ -340,7 +357,8 @@ pub(super) fn create_branch_legacy(ctx: &mut Context) -> anyhow::Result<String> 
     Ok(new_name)
 }
 
-pub(super) fn has_unassigned_changes(ctx: &mut Context) -> anyhow::Result<bool> {
+#[expect(dead_code)]
+pub(super) fn has_unassigned_changes(ctx: &Context) -> anyhow::Result<bool> {
     let context_lines = ctx.settings.context_lines;
 
     let (_guard, repo, ws, mut db) = ctx.workspace_and_db_mut()?;
@@ -358,8 +376,26 @@ pub(super) fn has_unassigned_changes(ctx: &mut Context) -> anyhow::Result<bool> 
         .any(|assignment| assignment.stack_id.is_none()))
 }
 
+pub(super) fn stack_has_assigned_changes(ctx: &Context, stack: StackId) -> anyhow::Result<bool> {
+    let context_lines = ctx.settings.context_lines;
+
+    let (_guard, repo, ws, mut db) = ctx.workspace_and_db_mut()?;
+    let changes = but_core::diff::ui::worktree_changes(&repo)?.changes;
+    let (assignments, _assignments_error) = but_hunk_assignment::assignments_with_fallback(
+        db.hunk_assignments_mut()?,
+        &repo,
+        &ws,
+        Some(changes),
+        context_lines,
+    )?;
+
+    Ok(assignments
+        .into_iter()
+        .any(|assignment| assignment.stack_id.is_some_and(|id| id == stack)))
+}
+
 pub(super) fn assigned_file_count_for_stack(
-    ctx: &mut Context,
+    ctx: &Context,
     stack_id: StackId,
 ) -> anyhow::Result<usize> {
     let context_lines = ctx.settings.context_lines;
@@ -388,7 +424,7 @@ pub(super) fn commit_is_empty(ctx: &mut Context, commit_id: gix::ObjectId) -> an
     Ok(commit_details.diff_with_first_parent.is_empty())
 }
 
-pub(super) fn reword_branch_inline_legacy(
+pub(super) fn reword_branch_legacy(
     ctx: &mut Context,
     stack_id: StackId,
     branch_name: String,
@@ -536,7 +572,7 @@ pub(super) fn commit_discard(
     ctx: &mut Context,
     commit_id: gix::ObjectId,
 ) -> anyhow::Result<CommitDiscardResult> {
-    but_api::commit::discard_commit::commit_discard(ctx, commit_id)
+    but_api::commit::discard_commit::commit_discard(ctx, commit_id, DryRun::No)
 }
 
 pub(super) fn remove_branch_legacy(

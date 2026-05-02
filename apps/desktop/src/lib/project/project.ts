@@ -4,14 +4,7 @@ import { projectPath } from "$lib/routes/routes.svelte";
 import { TestId } from "@gitbutler/ui";
 // Inlined to avoid circular import with forge/.
 type ForgeName = "github" | "gitlab" | "bitbucket" | "azure" | "default";
-import type { ForgeUser } from "@gitbutler/core/api";
-
-export type KeyType = "gitCredentialsHelper" | "local" | "systemExecutable";
-export type LocalKey = {
-	local: { private_key_path: string };
-};
-
-export type AuthKey = Exclude<KeyType, "local"> | LocalKey;
+import type { ApiProject, ForgeUser } from "@gitbutler/but-sdk";
 
 export type Project = {
 	id: string;
@@ -19,12 +12,7 @@ export type Project = {
 	description?: string;
 	path: string;
 	git_dir?: string;
-	api?: CloudProject & {
-		sync: boolean;
-		sync_code: boolean | undefined;
-		reviews: boolean | undefined;
-	};
-	preferred_key: AuthKey;
+	api?: ApiProject;
 	ok_with_force_push: boolean;
 	force_push_protection: boolean;
 	husky_hooks_enabled: boolean;
@@ -45,23 +33,6 @@ export type Project = {
 export function vscodePath(path: string) {
 	return path.includes("\\") ? "/" + path.replace("\\", "/") : path;
 }
-
-export function gitAuthType(preferredKey?: AuthKey): string {
-	if (typeof preferredKey === "object" && preferredKey !== null && "local" in preferredKey) {
-		return "local";
-	}
-	return preferredKey as KeyType;
-}
-
-export type CloudProject = {
-	name: string;
-	description: string | null;
-	repository_id: string;
-	git_url: string;
-	code_git_url: string;
-	created_at: string;
-	updated_at: string;
-};
 
 export type AddProjectOutcome =
 	| {

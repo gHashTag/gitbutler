@@ -8,8 +8,8 @@
 	import { FILE_SELECTION_MANAGER } from "$lib/selection/fileSelectionManager.svelte";
 	import { createWorktreeSelection } from "$lib/selection/key";
 	import { UNCOMMITTED_SERVICE } from "$lib/selection/uncommittedService.svelte";
-	import { STACK_SERVICE, type RejectionReason } from "$lib/stacks/stackService.svelte";
-	import { UI_STATE, type NewCommitMessage } from "$lib/state/uiState.svelte";
+	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
+	import { UI_STATE, type NewCommitMessage, type RejectionReason } from "$lib/state/uiState.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import { TestId } from "@gitbutler/ui";
 	import { tick } from "svelte";
@@ -66,6 +66,7 @@
 				finalBranchName = await stackService.fetchNewBranchName(projectId);
 			}
 			const parentId = commitAction?.parentCommitId;
+			const insertBelow = commitAction?.insertBelow;
 
 			if (!finalStackId) {
 				const stack = await createNewStack({
@@ -120,10 +121,12 @@
 				{
 					projectId,
 					parentId,
+					insertBelow,
 					stackId: finalStackId,
 					message: finalMessage,
 					stackBranchName: finalBranchName,
 					worktreeChanges,
+					dryRun: false,
 				},
 				{ properties: analyticsProperties },
 			);

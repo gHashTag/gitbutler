@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { fModeEnabled, useNewRebaseEngine } from "$lib/config/uiFeatureFlags";
+	import { fModeEnabled } from "$lib/config/uiFeatureFlags";
 	import { SETTINGS_SERVICE } from "$lib/settings/appSettings";
 	import { USER } from "$lib/user/user";
 	import { inject } from "@gitbutler/core/context";
@@ -18,22 +18,6 @@
 </p>
 
 <CardGroup>
-	<CardGroup.Item labelFor="apply3">
-		{#snippet title()}
-			New apply to workspace
-		{/snippet}
-		{#snippet caption()}
-			Use the V3 version of apply and unapply operations for workspace changes.
-		{/snippet}
-		{#snippet actions()}
-			<Toggle
-				id="apply3"
-				checked={$settingsStore?.featureFlags.apply3}
-				onclick={() =>
-					settingsService.updateFeatureFlags({ apply3: !$settingsStore?.featureFlags.apply3 })}
-			/>
-		{/snippet}
-	</CardGroup.Item>
 	<CardGroup.Item labelFor="f-mode">
 		{#snippet title()}
 			F Mode Navigation
@@ -46,21 +30,6 @@
 				id="f-mode"
 				checked={$fModeEnabled}
 				onclick={() => fModeEnabled.set(!$fModeEnabled)}
-			/>
-		{/snippet}
-	</CardGroup.Item>
-	<CardGroup.Item labelFor="new-rebase-engine">
-		{#snippet title()}
-			New rebase engine
-		{/snippet}
-		{#snippet caption()}
-			Use the new graph-based rebase engine for stack operations.
-		{/snippet}
-		{#snippet actions()}
-			<Toggle
-				id="new-rebase-engine"
-				checked={$useNewRebaseEngine}
-				onclick={() => useNewRebaseEngine.set(!$useNewRebaseEngine)}
 			/>
 		{/snippet}
 	</CardGroup.Item>

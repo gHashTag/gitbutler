@@ -26,7 +26,7 @@ pub struct Args {
     /// If the file does not exist it will be created. If it does exist it will be truncated.
     #[clap(long, hide = true)]
     pub log_file: Option<PathBuf>,
-    /// Run as if gitbutler-cli was started in PATH instead of the current working directory.
+    /// Run as if but was started in PATH instead of the current working directory.
     #[clap(short = 'C', long, default_value = ".", value_name = "PATH")]
     pub current_dir: PathBuf,
     /// Explicitly control how output should be formatted.
@@ -1102,10 +1102,10 @@ pub enum Subcommands {
         branch: Option<String>,
     },
 
-    /// Manage Claude AI skills for GitButler.
+    /// Manage AI agent skills for GitButler.
     ///
     /// Skills provide enhanced AI capabilities for working with GitButler through
-    /// Claude Code and other AI assistants.
+    /// Claude Code, Codex, and other AI assistants.
     ///
     /// Use `but skill install` to install the GitButler skill files. By default,
     /// it prompts for scope (repository or global home directory) and then format.
@@ -1192,9 +1192,6 @@ pub enum Subcommands {
         /// Disable authentication entirely. DANGEROUS — only use on trusted networks.
         #[clap(long)]
         dangerously_allow_anyone: bool,
-        /// Use the staging GitButler API (app.staging.gitbutler.com) instead of production.
-        #[clap(long)]
-        dev: bool,
     },
 
     /// Show help information grouped by category.

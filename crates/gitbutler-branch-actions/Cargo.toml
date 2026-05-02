@@ -28,13 +28,14 @@ but-workspace = { workspace = true, features = ["legacy"] }
 but-rebase.workspace = true
 but-core = { workspace = true, features = ["legacy"] }
 but-project-handle.workspace = true
-but-graph.workspace = true
+but-graph = { workspace = true, features = ["legacy"] }
 but-oxidize.workspace = true
 but-forge.workspace = true
 but-ctx = { workspace = true, features = ["legacy"] }
 chrono.workspace = true
 
 gitbutler-oplog.workspace = true
+gitbutler-git.workspace = true
 gitbutler-repo.workspace = true
 gitbutler-repo-actions.workspace = true
 gitbutler-branch.workspace = true
@@ -42,7 +43,6 @@ gitbutler-reference.workspace = true
 gitbutler-commit.workspace = true
 gitbutler-url.workspace = true
 gitbutler-operating-modes.workspace = true
-gitbutler-cherry-pick.workspace = true
 gitbutler-stack.workspace = true
 gitbutler-workspace.workspace = true
 gitbutler-project.workspace = true
@@ -62,6 +62,7 @@ schemars = { workspace = true, optional = true }
 but-schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
+but-askpass.workspace = true
 pretty_assertions = "1.4"
 but-graph.workspace = true
 but-testsupport.workspace = true

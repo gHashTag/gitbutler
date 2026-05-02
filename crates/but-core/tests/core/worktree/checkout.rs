@@ -1,3 +1,4 @@
+use bstr::ByteSlice;
 use but_core::worktree::{checkout, checkout::UncommitedWorktreeChanges, safe_checkout};
 use but_testsupport::{
     git_status, read_only_in_memory_scenario, visualize_commit_graph_all,
@@ -78,6 +79,100 @@ fn no_op_trees_never_touch_worktree() -> anyhow::Result<()> {
     ?? file-renamed
     ?? link-renamed
     ");
+    Ok(())
+}
+
+#[test]
+fn pure_deletion_checkout_does_not_restore_unrelated_worktree_deletions() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario_slow("all-file-types-renamed-and-modified");
+    insta::assert_snapshot!(git_status(&repo)?, @r"
+     D executable
+     D file
+     D link
+    ?? executable-renamed
+    ?? file-renamed
+    ?? link-renamed
+    ");
+
+    insta::assert_snapshot!(visualize_index(&*repo.index()?), @"
+    100755:01e79c3 executable
+    100644:3aac70f file
+    120000:c4c364c link
+    ");
+
+    let (head_commit, new_commit) = build_commit(
+        &repo,
+        |tree| {
+            tree.remove("executable")?;
+            Ok(())
+        },
+        "delete executable",
+    )?;
+
+    let out = safe_checkout(head_commit.id, new_commit.id, &repo, Default::default())?;
+    insta::assert_debug_snapshot!(out, @r#"
+    Outcome {
+        snapshot_tree: None,
+        num_deleted_files: 1,
+        num_added_or_updated_files: 0,
+        head_update: "Update refs/heads/main to Some(Object(Sha1(5eedd314adfb480212989a303c7651717062a9b2)))",
+    }
+    "#);
+    insta::assert_snapshot!(visualize_index(&*repo.index()?), @r"
+    100644:3aac70f file
+    120000:c4c364c link
+    ");
+    insta::assert_snapshot!(git_status(&repo)?, @r"
+     D file
+     D link
+    ?? executable-renamed
+    ?? file-renamed
+    ?? link-renamed
+    ");
+
+    Ok(())
+}
+
+#[test]
+fn pure_deletion_checkout_keeps_non_intersecting_worktree_deletion() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("unborn-empty");
+
+    let blob_id = repo.write_blob(b"content")?;
+    let mut editor = repo.empty_tree().edit()?;
+    editor.upsert("a.txt", EntryKind::Blob, blob_id)?;
+    editor.upsert("b.txt", EntryKind::Blob, blob_id)?;
+    editor.upsert("c.txt", EntryKind::Blob, blob_id)?;
+    let initial_tree_id = editor.write()?.detach();
+    let initial_commit = repo.new_commit("init", initial_tree_id, None::<gix::ObjectId>)?;
+    safe_checkout(
+        repo.empty_tree().id,
+        initial_commit.id,
+        &repo,
+        Default::default(),
+    )?;
+
+    std::fs::remove_file(repo.workdir_path("b.txt").expect("non-bare repository"))?;
+    insta::assert_snapshot!(git_status(&repo)?, @" D b.txt");
+
+    let (head_commit, new_commit) = build_commit(
+        &repo,
+        |tree| {
+            tree.remove("a.txt")?;
+            Ok(())
+        },
+        "delete a.txt",
+    )?;
+    let out = safe_checkout(head_commit.id, new_commit.id, &repo, Default::default())?;
+    assert!(out.snapshot_tree.is_none());
+    assert_eq!(out.num_deleted_files, 1);
+    assert_eq!(out.num_added_or_updated_files, 0);
+    assert!(out.head_update.is_some());
+
+    assert!(!repo.workdir_path("a.txt").unwrap().exists());
+    assert!(!repo.workdir_path("b.txt").unwrap().exists());
+    assert!(repo.workdir_path("c.txt").unwrap().exists());
+    insta::assert_snapshot!(git_status(&repo)?, @" D b.txt");
+
     Ok(())
 }
 
@@ -334,6 +429,68 @@ inserted in new tree
     AM file-renamed-in-index
     ?? file-renamed
     ");
+
+    Ok(())
+}
+
+#[test]
+fn worktree_snapshot_of_legacy_crlf_blob_merges_cleanly_with_independent_target_change()
+-> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario_slow("legacy-crlf-blob-with-gitattributes");
+    let file_path = repo.workdir_path("ImportOrdersJob.cs").unwrap();
+    let legacy_blob = repo
+        .find_object(repo.rev_parse_single("@:ImportOrdersJob.cs")?)?
+        .into_blob();
+    assert_eq!(
+        legacy_blob.data.as_bstr(),
+        "1\r\n2\r\n3\r\n",
+        "the tracked blob must start from digit-only CRLF content so the later spelled-out edits are clearly distinguishable"
+    );
+
+    // This write is with line-endings that are unchanged from the ones on disk, and from what's in Git (CRLF).
+    std::fs::write(&file_path, b"1\r\ntwo from worktree\r\n3\r\n")?;
+    assert_eq!(
+        git_status(&repo)?,
+        " M ImportOrdersJob.cs\n",
+        "the worktree edit must be visible before checkout"
+    );
+
+    let (head_commit, new_commit) = build_commit(
+        &repo,
+        |tree| {
+            // This commit also has the right line endings (CRLF)
+            let blob_id = repo.write_blob(b"1\r\n2\r\nthree from target\r\n")?;
+            tree.upsert("ImportOrdersJob.cs", EntryKind::Blob, blob_id)?;
+            Ok(())
+        },
+        "edit same legacy crlf file independently",
+    )?;
+
+    // A lot happens here, but the significant part is that the overlapping worktree changes are cherry-picked
+    // onto the `new_commit` to be transferred by merge. That snapshot now normalizes line endings correctly,
+    // so the independent edits merge cleanly instead of being treated as a whole-file conflict.
+    let out = safe_checkout(head_commit.id, new_commit.id, &repo, Default::default())?;
+    insta::assert_debug_snapshot!(out, @r#"
+    Outcome {
+        snapshot_tree: Some(
+            Sha1(77d39e5c3dae5dde723f5be3c45e3525ef424447),
+        ),
+        num_deleted_files: 0,
+        num_added_or_updated_files: 1,
+        head_update: "Update refs/heads/main to Some(Object(Sha1(a530b145a2513ba5b2a4418bbb74920d3967f8fb)))",
+    }
+    "#);
+
+    assert_eq!(
+        std::fs::read(&file_path)?.as_bstr(),
+        "1\r\ntwo from worktree\r\nthree from target\r\n",
+        "checkout keeps the worktree edit and applies the independent target change"
+    );
+    assert_eq!(
+        repo.head_id()?,
+        new_commit.id,
+        "checkout updates HEAD to the target commit"
+    );
 
     Ok(())
 }
@@ -847,6 +1004,73 @@ fn unrelated_additions_do_not_affect_worktree_changes() -> anyhow::Result<()> {
     ?? file-renamed
     ?? link-renamed
     ");
+    Ok(())
+}
+
+#[test]
+fn partial_commit_with_adjacent_lines_conflicts_on_checkout() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+    // Worktree has two added lines (added-a, added-b) between line1 and line2.
+    let file_path = repo.workdir_path("file").unwrap();
+    let worktree_content = std::fs::read_to_string(&file_path)?;
+    assert_eq!(worktree_content, "line1\nadded-a\nadded-b\nline2\nline3\n");
+
+    // Simulate a partial commit: the new tree has only one of the two added lines.
+    let (head_commit, new_commit) = build_commit(
+        &repo,
+        |tree| {
+            let blob_id = repo.write_blob(b"line1\nadded-a\nline2\nline3\n")?;
+            tree.upsert("file", EntryKind::Blob, blob_id)?;
+            Ok(())
+        },
+        "commit only one added line",
+    )?;
+
+    // The remaining worktree change (added-b) conflicts with the committed change
+    // (added-a) because both add at the same position. This is the underlying
+    // reason commit_create uses materialize_without_checkout instead of a full
+    // checkout — it avoids this conflict entirely by not touching the worktree.
+    let err = safe_checkout(head_commit.id, new_commit.id, &repo, Default::default()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Worktree changes would be overwritten"),
+        "checkout must abort on partial-commit conflict: {err}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn partial_commit_with_deletion_plus_insertion_conflicts_on_checkout() -> anyhow::Result<()> {
+    let (repo, _tmp) = writable_scenario("adjacent-line-additions");
+    // Worktree replaced old-line with new-line.
+    let file_path = repo.workdir_path("file2").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file_path)?,
+        "line1\nnew-line\nline3\n"
+    );
+
+    // Commit only the deletion of old-line, not the insertion of new-line.
+    let (head_commit, new_commit) = build_commit(
+        &repo,
+        |tree| {
+            let blob_id = repo.write_blob(b"line1\nline3\n")?;
+            tree.upsert("file2", EntryKind::Blob, blob_id)?;
+            Ok(())
+        },
+        "commit only the deletion",
+    )?;
+
+    // The three-way merge sees ours deleting old-line and theirs replacing it
+    // with new-line — both modify the same region. Same class of bug as the
+    // adjacent-line case: commit_create avoids this by skipping checkout entirely.
+    let err = safe_checkout(head_commit.id, new_commit.id, &repo, Default::default()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Worktree changes would be overwritten"),
+        "checkout must abort on partial-commit conflict: {err}"
+    );
+
     Ok(())
 }
 

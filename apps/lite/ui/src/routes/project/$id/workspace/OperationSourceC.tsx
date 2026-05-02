@@ -1,46 +1,98 @@
+import { Operand, operandEquals } from "#ui/operands.ts";
+import styles from "./OperationSourceC.module.css";
+import { OperationSourceLabel } from "./OperationSourceLabel.tsx";
 import { headInfoQueryOptions } from "#ui/api/queries.ts";
-import { classes } from "#ui/classes.ts";
-import { useDraggable } from "#ui/hooks/useDraggable.tsx";
+import { classes } from "#ui/ui/classes.ts";
+import {
+	projectActions,
+	selectProjectOperationModeState,
+	selectProjectOutlineModeState,
+} from "#ui/projects/state.ts";
+import { useAppDispatch, useAppSelector } from "#ui/store.ts";
+import { draggable } from "@atlaskit/pragmatic-drag-and-drop/element/adapter";
+import { centerUnderPointer } from "@atlaskit/pragmatic-drag-and-drop/element/center-under-pointer";
+import { setCustomNativeDragPreview } from "@atlaskit/pragmatic-drag-and-drop/element/set-custom-native-drag-preview";
 import { mergeProps, useRender } from "@base-ui/react";
 import { useSuspenseQuery } from "@tanstack/react-query";
-import { FC } from "react";
-import { DragData, DragPreview } from "./DragAndDrop.tsx";
-import { OperationSourceLabel } from "./OperationSourceLabel.tsx";
-import { operationSourceEquals, type OperationSource } from "./OperationSource.ts";
-import { type OperationMode } from "./WorkspaceMode.ts";
-import styles from "./route.module.css";
+import { FC, type ReactNode, useEffect, useEffectEvent, useRef } from "react";
+import { createRoot } from "react-dom/client";
+
+type DragData = {
+	source: Operand;
+};
+
+export const parseDragData = (data: unknown): DragData | null => {
+	if (typeof data !== "object" || data === null || !("source" in data)) return null;
+	return data as DragData;
+};
+
+const DragPreview: FC<{ children: ReactNode }> = ({ children }) => (
+	<div className={styles.dragPreview}>{children}</div>
+);
 
 export const OperationSourceC: FC<
 	{
-		operationMode?: OperationMode | null;
 		projectId: string;
-		source: OperationSource;
-		canDrag?: () => boolean;
+		source: Operand;
 	} & useRender.ComponentProps<"div">
-> = ({ operationMode = null, projectId, source, canDrag, render, ...props }) => {
+> = ({ projectId, source, render, ...props }) => {
 	const { data: headInfo } = useSuspenseQuery(headInfoQueryOptions(projectId));
+	const operationMode = useAppSelector((state) =>
+		selectProjectOperationModeState(state, projectId),
+	);
+	const outlineMode = useAppSelector((state) => selectProjectOutlineModeState(state, projectId));
 
-	const [isDragging, dragRef] = useDraggable({
-		getInitialData: (): DragData => ({ operationSource: source }),
-		preview: (
-			<DragPreview>
-				<OperationSourceLabel source={source} headInfo={headInfo} />
-			</DragPreview>
-		),
-		canDrag,
-	});
+	const dispatch = useAppDispatch();
+	const dragRef = useRef<HTMLElement>(null);
+	const onGenerateDragPreview = useEffectEvent(
+		({ nativeSetDragImage }: { nativeSetDragImage: DataTransfer["setDragImage"] | null }) => {
+			setCustomNativeDragPreview({
+				nativeSetDragImage,
+				getOffset: centerUnderPointer,
+				render: ({ container }) => {
+					const root = createRoot(container);
+					root.render(
+						<DragPreview>
+							<OperationSourceLabel source={source} headInfo={headInfo} />
+						</DragPreview>,
+					);
+					return () => {
+						root.unmount();
+					};
+				},
+			});
+		},
+	);
+	const canDrag = useEffectEvent(
+		() => outlineMode._tag !== "RenameBranch" && outlineMode._tag !== "RewordCommit",
+	);
 
-	const operationModeSource = operationMode?.source ?? null;
-	const isActiveOperationModeSource =
-		operationModeSource && operationSourceEquals(operationModeSource, source);
+	useEffect(() => {
+		const element = dragRef.current;
+		if (!element) return;
 
-	const isActive = isDragging || isActiveOperationModeSource;
+		return draggable({
+			element,
+			// Prevent false positives when users drag to select text in the input field.
+			canDrag,
+			getInitialData: (): DragData => ({ source }),
+			onGenerateDragPreview,
+			onDragStart: () => {
+				dispatch(projectActions.enterDragAndDropMode({ projectId, source }));
+			},
+			onDrop: () => {
+				dispatch(projectActions.exitMode({ projectId }));
+			},
+		});
+	}, [dispatch, projectId, source]);
+
+	const isActiveSource = operationMode?.source && operandEquals(operationMode.source, source);
 
 	return useRender({
 		render,
 		ref: dragRef,
 		props: mergeProps<"div">(props, {
-			className: classes(isActive && styles.activeSource),
+			className: classes(isActiveSource && styles.activeSource),
 		}),
 	});
 };

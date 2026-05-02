@@ -1156,6 +1156,22 @@ EOF
     create_workspace_commit_once D
   )
 
+  git init "stacked-bottom-remote-still-points-at-now-split-top"
+  (cd "stacked-bottom-remote-still-points-at-now-split-top"
+    commit init
+    setup_target_to_match_main
+    git checkout -b bottom
+        commit "B"
+    git checkout -b top
+        commit "T"
+    # origin/bottom previously pointed at the combined push (T), but the
+    # branches were since split locally so that bottom now contains only B
+    # and top contains T on top of bottom. Force-push is required to clear
+    # T from origin/bottom.
+    setup_remote_tracking top bottom "cp"
+    create_workspace_commit_once top
+  )
+
   git init special-branches
   (cd special-branches
     commit init
@@ -1367,6 +1383,26 @@ EOF
     git branch unapplied
     setup_target_to_match_main
     create_workspace_commit_once main
+  )
+
+  git init target-shared-with-unapplied-and-origin-head
+  (cd target-shared-with-unapplied-and-origin-head
+    commit init
+    commit M1
+    setup_target_to_match_main
+    setup_remote_tracking main HEAD
+
+    git branch unapplied
+    git branch base-peer
+    for n in $(seq 1 8); do
+      git branch "base-peer-$n"
+    done
+
+    git checkout -b survivor
+      commit S1
+      commit S2
+
+    create_workspace_commit_once survivor
   )
 
   git init remote-far-in-ancestry

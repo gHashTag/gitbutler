@@ -1,42 +1,14 @@
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result};
 use but_core::RepositoryExt;
 use but_ctx::Context;
-use but_rebase::RebaseStep;
-use but_workspace::legacy::stack_ext::StackExt;
 use gitbutler_branch::BranchUpdateRequest;
 use gitbutler_commit::commit_ext::CommitExt;
-use gitbutler_reference::Refname;
-use gitbutler_repo::first_parent_commit_ids_until;
-use gitbutler_stack::{Stack, StackId, Target};
+use gitbutler_stack::Stack;
 use itertools::Itertools;
-use serde::Serialize;
 
 use crate::VirtualBranchesExt;
 
-#[derive(Debug, PartialEq, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PushResult {
-    /// The name of the remote to which the branches were pushed.
-    pub remote: String,
-    /// The list of pushed branches and their corresponding remote refnames.
-    pub branch_to_remote: Vec<(String, Refname)>,
-    /// The list of branches with their before/after commit SHAs.
-    /// Format: (branch_name, before_sha, after_sha)
-    /// SHAs are stored as hex strings for serialization
-    pub branch_sha_updates: Vec<(String, String, String)>,
-}
-
-impl From<but_workspace::ui::Author> for crate::author::Author {
-    fn from(value: but_workspace::ui::Author) -> Self {
-        crate::author::Author {
-            name: value.name,
-            email: value.email,
-            gravatar_url: value.gravatar_url,
-        }
-    }
-}
-
-pub fn update_stack(ctx: &Context, update: &BranchUpdateRequest) -> Result<Stack> {
+pub(crate) fn update_stack(ctx: &Context, update: &BranchUpdateRequest) -> Result<Stack> {
     let mut vb_state = ctx.virtual_branches();
     let mut stack = vb_state.get_stack_in_workspace(update.id.context("BUG(opt-stack-id)")?)?;
 
@@ -64,17 +36,18 @@ pub(crate) struct IsCommitIntegrated<'repo, 'cache, 'graph> {
 }
 
 impl<'repo, 'cache, 'graph> IsCommitIntegrated<'repo, 'cache, 'graph> {
-    pub(crate) fn new(
-        target: &Target,
+    pub(crate) fn new_with_target(
+        target_ref_name: &gix::refs::FullNameRef,
+        target_base_oid: gix::ObjectId,
         gix_repo: &'repo gix::Repository,
         graph: &'graph mut MergeBaseCommitGraph<'repo, 'cache>,
     ) -> anyhow::Result<Self> {
         let remote_head = gix_repo
-            .find_reference(&target.branch.to_string())?
+            .find_reference(target_ref_name)?
             .peel_to_commit()?
             .id;
         let upstream_tree_id = gix_repo.find_commit(remote_head)?.tree_id()?.detach();
-        let upstream_commits = commit_ids_until(gix_repo, remote_head, target.sha)?;
+        let upstream_commits = commit_ids_until(gix_repo, remote_head, target_base_oid)?;
         let upstream_change_ids = upstream_commits
             .iter()
             .filter_map(|commit_id| {
@@ -90,7 +63,7 @@ impl<'repo, 'cache, 'graph> IsCommitIntegrated<'repo, 'cache, 'graph> {
         Ok(Self {
             gix_repo,
             graph,
-            target_commit_id: target.sha,
+            target_commit_id: target_base_oid,
             upstream_tree_id,
             upstream_commits,
             upstream_change_ids,
@@ -163,64 +136,6 @@ impl IsCommitIntegrated<'_, '_, '_> {
         // then the vbranch is fully merged
         Ok(merge_tree_id == self.upstream_tree_id)
     }
-}
-
-// changes a commit message for commit_oid, rebases everything above it, updates branch head if successful
-pub(crate) fn update_commit_message(
-    ctx: &Context,
-    stack_id: StackId,
-    commit_id: gix::ObjectId,
-    message: &str,
-) -> Result<gix::ObjectId> {
-    if message.is_empty() {
-        bail!("commit message can not be empty");
-    }
-    let mut vb_state = ctx.virtual_branches();
-    let default_target = vb_state.get_default_target()?;
-    let repo = ctx.repo.get()?;
-
-    let mut stack = vb_state.get_stack_in_workspace(stack_id)?;
-    let branch_commit_oids =
-        first_parent_commit_ids_until(&repo, stack.head_oid(ctx)?, default_target.sha)?;
-
-    if !branch_commit_oids.contains(&commit_id) {
-        bail!("commit {commit_id} not in the branch");
-    }
-
-    let mut steps = stack.as_rebase_steps(ctx)?;
-    // Update the commit message
-    for step in steps.iter_mut() {
-        if let RebaseStep::Pick {
-            commit_id: id,
-            new_message,
-        } = step
-            && *id == commit_id
-        {
-            *new_message = Some(message.into());
-        }
-    }
-    let merge_base = stack.merge_base(ctx)?;
-    let output = {
-        let repo = ctx.repo.get()?;
-        let mut rebase = but_rebase::Rebase::new(&repo, Some(merge_base), None)?;
-        rebase.rebase_noops(false);
-        rebase.steps(steps)?;
-        rebase.rebase(&*ctx.cache.get_cache()?)?
-    };
-
-    stack.set_stack_head(&mut vb_state, &repo, output.top_commit)?;
-    stack.set_heads_from_rebase_output(ctx, output.references)?;
-
-    crate::integration::update_workspace_commit_with_vb_state(&vb_state, ctx, false)
-        .context("failed to update gitbutler workspace")?;
-
-    output
-        .commit_mapping
-        .iter()
-        .find_map(|(_base, old, new)| (*old == commit_id).then_some(*new))
-        .ok_or(anyhow!(
-            "Failed to find the updated commit id after rebasing"
-        ))
 }
 
 fn commit_ids_until(

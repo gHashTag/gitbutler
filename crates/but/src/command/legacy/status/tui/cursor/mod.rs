@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bstr::BStr;
 use gitbutler_stack::StackId;
 
 use crate::{
@@ -8,8 +9,8 @@ use crate::{
         FilesStatusFlag, StatusOutputLine,
         output::StatusOutputLineData,
         tui::{
-            Mode, SelectAfterReload, branch_operation_display, commit_operation_display,
-            move_operation_display,
+            Mode, SelectAfterReload,
+            render::{commit_operation_display, move_operation_display},
         },
     },
 };
@@ -161,7 +162,7 @@ impl Cursor {
     }
 
     /// Select the first line that points to the given branch name.
-    pub(super) fn select_branch(branch_name: String, lines: &[StatusOutputLine]) -> Option<Self> {
+    pub(super) fn select_branch(branch_name: &str, lines: &[StatusOutputLine]) -> Option<Self> {
         let idx = lines.iter().position(|line| {
             if let Some(CliId::Branch { name, .. }) = line.data.cli_id().map(|id| &**id)
                 && *name == branch_name
@@ -188,6 +189,23 @@ impl Cursor {
         Some(Self(idx))
     }
 
+    /// Select the first uncommitted file line that points to the given path in the given stack.
+    pub(super) fn select_uncommitted_file(
+        path: &BStr,
+        stack_id: Option<StackId>,
+        lines: &[StatusOutputLine],
+    ) -> Option<Self> {
+        let idx = lines.iter().position(|line| {
+            if let Some(CliId::Uncommitted(uncommitted)) = line.data.cli_id().map(|id| &**id) {
+                let assignment = uncommitted.hunk_assignments.first();
+                &**assignment.path_bytes == path && assignment.stack_id == stack_id
+            } else {
+                false
+            }
+        })?;
+        Some(Self(idx))
+    }
+
     /// Select the first line that points to the unassigned section.
     pub(super) fn select_unassigned(lines: &[StatusOutputLine]) -> Option<Self> {
         let idx = lines.iter().position(|line| {
@@ -199,7 +217,7 @@ impl Cursor {
         Some(Self(idx))
     }
 
-    /// Selects the merge-base line.
+    /// Select the merge-base line.
     pub(super) fn select_merge_base(lines: &[StatusOutputLine]) -> Option<Self> {
         let idx = lines
             .iter()
@@ -321,7 +339,7 @@ impl Cursor {
         Some(Self(idx))
     }
 
-    /// Moves the cursor to the next selectable jump-target line after the current cursor position.
+    /// Moves the cursor to the first selectable row in the next section.
     #[must_use]
     pub(super) fn move_next_section(
         self,
@@ -333,19 +351,23 @@ impl Cursor {
             return None;
         }
 
-        let (idx, _) = lines
-            .iter()
-            .enumerate()
-            .skip(self.0 + 1)
-            .find(|(_, line)| is_jump_target_in_mode(line, mode, show_files))?;
-        Some(Self(idx))
+        let mut next_section_start = find_next_section_start(lines, mode, self.0)?;
+        loop {
+            if let Some(idx) =
+                first_selectable_in_section(lines, mode, show_files, next_section_start)
+            {
+                return Some(Self(idx));
+            }
+
+            next_section_start = find_next_section_start(lines, mode, next_section_start)?;
+        }
     }
 
-    /// Moves the cursor to the previous selectable jump-target line.
+    /// Moves the cursor to the first selectable row in the previous section.
     ///
-    /// If the cursor is inside a section (for example, on a file or commit row), this jumps to the
-    /// current section header first. If the cursor is already on a section header, this jumps to the
-    /// previous section header.
+    /// If the cursor is inside a section, this jumps to that section's first selectable row first.
+    /// If the cursor is already on that row, this jumps to the previous section's first selectable
+    /// row.
     #[must_use]
     pub(super) fn move_previous_section(
         self,
@@ -357,106 +379,89 @@ impl Cursor {
             return None;
         }
 
-        let current_line_is_section_header = lines.get(self.0).is_some_and(is_section_header);
-        let search_end = if current_line_is_section_header {
-            self.0
-        } else {
-            self.0 + 1
-        };
+        let current_section_start = find_section_start_at_or_before(lines, mode, self.0)?;
 
-        let (target_idx, _) = lines
-            .iter()
-            .enumerate()
-            .take(search_end)
-            .rev()
-            .find(|(_, line)| is_jump_target_in_mode(line, mode, show_files))?;
-        Some(Self(target_idx))
-    }
-
-    /// Returns the cursor position for the closest branch based on the currently selected row.
-    #[must_use]
-    pub(super) fn closest_branch_cursor(self, lines: &[StatusOutputLine]) -> Option<Self> {
-        if self.0 >= lines.len() {
-            return None;
+        if let Some(current_section_first_selectable) =
+            first_selectable_in_section(lines, mode, show_files, current_section_start)
+            && self.0 != current_section_first_selectable
+        {
+            return Some(Self(current_section_first_selectable));
         }
 
-        let selected_line = lines.get(self.0)?;
-
-        if matches!(selected_line.data, StatusOutputLineData::MergeBase) {
-            return Some(self);
-        }
-
-        let selected_cli_id = selected_line.data.cli_id().map(|id| &**id)?;
-
-        let target_idx = match (&selected_line.data, selected_cli_id) {
-            (StatusOutputLineData::Branch { .. }, CliId::Branch { .. }) => Some(self.0),
-            (StatusOutputLineData::Commit { stack_id, .. }, CliId::Commit { .. }) => stack_id
-                .and_then(|stack_id| branch_index_for_stack(lines, stack_id))
-                .or_else(|| previous_branch_index(lines, self.0)),
-            (_, CliId::CommittedFile { .. }) | (_, CliId::Commit { .. }) => {
-                previous_branch_index(lines, self.0)
+        let mut search_end = current_section_start;
+        while let Some(previous_section_start) =
+            find_previous_section_start(lines, mode, search_end)
+        {
+            if let Some(idx) =
+                first_selectable_in_section(lines, mode, show_files, previous_section_start)
+            {
+                return Some(Self(idx));
             }
-            (StatusOutputLineData::StagedChanges { .. }, _)
-            | (StatusOutputLineData::StagedFile { .. }, _) => selected_cli_id
-                .stack_id()
-                .and_then(|stack_id| branch_index_for_stack(lines, stack_id))
-                .or_else(|| first_branch_index(lines)),
-            _ => first_branch_index(lines),
-        };
 
-        target_idx.or_else(|| merge_base_index(lines)).map(Self)
+            search_end = previous_section_start;
+        }
+
+        None
     }
 }
 
-/// Returns the index of the first branch line, if any.
-fn first_branch_index(lines: &[StatusOutputLine]) -> Option<usize> {
-    lines.iter().position(|line| {
-        matches!(
-            line.data.cli_id().map(|id| &**id),
-            Some(CliId::Branch { .. })
-        )
-    })
-}
-
-/// Returns the index of the merge-base line, if any.
-fn merge_base_index(lines: &[StatusOutputLine]) -> Option<usize> {
-    lines
-        .iter()
-        .position(|line| matches!(line.data, StatusOutputLineData::MergeBase))
-}
-
-/// Returns the index of the nearest preceding branch line before or at `from_idx`.
-fn previous_branch_index(lines: &[StatusOutputLine], from_idx: usize) -> Option<usize> {
+/// Finds the start index of the nearest section at or before `idx`.
+fn find_section_start_at_or_before(
+    lines: &[StatusOutputLine],
+    mode: &Mode,
+    idx: usize,
+) -> Option<usize> {
     lines
         .iter()
         .enumerate()
-        .take(from_idx + 1)
+        .take(idx + 1)
         .rev()
-        .find(|(_, line)| {
-            matches!(
-                line.data.cli_id().map(|id| &**id),
-                Some(CliId::Branch { .. })
-            )
-        })
+        .find(|(_, line)| is_section_header(line, mode))
         .map(|(idx, _)| idx)
 }
 
-/// Returns the index of the first branch line that belongs to `stack_id`.
-fn branch_index_for_stack(
+/// Finds the next section start after `idx`.
+fn find_next_section_start(lines: &[StatusOutputLine], mode: &Mode, idx: usize) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(idx + 1)
+        .find(|(_, line)| is_section_header(line, mode))
+        .map(|(idx, _)| idx)
+}
+
+/// Finds the previous section start before `search_end`.
+fn find_previous_section_start(
     lines: &[StatusOutputLine],
-    stack_id: gitbutler_stack::StackId,
+    mode: &Mode,
+    search_end: usize,
 ) -> Option<usize> {
-    lines.iter().position(|line| {
-        if let Some(CliId::Branch {
-            stack_id: Some(branch_stack_id),
-            ..
-        }) = line.data.cli_id().map(|id| &**id)
-        {
-            *branch_stack_id == stack_id
-        } else {
-            false
-        }
-    })
+    lines
+        .iter()
+        .enumerate()
+        .take(search_end)
+        .rev()
+        .find(|(_, line)| is_section_header(line, mode))
+        .map(|(idx, _)| idx)
+}
+
+/// Finds the first selectable line in the section starting at `section_start`.
+fn first_selectable_in_section(
+    lines: &[StatusOutputLine],
+    mode: &Mode,
+    show_files: FilesStatusFlag,
+    section_start: usize,
+) -> Option<usize> {
+    let next_section_start =
+        find_next_section_start(lines, mode, section_start).unwrap_or(lines.len());
+
+    lines
+        .iter()
+        .enumerate()
+        .skip(section_start)
+        .take(next_section_start.saturating_sub(section_start))
+        .find(|(_, line)| is_selectable_in_mode(line, mode, show_files))
+        .map(|(idx, _)| idx)
 }
 
 /// Returns true if a line marks the boundary of a commit list within a branch section.
@@ -482,29 +487,38 @@ fn is_discard_commit_boundary(line: &StatusOutputLine) -> bool {
 }
 
 /// Returns true if a line is a section header row.
-fn is_section_header(line: &StatusOutputLine) -> bool {
-    matches!(
-        line.data,
-        StatusOutputLineData::Branch { .. }
-            | StatusOutputLineData::StagedChanges { .. }
-            | StatusOutputLineData::UnassignedChanges { .. }
-            | StatusOutputLineData::MergeBase
-    )
-}
+fn is_section_header(line: &StatusOutputLine, mode: &Mode) -> bool {
+    match mode {
+        Mode::Normal
+        | Mode::InlineReword(..)
+        | Mode::Command(..)
+        | Mode::Commit(..)
+        | Mode::Move(..)
+        | Mode::Details => {
+            matches!(
+                line.data,
+                StatusOutputLineData::Branch { .. }
+                    | StatusOutputLineData::UnassignedChanges { .. }
+                    | StatusOutputLineData::MergeBase
+            )
+        }
 
-/// Returns true if a line is selectable and is a jump target in the given mode.
-fn is_jump_target_in_mode(
-    line: &StatusOutputLine,
-    mode: &Mode,
-    show_files: FilesStatusFlag,
-) -> bool {
-    is_selectable_in_mode(line, mode, show_files) && is_section_header(line)
+        Mode::Rub(..) => {
+            matches!(
+                line.data,
+                StatusOutputLineData::Branch { .. }
+                    | StatusOutputLineData::StagedChanges { .. }
+                    | StatusOutputLineData::UnassignedChanges { .. }
+                    | StatusOutputLineData::MergeBase
+            )
+        }
+    }
 }
 
 pub(super) fn is_selectable_in_mode(
     line: &StatusOutputLine,
     mode: &Mode,
-    show_files: FilesStatusFlag,
+    show_files_flag: FilesStatusFlag,
 ) -> bool {
     if !line.is_selectable() {
         return false;
@@ -512,7 +526,7 @@ pub(super) fn is_selectable_in_mode(
 
     // selecting the source line should always be possible
     match mode {
-        Mode::Rub(rub_mode) | Mode::RubButApi(rub_mode) => {
+        Mode::Rub(rub_mode) => {
             if let Some(cli_id) = line.data.cli_id()
                 && rub_mode.source == **cli_id
             {
@@ -533,15 +547,11 @@ pub(super) fn is_selectable_in_mode(
                 return true;
             }
         }
-        Mode::Command(..)
-        | Mode::InlineReword(..)
-        | Mode::Normal
-        | Mode::Branch
-        | Mode::Details => {}
+        Mode::Command(..) | Mode::InlineReword(..) | Mode::Normal | Mode::Details => {}
     }
 
     match mode {
-        Mode::Normal | Mode::Details => match show_files {
+        Mode::Normal | Mode::Details => match show_files_flag {
             FilesStatusFlag::None | FilesStatusFlag::All => true,
             FilesStatusFlag::Commit(object_id) => {
                 if let Some(cli_id) = line.data.cli_id()
@@ -553,13 +563,12 @@ pub(super) fn is_selectable_in_mode(
                 }
             }
         },
-        Mode::Rub(rub_mode) | Mode::RubButApi(rub_mode) => line
+        Mode::Rub(rub_mode) => line
             .data
             .cli_id()
             .is_some_and(|cli_id| rub_mode.available_targets.contains(cli_id)),
         Mode::Commit(commit_mode) => commit_operation_display(&line.data, commit_mode).is_some(),
         Mode::Move(move_mode) => move_operation_display(&line.data, move_mode).is_some(),
-        Mode::Branch => branch_operation_display(&line.data).is_some(),
         Mode::InlineReword(..) | Mode::Command(..) => {
             // you can't actually move the selection in these modes
             // but returning `false` would dim every line which hurts UX

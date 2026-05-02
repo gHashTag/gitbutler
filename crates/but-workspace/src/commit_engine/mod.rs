@@ -10,7 +10,8 @@ use but_core::{
 use but_rebase::{RebaseOutput, commit::DateMode};
 use gix::prelude::ObjectIdExt as _;
 
-pub(crate) mod index;
+/// Utilities for synchronizing the on-disk index with a tree.
+pub mod index;
 
 /// Types for use in the frontend with serialization support.
 pub mod ui;
@@ -222,6 +223,8 @@ fn create_possibly_signed_commit(
     parents: impl IntoIterator<Item = impl Into<gix::ObjectId>>,
     commit_headers: Option<but_core::commit::Headers>,
 ) -> anyhow::Result<gix::ObjectId> {
+    let commit_headers =
+        commit_headers.unwrap_or_else(|| Headers::from_config(&repo.config_snapshot()));
     let commit = gix::objs::Commit {
         message: message.into(),
         tree,
@@ -229,9 +232,7 @@ fn create_possibly_signed_commit(
         committer,
         encoding: None,
         parents: parents.into_iter().map(Into::into).collect(),
-        extra_headers: (&commit_headers
-            .unwrap_or_else(|| Headers::from_config(&repo.config_snapshot())))
-            .into(),
+        extra_headers: (&commit_headers).into(),
     };
     but_rebase::commit::create(
         repo,

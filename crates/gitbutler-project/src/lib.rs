@@ -10,7 +10,7 @@ use std::path::Path;
 pub use but_project_handle::{ProjectHandle, ProjectHandleOrLegacyProjectId};
 use controller::Controller;
 use project::ApiProject;
-pub use project::{AddProjectOutcome, AuthKey, CodePushState, FetchResult, Project};
+pub use project::{AddProjectOutcome, CodePushState, FetchResult, Project};
 pub use storage::UpdateRequest;
 
 /// The maximum size of files to automatically start tracking, i.e. untracked files we pick up for tree-creation.
@@ -91,6 +91,17 @@ pub fn add_at_app_data_dir(
 /// NOTE: call [`Project::migrated()`] if the instance should be used for actual functionality.
 pub fn dangerously_list_projects_without_migration() -> anyhow::Result<Vec<Project>> {
     let controller = Controller::from_path(but_path::app_data_dir()?);
+    controller.list()
+}
+
+/// Testing purpose only.
+///
+/// Like [`dangerously_list_projects_without_migration()`], but allows setting
+/// the `app_data_dir` explicitly for isolated tests and diagnostics.
+pub fn dangerously_list_projects_without_migration_with_path(
+    app_data_dir: impl AsRef<Path>,
+) -> anyhow::Result<Vec<Project>> {
+    let controller = Controller::from_path(app_data_dir.as_ref());
     controller.list()
 }
 

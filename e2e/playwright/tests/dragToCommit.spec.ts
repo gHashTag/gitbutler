@@ -6,8 +6,9 @@ import {
 	assertFileIsUnstaged,
 } from "../src/file.ts";
 import { getBaseURL, type GitButler, startGitButler } from "../src/setup.ts";
+import { test } from "../src/test.ts";
 import { clickByTestId, dragAndDropByLocator, getByTestId, waitForTestId } from "../src/util.ts";
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
 import { writeFileSync } from "fs";
 
 let gitbutler: GitButler;
@@ -50,9 +51,9 @@ test("should be able to start a commit by dragging a file", async ({ page, conte
 	const commits = getByTestId(page, "commit-row");
 	await expect(commits).toHaveCount(2);
 
-	// Push the changes to the remote branch
-	// (it's basically a no-op, just makes sure that the same commits after rebasing are on the remote)
-	await clickByTestId(page, "stack-push-button");
+	// Imported remote branches start out already synced when added via `but apply`.
+	const initialPushButton = getByTestId(page, "stack-push-button");
+	await expect(initialPushButton).toBeDisabled();
 
 	// Add a two new files to the workdir
 	writeFileSync(filePath, fileContent, { flag: "w" });

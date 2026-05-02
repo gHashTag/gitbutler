@@ -1,9 +1,11 @@
 import { FileChangeDropData, FolderChangeDropData, HunkDropDataV3 } from "$lib/dragging/draggables";
 import { updateStackPrs } from "$lib/forge/shared/prFooter";
 import { UNCOMMITTED_SERVICE } from "$lib/selection/uncommittedService.svelte";
+import { normalizeReferenceSubject } from "$lib/stacks/commitMovePlacement";
 import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
 import { UI_STATE } from "$lib/state/uiState.svelte";
 import { inject } from "@gitbutler/core/context";
+import type { DropResult } from "$lib/dragging/dropResult";
 import type { DropzoneHandler } from "$lib/dragging/handler";
 import type { ForgePrService } from "$lib/forge/interface/forgePrService";
 
@@ -46,25 +48,24 @@ export class MoveBranchDzHandler implements DropzoneHandler {
 			data.numberOfCommits > 0 // TODO: If trying to move an empty branch, we should just delete the reference and recreate it.
 		);
 	}
-	async ondrop(data: BranchDropData): Promise<void> {
-		const { deletedStacks } = await this.stackService.moveBranch({
+	async ondrop(data: BranchDropData): Promise<DropResult | void> {
+		const sourceStackDeleted = data.numberOfBranchesInStack === 1;
+
+		await this.stackService.moveBranch({
 			projectId: this.projectId,
-			sourceStackId: data.stackId,
-			subjectBranchName: data.branchName,
-			targetBranchName: this.branchName,
-			targetStackId: this.stackId,
+			subjectBranch: normalizeReferenceSubject(data.branchName),
+			targetBranch: normalizeReferenceSubject(this.branchName),
 		});
 
-		if (!this.prService) return;
-		if (!this.baseBranchName) return;
+		if (this.prService && this.baseBranchName) {
+			if (!sourceStackDeleted) {
+				const branchDetails = await this.stackService.fetchBranches(this.projectId, data.stackId);
+				await updateStackPrs(this.prService, branchDetails, this.baseBranchName);
+			}
 
-		if (!deletedStacks.includes(data.stackId)) {
-			const branchDetails = await this.stackService.fetchBranches(this.projectId, data.stackId);
+			const branchDetails = await this.stackService.fetchBranches(this.projectId, this.stackId);
 			await updateStackPrs(this.prService, branchDetails, this.baseBranchName);
 		}
-
-		const branchDetails = await this.stackService.fetchBranches(this.projectId, this.stackId);
-		await updateStackPrs(this.prService, branchDetails, this.baseBranchName);
 	}
 }
 

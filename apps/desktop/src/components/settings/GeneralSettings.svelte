@@ -3,8 +3,10 @@
 	import CliSymlinkSetup from "$components/settings/CliSymlinkSetup.svelte";
 	import AccessTokenSignIn from "$components/shared/AccessTokenSignIn.svelte";
 	import { BACKEND } from "$lib/backend";
+	import { getUserErrorCode } from "$lib/backend/ipc";
 	import { CLI_MANAGER } from "$lib/config/cli";
 	import { showError } from "$lib/error/showError";
+	import { showToast } from "$lib/notifications/toasts";
 	import { PROJECTS_SERVICE } from "$lib/project/projectsService";
 	import { SETTINGS_SERVICE } from "$lib/settings/appSettings";
 	import {
@@ -78,6 +80,7 @@
 		{ identifier: "alacritty-mac", displayName: "Alacritty", platform: "macos" },
 		{ identifier: "wezterm-mac", displayName: "WezTerm", platform: "macos" },
 		{ identifier: "hyper", displayName: "Hyper", platform: "macos" },
+		{ identifier: "kitty", displayName: "Kitty", platform: "macos" },
 		// Windows
 		{ identifier: "wt", displayName: "Windows Terminal", platform: "windows" },
 		{ identifier: "powershell", displayName: "PowerShell", platform: "windows" },
@@ -91,6 +94,7 @@
 		{ identifier: "warp", displayName: "Warp", platform: "linux" },
 		{ identifier: "hyper", displayName: "Hyper", platform: "linux" },
 		{ identifier: "wezterm", displayName: "WezTerm", platform: "linux" },
+		{ identifier: "kitty", displayName: "Kitty", platform: "linux" },
 	];
 
 	const terminalOptions = allTerminalOptions.filter((t) => t.platform === platformName);
@@ -318,7 +322,25 @@
 						<Button
 							style="pop"
 							icon="play"
-							onclick={async () => await instalCLI()}
+							onclick={async () => {
+								try {
+									await instalCLI();
+								} catch (err: unknown) {
+									// osascript returns a generic non-success when the
+									// user dismisses the macOS admin-privileges prompt.
+									// The backend tags that specific case with a
+									// `CliInstallCancelled` code so we can show an info
+									// toast instead of an error toast.
+									if (getUserErrorCode(err) === "CliInstallCancelled") {
+										showToast({
+											style: "info",
+											message: "CLI install cancelled.",
+										});
+										return;
+									}
+									throw err;
+								}
+							}}
 							loading={installingCLI.current.isLoading}
 						>
 							Install But CLI</Button

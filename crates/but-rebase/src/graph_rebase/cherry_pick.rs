@@ -10,7 +10,7 @@ use but_core::{
 };
 use gix::{objs::tree::EntryKind, prelude::ObjectIdExt as _};
 
-use crate::{cherry_pick::function::ConflictEntries, commit::DateMode};
+use crate::{cherry_pick::ConflictEntries, commit::DateMode};
 
 /// Describes the outcome of cherrypick.
 #[derive(Debug, Clone)]
@@ -33,6 +33,22 @@ pub enum CherryPickOutcome {
         /// The shas of the commits that we were trying to cherry pick onto.
         ontos: Option<Vec<gix::ObjectId>>,
     },
+}
+
+/// Controls how parent trees are merged during cherry-pick.
+///
+/// When cherry-picking a commit with multiple parents, both the old parents
+/// (base) and the new parents (ontos) are merged pairwise. This enum controls
+/// the merge options used for that pairwise merging.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum TreeMergeMode {
+    /// Merge with rename detection enabled (default).
+    #[default]
+    WithRenames,
+    /// Merge with rename detection disabled.
+    /// Useful when parents are independent and renames detected across them
+    /// would be false positives.
+    WithoutRenames,
 }
 
 /// Controls when a commit is cherry-picked during a rebase.
@@ -65,12 +81,14 @@ pub enum PickMode {
 /// X's "base" sub-tree as the base.
 ///
 /// `pick_mode` - controls how to determine if a commit should be cherry-picked.
+/// `tree_merge_mode` - controls how parent trees are merged for merge commits.
 /// `sign_commit` - controls how the resulting commit is signed.
 pub fn cherry_pick(
     repo: &gix::Repository,
     target: gix::ObjectId,
     ontos: &[gix::ObjectId],
     pick_mode: PickMode,
+    tree_merge_mode: TreeMergeMode,
     sign_commit: SignCommit,
 ) -> Result<CherryPickOutcome> {
     let target = but_core::Commit::from_id(target.attach(repo))?;
@@ -80,11 +98,11 @@ pub fn cherry_pick(
         return Ok(CherryPickOutcome::Identity(target.id.detach()));
     }
 
-    let base_t = find_base_tree(&target)?;
+    let base_t = find_base_tree(&target, tree_merge_mode)?;
     // We always want the "theirs-ist" side of the target if it's conflicted.
     let target_t = find_real_tree(&target, TreeKind::Theirs)?;
     // We want to cherry-pick onto the merge result.
-    let onto_t = tree_from_merging_commits(repo, ontos, TreeKind::AutoResolution)?;
+    let onto_t = merged_tree_from_commits(repo, ontos, tree_merge_mode, TreeKind::AutoResolution)?;
 
     match (&base_t, &onto_t) {
         (MergeOutcome::NoCommit, MergeOutcome::NoCommit) if pick_mode == PickMode::Force => {
@@ -191,20 +209,29 @@ impl MergeOutcome {
     }
 }
 
-fn find_base_tree(target: &but_core::Commit) -> Result<MergeOutcome> {
+fn find_base_tree(
+    target: &but_core::Commit,
+    tree_merge_mode: TreeMergeMode,
+) -> Result<MergeOutcome> {
     if target.is_conflicted() {
         Ok(MergeOutcome::Success(
             find_real_tree(target, TreeKind::Base)?.detach(),
         ))
     } else {
-        tree_from_merging_commits(target.id.repo, &target.parents, TreeKind::AutoResolution)
+        merged_tree_from_commits(
+            target.id.repo,
+            &target.parents,
+            tree_merge_mode,
+            TreeKind::AutoResolution,
+        )
     }
 }
 
-/// Merge together many commits, making use of the preferenced tree.
-fn tree_from_merging_commits(
+/// Merge together many commits, making use of the preferred tree.
+fn merged_tree_from_commits(
     repo: &gix::Repository,
     commits: &[gix::ObjectId],
+    tree_merge_mode: TreeMergeMode,
     preference: TreeKind,
 ) -> Result<MergeOutcome> {
     let mut to_merge = commits.to_vec();
@@ -231,7 +258,12 @@ fn tree_from_merging_commits(
 
         let commit = but_core::Commit::from_id(commit.attach(repo))?;
         let tree = find_real_tree(&commit, preference)?;
-        let (options, conflicts) = repo.merge_options_fail_fast()?;
+        // When parents are independent, rename detection can produce false
+        // positives across them, silently swallowing clean file deletions.
+        let (options, conflicts) = match tree_merge_mode {
+            TreeMergeMode::WithRenames => repo.merge_options_fail_fast()?,
+            TreeMergeMode::WithoutRenames => repo.merge_options_no_rewrites_fail_fast()?,
+        };
 
         let mut output = repo.merge_trees(
             peel_to_tree_or_empty(repo, base)?,
@@ -305,24 +337,21 @@ fn commit_from_unconflicted_tree<'repo>(
     let repo = to_rebase.id.repo;
 
     let headers = to_rebase.headers();
-    let to_rebase_is_conflicted = headers.as_ref().is_some_and(|hdr| hdr.is_conflicted());
     let mut new_commit = to_rebase.inner;
     new_commit.tree = resolved_tree_id.detach();
 
     // Ensure the commit isn't thinking it's conflicted.
-    if to_rebase_is_conflicted {
-        if let Some(pos) = new_commit
-            .extra_headers()
-            .find_pos(HEADERS_CONFLICTED_FIELD)
-        {
-            new_commit.extra_headers.remove(pos);
-        }
+    new_commit.message = but_core::commit::strip_conflict_markers(new_commit.message.as_ref());
+    if let Some(pos) = new_commit
+        .extra_headers()
+        .find_pos(HEADERS_CONFLICTED_FIELD)
+    {
+        new_commit.extra_headers.remove(pos);
     } else if headers.is_none() {
+        let headers = Headers::from_config(&repo.config_snapshot());
         new_commit
             .extra_headers
-            .extend(Vec::<(BString, BString)>::from(&Headers::from_config(
-                &repo.config_snapshot(),
-            )));
+            .extend(Vec::<(BString, BString)>::from(&headers));
     }
     new_commit.parents = parents.into();
 
@@ -348,10 +377,6 @@ fn commit_from_conflicted_tree<'repo>(
     sign_commit: SignCommit,
 ) -> anyhow::Result<gix::Id<'repo>> {
     let repo = resolved_tree_id.repo;
-    // in case someone checks this out with vanilla Git, we should warn why it looks like this
-    let readme_content =
-        b"You have checked out a GitButler Conflicted commit. You probably didn't mean to do this.";
-    let readme_blob = repo.write_blob(readme_content)?;
 
     let conflicted_files =
         extract_conflicted_files(resolved_tree_id, cherry_pick, treat_as_unresolved)?;
@@ -383,14 +408,17 @@ fn commit_from_conflicted_tree<'repo>(
         resolved_tree_id,
     )?;
     tree.upsert(".conflict-files", EntryKind::Blob, conflicted_files_blob)?;
-    tree.upsert("CONFLICT-README.txt", EntryKind::Blob, readme_blob)?;
 
     let mut headers = to_rebase
         .headers()
         .unwrap_or_else(|| Headers::from_config(&repo.config_snapshot()));
-    headers.conflicted = conflicted_files.conflicted_header_field();
+    headers.conflicted = None;
     to_rebase.tree = tree.write().context("failed to write tree")?.detach();
     to_rebase.parents = parents.into();
+
+    // Add conflict markers to the commit message
+    to_rebase.inner.message =
+        but_core::commit::add_conflict_markers(to_rebase.inner.message.as_ref());
 
     to_rebase.set_headers(&headers);
     Ok(crate::commit::create(

@@ -46,6 +46,10 @@ pub(crate) mod state {
                             "headSha": head_sha,
                         }),
                     },
+                    Change::GitRemoteActivity { project_id } => ChangeForFrontend {
+                        name: format!("project://{project_id}/git/remote-activity"),
+                        payload: serde_json::json!({}),
+                    },
                     Change::WorktreeChanges {
                         project_id,
                         changes,
@@ -185,7 +189,7 @@ pub(crate) mod state {
                 watch_mode,
             )?;
 
-            let db = ctx.db.get()?;
+            let db = ctx.db.get_cache()?;
             let db_watcher = but_db::poll::watch_in_background(&db, {
                 let app_handle = self.app_handle.clone();
                 let project_id = ctx.legacy_project.id.clone();

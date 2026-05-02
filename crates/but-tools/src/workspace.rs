@@ -4,10 +4,14 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context as _;
-use bstr::BString;
-use but_core::{TreeChange, UnifiedPatch, ref_metadata::StackId};
+use anyhow::{Context as _, bail};
+use bstr::{BString, ByteSlice as _};
+use but_core::{
+    TreeChange, UnifiedPatch,
+    ref_metadata::{StackId, StackKind},
+};
 use but_ctx::Context;
+use but_rebase::graph_rebase::{Editor, LookupStep as _};
 use but_workspace::legacy::{CommmitSplitOutcome, ui::StackEntryNoOpt};
 use gitbutler_branch_actions::{BranchManagerExt, update_workspace_commit};
 use gitbutler_oplog::{
@@ -15,7 +19,6 @@ use gitbutler_oplog::{
     entry::{OperationKind, SnapshotDetails},
 };
 use gitbutler_reference::{LocalRefname, Refname};
-use gitbutler_stack::{PatchReferenceUpdate, VirtualBranchesHandle};
 use schemars::{JsonSchema, schema_for};
 
 use crate::tool::{Tool, ToolResult, Toolset, WorkspaceToolset, error_to_json, result_to_json};
@@ -170,7 +173,6 @@ pub fn create_commit(
     let mut guard = ctx.exclusive_worktree_access();
     let repo = ctx.repo.get()?;
     let worktree = but_core::diff::worktree_changes(&repo)?;
-    let vb_state = VirtualBranchesHandle::new(ctx.project_data_dir());
 
     let file_changes: Vec<but_core::DiffSpec> = worktree
         .changes
@@ -199,16 +201,6 @@ pub fn create_commit(
                 .expect("Failed to create virtual branch");
             stack.id
         });
-
-    // Update the branch description.
-    let mut stack = vb_state.get_stack(stack_id)?;
-    stack.update_branch(
-        ctx,
-        params.branch_name.clone(),
-        &PatchReferenceUpdate {
-            ..Default::default()
-        },
-    )?;
 
     let snapshot_tree = ctx.prepare_snapshot(guard.read_permission());
 
@@ -303,7 +295,6 @@ pub fn create_branch(
 ) -> Result<StackEntryNoOpt, anyhow::Error> {
     let mut guard = ctx.exclusive_worktree_access();
     let perm = guard.write_permission();
-    let vb_state = VirtualBranchesHandle::new(ctx.project_data_dir());
 
     let name = params.branch_name;
 
@@ -313,16 +304,6 @@ pub fn create_branch(
     };
 
     let stack_entry = gitbutler_branch_actions::create_virtual_branch(ctx, &branch, perm)?;
-
-    // Update the branch description.
-    let mut stack = vb_state.get_stack(stack_entry.id)?;
-    stack.update_branch(
-        ctx,
-        name,
-        &PatchReferenceUpdate {
-            ..Default::default()
-        },
-    )?;
 
     Ok(stack_entry)
 }
@@ -675,10 +656,8 @@ fn move_file_changes(
 ) -> Result<Vec<(gix::ObjectId, gix::ObjectId)>, anyhow::Error> {
     let source_commit_id = gix::ObjectId::from_str(&params.source_commit_id)
         .map(|id| find_the_right_commit_id(id, commit_mapping))?;
-    let source_stack_id = StackId::from_str(&params.source_stack_id)?;
     let destination_commit_id = gix::ObjectId::from_str(&params.destination_commit_id)
         .map(|id| find_the_right_commit_id(id, commit_mapping))?;
-    let destination_stack_id = StackId::from_str(&params.destination_stack_id)?;
 
     let changes = params
         .files
@@ -690,26 +669,32 @@ fn move_file_changes(
         })
         .collect::<Vec<_>>();
 
+    let context_lines = ctx.settings.context_lines;
+    let mut meta = ctx.meta()?;
     let mut guard = ctx.exclusive_worktree_access();
-    let result = but_workspace::legacy::move_changes_between_commits(
-        ctx,
-        source_stack_id,
+    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(guard.write_permission())?;
+    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let outcome = but_workspace::commit::move_changes_between_commits(
+        editor,
         source_commit_id,
-        destination_stack_id,
         destination_commit_id,
         changes,
-        guard.write_permission(),
+        context_lines,
     )?;
-
-    // TODO(ctx): remove this, with the rebase engine this is done above
-    gitbutler_branch_actions::update_workspace_commit(ctx, false)?;
+    let replaced_commits = outcome
+        .rebase
+        .materialize_without_checkout()?
+        .history
+        .commit_mappings()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     // Update the commit mapping with the new commit ids.
-    for (old_commit_id, new_commit_id) in result.replaced_commits.clone().iter() {
+    for (old_commit_id, new_commit_id) in replaced_commits.iter() {
         commit_mapping.insert(*old_commit_id, *new_commit_id);
     }
 
-    Ok(result.replaced_commits)
+    Ok(replaced_commits)
 }
 
 pub struct GetCommitDetails;
@@ -855,18 +840,7 @@ pub fn branch_changes(
     ctx: &mut Context,
     params: GetBranchChangesParameters,
 ) -> anyhow::Result<Vec<FileChangeSimple>> {
-    let stacks = stacks(ctx)?;
-    let stack_id = stacks
-        .iter()
-        .find_map(|s| {
-            let found = s.heads.iter().any(|h| h.name == params.branch_name);
-            if found { s.id } else { None }
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("Branch '{}' not found in the workspace", params.branch_name)
-        })?;
-
-    let changes = changes_in_branch_inner(ctx, params.branch_name, Some(stack_id))?;
+    let changes = changes_in_branch_inner(ctx, params.branch_name)?;
     let file_changes = changes
         .changes
         .into_iter()
@@ -1010,14 +984,24 @@ pub fn squash_commits(
     let squashed_commit =
         gitbutler_branch_actions::squash_commits(ctx, stack_id, source_ids, destination_id)?;
 
-    let new_commit_id = gitbutler_branch_actions::update_commit_message(
-        ctx,
-        stack_id,
-        squashed_commit,
-        message.as_str(),
-    )?;
+    if message.is_empty() {
+        bail!("commit message can not be empty");
+    }
 
-    // Update the commit mapping with the new commit id.
+    let mut guard = ctx.exclusive_worktree_access();
+    let mut meta = ctx.meta()?;
+    let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(guard.write_permission())?;
+    let editor = Editor::create(&mut ws, &mut meta, &repo)?;
+    let (rebase, edited_commit_selector) =
+        but_workspace::commit::reword(editor, squashed_commit, message.as_bytes().as_bstr())?;
+    let new_commit_id = rebase.lookup_pick(edited_commit_selector)?;
+    let materialized = rebase.materialize()?;
+
+    for (old_commit_id, new_commit_id) in materialized.history.commit_mappings() {
+        commit_mapping.insert(old_commit_id, new_commit_id);
+    }
+
+    // Keep the original destination commit id pointing at the final squashed + reworded commit.
     commit_mapping.insert(destination_id, new_commit_id);
 
     Ok(new_commit_id)
@@ -1146,7 +1130,6 @@ pub fn split_branch(
 
     let (stack_id, _, _) = branch_manager.create_virtual_branch_from_branch(
         &refname,
-        None,
         None,
         guard.write_permission(),
     )?;
@@ -1472,17 +1455,10 @@ impl ToolResult for Result<ProjectStatus, anyhow::Error> {
 }
 
 pub fn get_project_status(
-    ctx: &mut Context,
+    ctx: &Context,
     filter_changes: Option<Vec<BString>>,
 ) -> anyhow::Result<ProjectStatus> {
-    let stacks = stacks(ctx)?;
-    let stacks = entries_to_simple_stacks(
-        &stacks
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>, _>>()?,
-        ctx,
-    )?;
+    let stacks = simple_stacks_from_workspace(ctx)?;
 
     let file_changes = get_filtered_changes(ctx, filter_changes)?;
 
@@ -1493,7 +1469,7 @@ pub fn get_project_status(
 }
 
 pub fn get_filtered_changes(
-    ctx: &mut Context,
+    ctx: &Context,
     filter_changes: Option<Vec<BString>>,
 ) -> Result<Vec<FileChange>, anyhow::Error> {
     let context_lines = ctx.settings.context_lines;
@@ -1521,34 +1497,45 @@ pub fn get_filtered_changes(
     Ok(file_changes)
 }
 
-fn entries_to_simple_stacks(
-    entries: &[StackEntryNoOpt],
-    ctx: &Context,
-) -> anyhow::Result<Vec<SimpleStack>> {
+fn simple_stacks_from_workspace(ctx: &Context) -> anyhow::Result<Vec<SimpleStack>> {
     let mut stacks = vec![];
-    let vb_state = VirtualBranchesHandle::new(ctx.project_data_dir());
-    let repo = &*ctx.repo.get()?;
-    for entry in entries {
-        let stack = vb_state.get_stack(entry.id)?;
-        let branches = stack.branches();
-        let branches = branches.iter().filter(|b| !b.archived);
-        let mut simple_branches = vec![];
-        for branch in branches {
-            let commits =
-                but_workspace::legacy::local_and_remote_commits(ctx, repo, branch, &stack)?;
+    let (_guard, repo, ws, _db) = ctx.workspace_and_db()?;
+    for stack in &ws.stacks {
+        let Some(stack_id) = stack.id else {
+            continue;
+        };
 
+        let mut simple_branches = vec![];
+        for segment in stack.segments.iter().rev() {
+            let Some(ref_name) = segment.ref_name() else {
+                continue;
+            };
+            let archived = ws
+                .metadata
+                .as_ref()
+                .and_then(|metadata| {
+                    metadata
+                        .find_branch(ref_name, StackKind::AppliedAndUnapplied)
+                        .map(|branch| branch.archived)
+                })
+                .unwrap_or(false);
+            if archived {
+                continue;
+            }
+
+            let commits = segment
+                .commits
+                .iter()
+                .rev()
+                .map(|commit| simple_commit_from_id(&repo, commit.id))
+                .collect::<anyhow::Result<Vec<_>>>()?;
             if commits.is_empty() {
                 continue;
             }
 
-            let simple_commits = commits
-                .into_iter()
-                .map(SimpleCommit::from)
-                .collect::<Vec<_>>();
-
             simple_branches.push(SimpleBranch {
-                name: branch.name.to_string(),
-                commits: simple_commits,
+                name: ref_name.shorten().to_string(),
+                commits,
             });
         }
         if simple_branches.is_empty() {
@@ -1556,12 +1543,36 @@ fn entries_to_simple_stacks(
         }
 
         stacks.push(SimpleStack {
-            id: entry.id,
-            name: entry.name().unwrap_or_default().to_string(),
+            id: stack_id,
+            name: stack
+                .ref_name()
+                .map(|ref_name| ref_name.shorten().to_string())
+                .unwrap_or_default(),
             branches: simple_branches,
         });
     }
     Ok(stacks)
+}
+
+fn simple_commit_from_id(
+    repo: &gix::Repository,
+    commit_id: gix::ObjectId,
+) -> anyhow::Result<SimpleCommit> {
+    let message_str = repo.find_commit(commit_id)?.message_raw()?.to_string();
+    let mut lines = message_str.lines();
+    let message_title = lines.next().unwrap_or_default().to_string();
+    let mut message_body = lines.collect::<Vec<_>>().join("\n");
+    while message_body.starts_with('\n') || message_body.starts_with("\r\n") {
+        message_body = message_body
+            .trim_start_matches('\n')
+            .trim_start_matches("\r\n")
+            .to_string();
+    }
+    Ok(SimpleCommit {
+        id: commit_id,
+        message_title,
+        message_body,
+    })
 }
 
 fn get_file_changes(
@@ -1633,58 +1644,62 @@ fn unified_diff_for_changes(
 fn changes_in_branch_inner(
     ctx: &Context,
     branch_name: String,
-    stack_id: Option<StackId>,
 ) -> anyhow::Result<but_core::ui::TreeChanges> {
-    let state = VirtualBranchesHandle::new(ctx.project_data_dir());
-    let repo = ctx.repo.get()?;
-    let (start_commit_id, base_commit_id) = if let Some(stack_id) = stack_id {
-        commit_and_base_from_stack(ctx, &state, stack_id, branch_name.clone())
-    } else {
-        let start_commit_id = repo.find_reference(&branch_name)?.peel_to_commit()?.id;
-        let target = state.get_default_target()?;
-        let merge_base = repo.merge_base(start_commit_id, target.sha)?.detach();
-        Ok((start_commit_id, merge_base))
-    }?;
+    let (_guard, repo, ws, _db) = ctx.workspace_and_db()?;
+    let (start_commit_id, base_commit_id) =
+        commit_and_base_from_stack(&repo, &ws, branch_name.as_str())?;
 
     but_core::diff::ui::changes_with_line_stats_in_range(&repo, start_commit_id, base_commit_id)
 }
 
 fn commit_and_base_from_stack(
-    ctx: &Context,
-    state: &VirtualBranchesHandle,
-    stack_id: StackId,
-    branch_name: String,
+    repo: &gix::Repository,
+    ws: &but_graph::projection::Workspace,
+    branch_name: &str,
 ) -> anyhow::Result<(gix::ObjectId, gix::ObjectId)> {
-    let stack = state.get_stack(stack_id)?;
-
-    // Find the branch head and the one before it
-    let heads = stack.heads(false);
-    let (start, end) = heads
+    let (stack, segment_index, ref_name) = ws
+        .stacks
         .iter()
-        .rev()
-        .fold((None, None), |(start, end), branch| {
-            if start.is_some() && end.is_none() {
-                (start, Some(branch))
-            } else if branch == &branch_name {
-                (Some(branch), None)
-            } else {
-                (start, end)
-            }
-        });
-    let repo = ctx.repo.get()?;
+        .find_map(|stack| {
+            stack
+                .segments
+                .iter()
+                .enumerate()
+                .find_map(|(segment_index, segment)| {
+                    segment
+                        .ref_name()
+                        .filter(|ref_name| ref_name_matches_branch_name(ref_name, branch_name))
+                        .map(|ref_name| (stack, segment_index, ref_name))
+                })
+        })
+        .with_context(|| format!("Branch {branch_name} not found in the workspace"))?;
 
-    // Find the head that matches the branch name - the commit contained is our commit_id
-    let start_commit_id = repo
-        .find_reference(start.with_context(|| format!("Branch {branch_name} not found"))?)?
-        .peel_to_commit()?
-        .id;
+    let start_commit_id = repo.find_reference(ref_name)?.peel_to_commit()?.id;
 
-    // Now, find the preceding head in the stack. If it is not present, use the stack merge base
-    let base_commit_id = match end {
-        Some(end) => repo.find_reference(end)?.peel_to_commit()?.id,
-        None => stack.merge_base(ctx)?,
+    let base_commit_id = if let Some(lower_segment) = stack.segments.get(segment_index + 1) {
+        if let Some(lower_ref_name) = lower_segment.ref_name() {
+            repo.find_reference(lower_ref_name)?.peel_to_commit()?.id
+        } else {
+            lower_segment
+                .tip()
+                .or(lower_segment.base)
+                .context("Couldn't determine base commit from lower stack segment")?
+        }
+    } else if let Some(stack_tip) = stack.tip_skip_empty() {
+        ws.merge_base_with_target_branch(stack_tip)
+            .map(|(merge_base, _target)| merge_base)
+            .or_else(|| stack.base())
+            .context("Couldn't determine base commit for bottom stack segment")?
+    } else {
+        stack
+            .base()
+            .context("Couldn't determine base commit for empty stack")?
     };
     Ok((start_commit_id, base_commit_id))
+}
+
+fn ref_name_matches_branch_name(ref_name: &gix::refs::FullNameRef, branch_name: &str) -> bool {
+    ref_name.to_string() == branch_name || *ref_name.shorten() == branch_name
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -1742,15 +1757,14 @@ fn find_the_right_commit_id(
     commit_id
 }
 
+#[expect(deprecated, reason = "calls but_workspace::legacy::stacks_v3")]
 fn stacks(ctx: &Context) -> anyhow::Result<Vec<but_workspace::legacy::ui::StackEntry>> {
     let meta = ctx.legacy_meta()?;
     let repo = &*ctx.repo.get()?;
-    let mut cache = ctx.cache.get_cache_mut()?;
     but_workspace::legacy::stacks_v3(
         repo,
         &meta,
         but_workspace::legacy::StacksFilter::InWorkspace,
         None,
-        &mut cache,
     )
 }

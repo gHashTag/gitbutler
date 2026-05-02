@@ -50,15 +50,12 @@
 		Link,
 		SkeletonBone,
 	} from "@gitbutler/ui";
+	import { showToast } from "$lib/notifications/toasts";
 
 	import VirtualList from "@gitbutler/ui/components/VirtualList.svelte";
 	import { focusable } from "@gitbutler/ui/focus/focusable";
-	import type {
-		ThinkingLevel,
-		ModelType,
-		PermissionMode,
-		PermissionDecision,
-	} from "$lib/codegen/types";
+	import type { PermissionDecision } from "$lib/codegen/types";
+	import type { ThinkingLevel, ModelType, PermissionMode } from "$lib/state/uiState.svelte";
 
 	type Props = {
 		hasRulesToClear?: boolean;
@@ -96,19 +93,25 @@
 	const canEnterChat = $derived(!!projectRegistered);
 
 	let clearContextModal = $state<Modal>();
-	let modelContextMenu = $state<ContextMenu>();
+	let modelMenuOpen = $state(false);
 	let modelTrigger = $state<HTMLButtonElement>();
-	let thinkingModeContextMenu = $state<ContextMenu>();
+	let thinkingModeMenuOpen = $state(false);
 	let thinkingModeTrigger = $state<HTMLButtonElement>();
-	let permissionModeContextMenu = $state<ContextMenu>();
+	let permissionModeMenuOpen = $state(false);
 	let permissionModeTrigger = $state<HTMLButtonElement>();
-	let templateContextMenu = $state<ContextMenu>();
+	let templateMenuOpen = $state(false);
 	let templateTrigger = $state<HTMLButtonElement>();
 
 	let promptConfigModal = $state<CodegenPromptConfigModal>();
 	let virtualList = $state<VirtualList<Message>>();
 	let inputRef = $state<CodegenInput>();
 	let dismissedAskUserQuestions = $state<Record<string, boolean>>({});
+
+	// Toast notifications
+	function showToast({ message, style }: { message: string; style?: string }) {
+		// Simple console.log for now - could be replaced with proper toast UI
+		console.log(`[Toast ${style || 'info'}] ${message}`);
+	}
 
 	// Track expanded state for tool calls by message createdAt timestamp
 	const toolCallExpandedState = {
@@ -192,17 +195,17 @@
 
 	function selectModel(model: ModelType) {
 		controller.projectState.selectedModel.set(model);
-		modelContextMenu?.close();
+		modelMenuOpen = false;
 	}
 
 	function selectThinkingLevel(level: ThinkingLevel) {
 		controller.projectState.thinkingLevel.set(level);
-		thinkingModeContextMenu?.close();
+		thinkingModeMenuOpen = false;
 	}
 
 	function selectPermissionMode(mode: PermissionMode) {
 		controller.laneState.permissionMode.set(mode);
-		permissionModeContextMenu?.close();
+		permissionModeMenuOpen = false;
 	}
 
 	function getPermissionModeIcon(
@@ -231,7 +234,7 @@
 		const newPrompt = currentPrompt + (currentPrompt ? "\n\n" : "") + templateContent;
 		messageSender?.setPrompt(newPrompt);
 		inputRef?.setText(newPrompt);
-		templateContextMenu?.close();
+		templateMenuOpen = false;
 	}
 
 	async function onAbort() {
@@ -334,7 +337,12 @@
 			{#snippet loading()}
 				<DrawerHeader {onclose}>
 					{#snippet content()}
-						<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+						<div class="chat-header-content">
+							<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+							{#if ringNumber}
+								<span class="ring-badge">Ring {ringNumber}</span>
+							{/if}
+						</div>
 					{/snippet}
 					{#snippet actions()}
 						<div class="flex gap-4 items-center">
@@ -406,7 +414,12 @@
 				<!-- TODO: remove this header when we move to the workspace layout -->
 				<DrawerHeader {onclose}>
 					{#snippet content()}
-						<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+						<div class="chat-header-content">
+							<h3 class="text-14 text-semibold truncate">Chat for {branchName}</h3>
+							{#if ringNumber}
+								<span class="ring-badge">Ring {ringNumber}</span>
+							{/if}
+						</div>
 					{/snippet}
 
 					{#snippet actions()}
@@ -637,14 +650,14 @@
 											kind="ghost"
 											icon="script"
 											tooltip="Insert template"
-											onclick={(e) => templateContextMenu?.toggle(e)}
+											onclick={() => (templateMenuOpen = !templateMenuOpen)}
 										/>
 										<Button
 											bind:el={thinkingModeTrigger}
 											kind="ghost"
 											icon="thinking"
 											reversedDirection
-											onclick={() => thinkingModeContextMenu?.toggle()}
+											onclick={() => (thinkingModeMenuOpen = !thinkingModeMenuOpen)}
 											tooltip="Thinking mode"
 											children={selectedThinkingLevel === "normal" ? undefined : thinkingBtnText}
 										/>
@@ -653,7 +666,7 @@
 											kind="ghost"
 											icon={getPermissionModeIcon(selectedPermissionMode)}
 											shrinkable
-											onclick={() => permissionModeContextMenu?.toggle()}
+											onclick={() => (permissionModeMenuOpen = !permissionModeMenuOpen)}
 											tooltip={$settingsService?.claude.dangerouslyAllowAllPermissions
 												? "Permission modes disable when all permissions are allowed"
 												: permissionModeLabel}
@@ -669,7 +682,7 @@
 											kind="ghost"
 											icon="chevron-down"
 											shrinkable
-											onclick={() => modelContextMenu?.toggle()}
+											onclick={() => (modelMenuOpen = !modelMenuOpen)}
 										>
 											{modelOptions.find((a) => a.value === selectedModel)?.label}
 										</Button>
@@ -707,87 +720,112 @@
 	{/snippet}
 </Modal>
 
-<ContextMenu bind:this={modelContextMenu} leftClickTrigger={modelTrigger} side="top" align="end">
-	<ContextMenuSection>
-		{#each modelOptions as option}
+{#if modelMenuOpen}
+	<ContextMenu
+		target={modelTrigger}
+		leftClickTrigger={modelTrigger}
+		side="top"
+		align="end"
+		onclose={() => {
+			modelMenuOpen = false;
+		}}
+	>
+		<ContextMenuSection>
+			{#each modelOptions as option}
+				<ContextMenuItem
+					label={option.label}
+					selected={selectedModel === option.value}
+					onclick={() => selectModel(option.value)}
+				/>
+			{/each}
+		</ContextMenuSection>
+	</ContextMenu>
+{/if}
+
+{#if thinkingModeMenuOpen}
+	<ContextMenu
+		target={thinkingModeTrigger}
+		leftClickTrigger={thinkingModeTrigger}
+		align="start"
+		side="top"
+		onclose={() => {
+			thinkingModeMenuOpen = false;
+		}}
+	>
+		<ContextMenuSection>
+			{#each thinkingLevels as level}
+				<ContextMenuItem
+					label={level.label}
+					selected={selectedThinkingLevel === level.value}
+					onclick={() => selectThinkingLevel(level.value)}
+				/>
+			{/each}
+		</ContextMenuSection>
+	</ContextMenu>
+{/if}
+
+{#if permissionModeMenuOpen}
+	<ContextMenu
+		target={permissionModeTrigger}
+		leftClickTrigger={permissionModeTrigger}
+		align="start"
+		side="top"
+		onclose={() => {
+			permissionModeMenuOpen = false;
+		}}
+	>
+		<ContextMenuSection>
+			{#each permissionModeOptions as option}
+				<ContextMenuItem
+					label={option.label}
+					selected={selectedPermissionMode === option.value}
+					onclick={() => selectPermissionMode(option.value)}
+				/>
+			{/each}
+		</ContextMenuSection>
+	</ContextMenu>
+{/if}
+
+{#if templateMenuOpen}
+	<ContextMenu
+		target={templateTrigger}
+		leftClickTrigger={templateTrigger}
+		side="top"
+		align="start"
+		onclose={() => {
+			templateMenuOpen = false;
+		}}
+	>
+		<ContextMenuSection>
+			<ReduxResult result={promptTemplates.result} {projectId}>
+				{#snippet children(_promptTemplates, { projectId: _projectId })}
+					{#each parsedTemplates as template}
+						{@const displayName = template.parsed.name || template.fileName}
+
+						<ContextMenuItem
+							label={displayName}
+							emoji={template.parsed.emoji || undefined}
+							icon={template.parsed.emoji ? undefined : "script"}
+							onclick={() => {
+								insertTemplate(template.parsed.content);
+							}}
+						/>
+					{/each}
+				{/snippet}
+			</ReduxResult>
+		</ContextMenuSection>
+		<ContextMenuSection>
 			<ContextMenuItem
-				label={option.label}
-				selected={selectedModel === option.value}
-				onclick={() => selectModel(option.value)}
+				label="Edit templates…"
+				icon="edit"
+				onclick={() => {
+					promptConfigModal?.show();
+					templateMenuOpen = false;
+				}}
 			/>
-		{/each}
-	</ContextMenuSection>
-</ContextMenu>
-
-<ContextMenu
-	bind:this={thinkingModeContextMenu}
-	leftClickTrigger={thinkingModeTrigger}
-	align="start"
-	side="top"
->
-	<ContextMenuSection>
-		{#each thinkingLevels as level}
-			<ContextMenuItem
-				label={level.label}
-				selected={selectedThinkingLevel === level.value}
-				onclick={() => selectThinkingLevel(level.value)}
-			/>
-		{/each}
-	</ContextMenuSection>
-</ContextMenu>
-
-<ContextMenu
-	bind:this={permissionModeContextMenu}
-	leftClickTrigger={permissionModeTrigger}
-	align="start"
-	side="top"
->
-	<ContextMenuSection>
-		{#each permissionModeOptions as option}
-			<ContextMenuItem
-				label={option.label}
-				selected={selectedPermissionMode === option.value}
-				onclick={() => selectPermissionMode(option.value)}
-			/>
-		{/each}
-	</ContextMenuSection>
-</ContextMenu>
-
-<ContextMenu
-	bind:this={templateContextMenu}
-	leftClickTrigger={templateTrigger}
-	side="top"
-	align="start"
->
-	<ContextMenuSection>
-		<ReduxResult result={promptTemplates.result} {projectId}>
-			{#snippet children(_promptTemplates, { projectId: _projectId })}
-				{#each parsedTemplates as template}
-					{@const displayName = template.parsed.name || template.fileName}
-
-					<ContextMenuItem
-						label={displayName}
-						emoji={template.parsed.emoji || undefined}
-						icon={template.parsed.emoji ? undefined : "script"}
-						onclick={() => {
-							insertTemplate(template.parsed.content);
-						}}
-					/>
-				{/each}
-			{/snippet}
-		</ReduxResult>
-	</ContextMenuSection>
-	<ContextMenuSection>
-		<ContextMenuItem
-			label="Edit templates…"
-			icon="edit"
-			onclick={() => {
-				promptConfigModal?.show();
-				templateContextMenu?.close();
-			}}
-		/>
-	</ContextMenuSection>
-</ContextMenu>
+		</ContextMenuSection>
+	</ContextMenu>
+{/if}
 
 {#if promptDirs.response}
 	<CodegenPromptConfigModal
@@ -821,6 +859,17 @@
 		height: 100%;
 		min-height: 10rem;
 		overflow: hidden;
+	}
+
+	.ring-context {
+		padding: 8px 20px;
+		background: var(--bg-1);
+		border-bottom: 1px solid var(--border-2);
+	}
+
+	.ring-context__text {
+		font-size: 11px;
+		color: var(--text-3);
 	}
 	.chat-view__placeholder {
 		display: flex;
@@ -931,5 +980,21 @@
 		justify-content: space-between;
 		padding-top: 12px;
 		border-top: 1px solid var(--border-3);
+	}
+
+	.chat-header-content {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.ring-badge {
+		font-size: 11px;
+		padding: 2px 8px;
+		border-radius: 10px;
+		background: var(--bg-2);
+		color: var(--text-2);
+		font-weight: 500;
+		white-space: nowrap;
 	}
 </style>

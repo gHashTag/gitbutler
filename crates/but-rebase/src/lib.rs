@@ -16,7 +16,7 @@ pub mod graph_rebase;
 
 /// Types for use with cherry-picking
 pub mod cherry_pick;
-pub use cherry_pick::function::cherry_pick_one;
+pub use cherry_pick::cherry_pick_one;
 
 use crate::cherry_pick::{EmptyCommit, PickMode};
 
@@ -141,10 +141,7 @@ impl<'repo> Rebase<'repo> {
     ///
     /// **However, note that it will also make all input commits sequential, so the caller must assure
     /// these actually form a 'line'.**
-    // TODO: use the `cache` in all places where a ChangeID would be generated, and pick the cached
-    //       version if available. The idea is that the 'virtual' one from the cache gets persisted
-    //       when needed.
-    pub fn rebase(&mut self, _cache: &but_db::CacheHandle) -> Result<RebaseOutput> {
+    pub fn rebase(&mut self) -> Result<RebaseOutput> {
         if self.steps.is_empty() {
             return Err(anyhow!("No rebase steps provided"));
         }
@@ -289,7 +286,11 @@ fn rebase(
                         None if commit.parents.is_empty() => {
                             let mut new_commit = commit;
                             if let Some(new_message) = new_message {
-                                new_commit.message = new_message;
+                                new_commit.message =
+                                    but_core::commit::rewrite_conflict_markers_on_message_change(
+                                        new_commit.message.as_ref(),
+                                        new_message,
+                                    );
                             }
                             cursor = Some(commit::create(
                                 repo,
@@ -328,7 +329,11 @@ fn rebase(
                 let mut new_commit = repo.find_commit(new_commit)?.decode()?.to_owned()?;
                 new_commit.parents = base_commit.parent_ids().map(|id| id.detach()).collect();
                 if let Some(new_message) = new_message {
-                    new_commit.message = new_message;
+                    new_commit.message =
+                        but_core::commit::rewrite_conflict_markers_on_message_change(
+                            new_commit.message.as_ref(),
+                            new_message,
+                        );
                 }
                 *cursor = commit::create(
                     repo,
@@ -374,7 +379,10 @@ fn reword_commit(
     new_message: BString,
 ) -> Result<gix::ObjectId> {
     let mut new_commit = repo.find_commit(oid)?.decode()?.to_owned()?;
-    new_commit.message = new_message;
+    new_commit.message = but_core::commit::rewrite_conflict_markers_on_message_change(
+        new_commit.message.as_ref(),
+        new_message,
+    );
     Ok(commit::create(
         repo,
         new_commit,

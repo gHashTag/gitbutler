@@ -1,14 +1,16 @@
+#![expect(deprecated, reason = "calls but_workspace::legacy::stacks_v3")]
+
 use std::{fs, path, path::PathBuf, str::FromStr};
 
 use but_ctx::{Context, ProjectHandleOrLegacyProjectId, RepoOpenMode};
 use but_error::Marker;
 use but_project_handle::storage_path_config_key;
+use but_rebase::graph_rebase::LookupStep as _;
 use but_settings::AppSettings;
 use but_testsupport::gix_testtools::{Creation, scripted_fixture_writable_with_args};
 use gitbutler_branch::BranchCreateRequest;
 use gitbutler_branch_actions::GITBUTLER_WORKSPACE_COMMIT_TITLE;
 use gitbutler_oplog::{OplogExt, SnapshotExt};
-use gitbutler_project::{self as projects};
 use gitbutler_reference::{LocalRefname, Refname};
 use gitbutler_stack::StackId;
 use tempfile::{TempDir, tempdir};
@@ -220,7 +222,8 @@ impl Test {
             settings,
             RepoOpenMode::Isolated,
         )
-        .expect("can create context");
+        .expect("can create context")
+        .with_memory_app_cache();
         Self {
             repo: test_project,
             project_id: project.id,
@@ -311,86 +314,16 @@ fn maybe_find_branch_by_refname<'repo>(
     }
 }
 
-mod amend;
 mod apply_virtual_branch;
 mod create_virtual_branch_from_branch;
 mod init;
 mod list;
 mod list_details;
-mod move_branch;
-mod move_commit_to_vbranch;
 mod oplog;
 mod save_and_unapply_virtual_branch;
 mod set_base_branch;
 mod unapply_without_saving_virtual_branch;
-mod undo_commit;
-mod update_commit_message;
 mod workspace_migration;
-
-/// Create a raw git commit parented to `parent` that sets `filename` to `content`,
-/// bypassing GitButler's stack API. Used in tests to construct competitor commits
-/// or to inject a known tree state without going through the worktree.
-pub fn make_commit_on_file(
-    repo: &gix::Repository,
-    parent: gix::ObjectId,
-    filename: &str,
-    content: &[u8],
-) -> anyhow::Result<gix::ObjectId> {
-    let blob_id = repo.write_blob(content)?.detach();
-    let parent_commit = repo.find_commit(parent)?;
-    let mut editor = parent_commit.tree()?.edit()?;
-    editor.upsert(filename, gix::object::tree::EntryKind::Blob, blob_id)?;
-    let tree_id = editor.write()?.detach();
-    Ok(repo
-        .write_object(gix::objs::Commit {
-            tree: tree_id,
-            parents: [parent].into(),
-            message: "raw test commit".into(),
-            ..parent_commit.decode()?.to_owned()?
-        })?
-        .detach())
-}
-
-/// Cherry-pick `competing_oid` (which shares an ancestor with `onto_oid` and modifies the
-/// same content) onto `onto_oid` to produce a conflicted commit, then update the source
-/// stack head to that conflicted commit. Returns the conflicted commit's OID.
-///
-/// The conflicted commit is parented to `onto_oid`, so after this call the source stack
-/// history is: merge_base → onto_oid → conflicted.
-pub fn push_conflicted_commit_onto(
-    ctx: &but_ctx::Context,
-    stack_id: gitbutler_stack::StackId,
-    onto_oid: gix::ObjectId,
-    competing_oid: gix::ObjectId,
-) -> anyhow::Result<gix::ObjectId> {
-    let (_guard, repo, ws, _db) = ctx.workspace_and_db()?;
-    let conflicted_oid = but_rebase::cherry_pick_one(
-        &repo,
-        onto_oid,
-        competing_oid,
-        but_rebase::cherry_pick::PickMode::Unconditionally,
-        but_rebase::cherry_pick::EmptyCommit::Keep,
-    )?;
-    assert!(
-        but_core::Commit::from_id(repo.find_commit(conflicted_oid)?.id())?.is_conflicted(),
-        "cherry_pick_one must have produced a conflicted commit for the test to be meaningful"
-    );
-    let ref_name = ws
-        .stacks
-        .iter()
-        .find(|s| s.id == Some(stack_id))
-        .ok_or_else(|| anyhow::anyhow!("stack not found in workspace"))?
-        .ref_name()
-        .ok_or_else(|| anyhow::anyhow!("stack has no ref name"))?
-        .to_owned();
-    repo.reference(
-        ref_name.as_ref(),
-        conflicted_oid,
-        gix::refs::transaction::PreviousValue::Any,
-        "test: push conflicted commit",
-    )?;
-    Ok(conflicted_oid)
-}
 
 pub fn list_commit_files(
     ctx: &Context,
@@ -411,20 +344,18 @@ pub fn create_commit(
 ) -> anyhow::Result<gix::ObjectId> {
     let mut guard = ctx.exclusive_worktree_access();
 
-    let repo = ctx.repo.get()?;
+    let repo = ctx.repo.get()?.clone();
     let worktree = but_core::diff::worktree_changes(&repo)?;
     let file_changes: Vec<but_core::DiffSpec> =
         worktree.changes.iter().map(Into::into).collect::<Vec<_>>();
 
     let meta = ctx.legacy_meta()?;
     let stacks = {
-        let mut cache = ctx.cache.get_cache_mut()?;
         but_workspace::legacy::stacks_v3(
             &repo,
             &meta,
             but_workspace::legacy::StacksFilter::InWorkspace,
             None,
-            &mut cache,
         )?
     };
 
@@ -436,16 +367,29 @@ pub fn create_commit(
         .and_then(|s| s.heads.first().map(|h| h.name.to_string()))
         .ok_or(anyhow::anyhow!("Could not find associated reference name"))?;
 
-    let outcome = but_workspace::legacy::commit_engine::create_commit_simple(
-        ctx,
-        stack_id,
-        None,
-        file_changes,
-        message.to_string(),
-        stack_branch_name,
-        guard.write_permission(),
-    );
-
+    let mut meta = ctx.meta()?;
+    ctx.reload_repo_and_invalidate_workspace(guard.write_permission())?;
+    let full_ref_name: gix::refs::FullName =
+        format!("refs/heads/{stack_branch_name}").try_into()?;
+    let outcome = {
+        let (repo, mut ws, _) = ctx.workspace_mut_and_db_with_perm(guard.write_permission())?;
+        let editor = but_rebase::graph_rebase::Editor::create(&mut ws, &mut meta, &repo)?;
+        but_workspace::commit::commit_create(
+            editor,
+            file_changes,
+            but_rebase::graph_rebase::mutate::RelativeToRef::Reference(full_ref_name.as_ref()),
+            but_rebase::graph_rebase::mutate::InsertSide::Below,
+            message,
+            ctx.settings.context_lines,
+        )
+        .and_then(|outcome| {
+            let selector = outcome.commit_selector;
+            let materialized = outcome.rebase.materialize()?;
+            selector
+                .map(|selector| materialized.lookup_pick(selector))
+                .transpose()
+        })
+    };
     let _ = snapshot_tree.and_then(|snapshot_tree| {
         ctx.snapshot_commit_creation(
             snapshot_tree,
@@ -455,7 +399,7 @@ pub fn create_commit(
             guard.write_permission(),
         )
     });
-    outcome?
-        .new_commit
-        .ok_or(anyhow::anyhow!("No new commit created"))
+    let new_commit = outcome?.ok_or(anyhow::anyhow!("No new commit created"))?;
+    ctx.reload_repo_and_invalidate_workspace(guard.write_permission())?;
+    Ok(new_commit)
 }

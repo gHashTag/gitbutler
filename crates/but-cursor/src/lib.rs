@@ -2,11 +2,11 @@ use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
 use but_action::{ActionHandler, Source, reword::CommitEvent};
 use but_ctx::Context;
-use but_hunk_assignment::HunkAssignmentRequest;
+use but_hunk_assignment::{HunkAssignmentRequest, HunkAssignmentTarget};
 use but_llm::LLMProvider;
 use but_workspace::legacy::StacksFilter;
 use gix::diff::blob::{
-    Algorithm, UnifiedDiff,
+    Algorithm, InternedInput, UnifiedDiff,
     unified_diff::{ConsumeBinaryHunk, ContextSize},
 };
 use serde::{Deserialize, Serialize};
@@ -59,19 +59,15 @@ impl gix::diff::blob::unified_diff::ConsumeBinaryHunkDelegate for ProduceDiffHun
 
 impl Edit {
     fn generate_headers(&self) -> anyhow::Result<Vec<but_core::HunkHeader>> {
-        let interner = gix::diff::blob::intern::InternedInput::new(
-            self.old_string.as_bytes(),
-            self.new_string.as_bytes(),
-        );
-        let headers = gix::diff::blob::diff(
-            Algorithm::Myers,
+        let interner = InternedInput::new(self.old_string.as_bytes(), self.new_string.as_bytes());
+        let diff = gix::diff::blob::diff_with_slider_heuristics(Algorithm::Myers, &interner);
+        let headers = UnifiedDiff::new(
+            &diff,
             &interner,
-            UnifiedDiff::new(
-                &interner,
-                ConsumeBinaryHunk::new(ProduceDiffHunk::default(), "\n"),
-                ContextSize::symmetrical(0), // Zero context lines is fine since the hunk will be reconciled later with but_hunk_assignment::assignments_with_fallback
-            ),
-        )?
+            ConsumeBinaryHunk::new(ProduceDiffHunk::default(), "\n"),
+            ContextSize::symmetrical(0), // Zero context lines is fine since the hunk will be reconciled later with but_hunk_assignment::assignments_with_fallback
+        )
+        .consume()?
         .headers;
         Ok(headers)
     }
@@ -117,6 +113,7 @@ fn cursor_path_to_pathbuf(input: &str) -> PathBuf {
     }
 }
 
+#[expect(deprecated, reason = "calls but_workspace::legacy::stacks_v3")]
 pub async fn handle_after_edit(read: impl std::io::Read) -> anyhow::Result<CursorHookOutput> {
     let mut input: FileEditEvent = serde_json::from_reader(read)
         .map_err(|e| anyhow::anyhow!("Failed to parse input JSON: {e}"))?;
@@ -150,14 +147,7 @@ pub async fn handle_after_edit(read: impl std::io::Read) -> anyhow::Result<Curso
     // Create repo and workspace once at the entry point
     let mut guard = ctx.exclusive_worktree_access();
     let stacks = {
-        let mut cache = ctx.cache.get_cache_mut()?;
-        but_workspace::legacy::stacks_v3(
-            &*ctx.repo.get()?,
-            &meta,
-            StacksFilter::default(),
-            None,
-            &mut cache,
-        )?
+        but_workspace::legacy::stacks_v3(&*ctx.repo.get()?, &meta, StacksFilter::default(), None)?
     };
     let stack_id = but_claude::hooks::get_or_create_session(
         &mut ctx,
@@ -199,8 +189,7 @@ pub async fn handle_after_edit(read: impl std::io::Read) -> anyhow::Result<Curso
         .map(|a| HunkAssignmentRequest {
             hunk_header: a.hunk_header,
             path_bytes: a.path_bytes,
-            stack_id: Some(stack_id),
-            branch_ref_bytes: None,
+            target: Some(HunkAssignmentTarget::Stack { stack_id }),
         })
         .collect();
 
@@ -215,6 +204,7 @@ pub async fn handle_after_edit(read: impl std::io::Read) -> anyhow::Result<Curso
     Ok(CursorHookOutput::default())
 }
 
+#[expect(deprecated, reason = "calls but_workspace::legacy::stacks_v3")]
 pub async fn handle_stop(
     nightly: bool,
     read: impl std::io::Read,
@@ -243,14 +233,7 @@ pub async fn handle_stop(
     // Create repo and workspace once at the entry point
     let mut guard = ctx.exclusive_worktree_access();
     let stacks = {
-        let mut cache = ctx.cache.get_cache_mut()?;
-        but_workspace::legacy::stacks_v3(
-            &*ctx.repo.get()?,
-            &meta,
-            StacksFilter::default(),
-            None,
-            &mut cache,
-        )?
+        but_workspace::legacy::stacks_v3(&*ctx.repo.get()?, &meta, StacksFilter::default(), None)?
     };
     let stack_id = but_claude::hooks::get_or_create_session(
         &mut ctx,
@@ -283,14 +266,7 @@ pub async fn handle_stop(
     )?;
 
     let stacks = {
-        let mut cache = ctx.cache.get_cache_mut()?;
-        but_workspace::legacy::stacks_v3(
-            &*ctx.repo.get()?,
-            &meta,
-            StacksFilter::default(),
-            None,
-            &mut cache,
-        )?
+        but_workspace::legacy::stacks_v3(&*ctx.repo.get()?, &meta, StacksFilter::default(), None)?
     };
 
     // Trigger commit message generation for newly created commits

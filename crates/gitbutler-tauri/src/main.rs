@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "builtin-but")]
     {
         if but::is_executed_as_but()? {
-            gitbutler_repo_actions::askpass::disable();
+            but_askpass::disable();
             return runtime.block_on(but::handle_args(std::env::args_os()));
         }
     }
@@ -129,9 +129,9 @@ fn main() -> anyhow::Result<()> {
                 file_name: Some("ui-logs".to_string()),
             }))
             .level(if tauri_debug_logging {
-                log::LevelFilter::Debug
+                tauri_plugin_log::log::LevelFilter::Debug
             } else {
-                log::LevelFilter::Error
+                tauri_plugin_log::log::LevelFilter::Error
             });
 
         let builder = tauri::Builder::default()
@@ -167,7 +167,7 @@ fn main() -> anyhow::Result<()> {
                     tracing::info!("SHELL env: {var:?}", var = std::env::var_os("SHELL"));
                 }
 
-                gitbutler_repo_actions::askpass::init({
+                but_askpass::init({
                     let handle = app_handle.clone();
                     move |event| {
                         handle
@@ -248,6 +248,42 @@ fn main() -> anyhow::Result<()> {
                 app_handle.manage(app_settings);
                 app_handle.manage(claude);
 
+                // === TRINITY STABLE WATCHER ===
+                // Start file-based agent event watcher for Ring-080
+                //
+                // NOTE: project_id is not available at initialization time (projects load dynamically).
+                // Using "trinity" as default - the frontend wildcard listener (project://*/stable-agent-event)
+                // will match any project prefix. This can be enhanced later for per-project watchers.
+                {
+                    use std::env;
+                    use but_claude::StableWatcher;
+
+                    let trinity_dir = std::path::PathBuf::from(
+                        env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                    ).join("t27/.trinity/experience");
+
+                    // Create directory if needed
+                    let _ = std::fs::create_dir_all(&trinity_dir);
+
+                    // Default project_id - matches frontend wildcard pattern
+                    let project_id = "trinity".to_string();
+
+                    // Create and spawn the watcher
+                    let stable_watcher = Arc::new(StableWatcher::new(
+                        broadcaster.clone(),
+                        trinity_dir,
+                        project_id,
+                    ));
+
+                    let watcher_clone = stable_watcher.clone();
+                    tokio::spawn(async move {
+                        let _ = watcher_clone.watch().await;
+                    });
+
+                    app_handle.manage(stable_watcher);
+                }
+                // END TRINITY STABLE WATCHER
+
                 // Auto-connect IRC connections based on settings (only when feature flag is on).
                 #[cfg(feature = "irc")]
                 if let Ok(settings) = app_handle.state::<AppSettingsWithDiskSync>().get() {
@@ -311,6 +347,8 @@ fn main() -> anyhow::Result<()> {
                 diff::tauri_commit_details::commit_details,
                 diff::tauri_commit_details_with_line_stats::commit_details_with_line_stats,
                 but_api::branch::tauri_branch_diff::branch_diff,
+                but_api::branch::tauri_move_branch::move_branch,
+                but_api::branch::tauri_tear_off_branch::tear_off_branch,
                 legacy::git::tauri_git_remote_branches::git_remote_branches,
                 legacy::git::tauri_delete_all_data::delete_all_data,
                 legacy::git::tauri_git_set_global_config::git_set_global_config,
@@ -322,6 +360,10 @@ fn main() -> anyhow::Result<()> {
                 legacy::users::tauri_set_user::set_user,
                 legacy::users::tauri_delete_user::delete_user,
                 legacy::users::tauri_get_user::get_user,
+                legacy::users::tauri_get_login_token::get_login_token,
+                legacy::users::tauri_login_with_token::login_with_token,
+                legacy::users::tauri_get_user_profile::get_user_profile,
+                legacy::users::tauri_update_user_profile::update_user_profile,
                 legacy::projects::tauri_add_project::add_project,
                 legacy::projects::tauri_add_project_best_effort::add_project_best_effort,
                 legacy::projects::tauri_get_project::get_project,
@@ -350,18 +392,11 @@ fn main() -> anyhow::Result<()> {
                 legacy::virtual_branches::tauri_update_stack_order::update_stack_order,
                 legacy::virtual_branches::tauri_unapply_stack::unapply_stack,
                 legacy::virtual_branches::tauri_create_virtual_branch_from_branch::create_virtual_branch_from_branch,
-                legacy::virtual_branches::tauri_amend_virtual_branch::amend_virtual_branch,
-                legacy::virtual_branches::tauri_undo_commit::undo_commit,
-                legacy::virtual_branches::tauri_reorder_stack::reorder_stack,
-                legacy::virtual_branches::tauri_update_commit_message::update_commit_message,
                 legacy::virtual_branches::tauri_list_branches::list_branches,
                 legacy::virtual_branches::tauri_get_branch_listing_details::get_branch_listing_details,
                 legacy::virtual_branches::tauri_integrate_branch_with_steps::integrate_branch_with_steps,
                 legacy::virtual_branches::tauri_squash_commits::squash_commits,
                 legacy::virtual_branches::tauri_fetch_from_remotes::fetch_from_remotes,
-                legacy::virtual_branches::tauri_move_commit::move_commit,
-                legacy::virtual_branches::tauri_move_branch_legacy::move_branch_legacy,
-                legacy::virtual_branches::tauri_tear_off_branch_legacy::tear_off_branch_legacy,
                 legacy::virtual_branches::tauri_normalize_branch_name::normalize_branch_name,
                 legacy::virtual_branches::tauri_upstream_integration_statuses::upstream_integration_statuses,
                 legacy::virtual_branches::tauri_integrate_upstream::integrate_upstream,
@@ -413,14 +448,10 @@ fn main() -> anyhow::Result<()> {
                 legacy::workspace::tauri_stacks::stacks,
                 legacy::workspace::tauri_stack_details::stack_details,
                 legacy::workspace::tauri_branch_details::branch_details,
-                legacy::workspace::tauri_create_commit_from_worktree_changes::create_commit_from_worktree_changes,
-                legacy::workspace::tauri_amend_commit_from_worktree_changes::amend_commit_from_worktree_changes,
                 legacy::workspace::tauri_discard_worktree_changes::discard_worktree_changes,
                 legacy::workspace::tauri_stash_into_branch::stash_into_branch,
                 legacy::workspace::tauri_canned_branch_name::canned_branch_name,
                 legacy::workspace::tauri_target_commits::target_commits,
-                legacy::workspace::tauri_move_changes_between_commits::move_changes_between_commits,
-                legacy::workspace::tauri_uncommit_changes::uncommit_changes,
                 legacy::workspace::tauri_split_branch::split_branch,
                 legacy::workspace::tauri_split_branch_into_dependent_branch::split_branch_into_dependent_branch,
                 legacy::absorb::tauri_absorb::absorb,
@@ -450,6 +481,7 @@ fn main() -> anyhow::Result<()> {
                 askpass::submit_prompt_response,
                 menu::menu_item_set_enabled,
                 projects::list_projects,
+                projects::server_capabilities,
                 projects::set_project_active,
                 projects::open_project_in_window,
                 zip::get_logs_archive_path,
@@ -470,6 +502,7 @@ fn main() -> anyhow::Result<()> {
                 // Debug-only - not for production!
                 #[cfg(debug_assertions)]
                 env::env_vars,
+                env::read_file_content,
                 claude::claude_send_message,
                 claude::claude_get_messages,
                 claude::claude_cancel_session,
@@ -541,8 +574,10 @@ fn main() -> anyhow::Result<()> {
                 commit::insert_blank::tauri_commit_insert_blank::commit_insert_blank,
                 commit::create::tauri_commit_create::commit_create,
                 commit::amend::tauri_commit_amend::commit_amend,
+                commit::move_commit::tauri_commit_move::commit_move,
                 commit::move_changes::tauri_commit_move_changes_between::commit_move_changes_between,
                 commit::uncommit::tauri_commit_uncommit_changes::commit_uncommit_changes,
+                commit::uncommit::tauri_commit_uncommit::commit_uncommit,
                 platform::tauri_build_type::build_type,
             ])
             .menu(move |handle| menu::build(handle, &app_settings_for_menu))
@@ -584,6 +619,13 @@ fn main() -> anyhow::Result<()> {
                     let irc_manager = app_handle.state::<IrcManager>();
                     // Note that we can't use `tauri::async_runtime::block_on`  during shutdown as it panics.
                     irc_manager.shutdown_now();
+                }
+
+                // Shutdown StableWatcher on exit
+                if let tauri::RunEvent::Exit = event {
+                    if let Some(watcher) = app_handle.try_state::<Arc<but_claude::StableWatcher>>() {
+                        watcher.shutdown();
+                    }
                 }
             });
     });

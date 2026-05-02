@@ -9,16 +9,18 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use bstr::{BStr, BString, ByteSlice};
-use but_core::RepositoryExt;
+use but_core::{
+    RefMetadata, RepositoryExt, WORKSPACE_REF_NAME, extract_remote_name_and_short_name,
+};
 use but_ctx::Context;
 use but_serde::BStringForFrontend;
 use gitbutler_branch::{BranchIdentity, ReferenceExtGix};
-use gitbutler_reference::{RemoteRefname, normalize_branch_name};
-use gitbutler_stack::{StackId, Target};
+use gitbutler_reference::normalize_branch_name;
+use gitbutler_stack::StackId;
 use gix::{object::tree::diff::Action, prelude::TreeDiffChangeExt, reference::Category};
 use serde::{Deserialize, Serialize};
 
-use crate::{VirtualBranchesExt, gravatar::gravatar_url_from_email};
+use crate::gravatar::gravatar_url_from_email;
 
 /// Returns a list of branches associated with this project.
 pub fn list_branches(
@@ -59,13 +61,13 @@ pub fn list_branches(
         });
     }
 
-    let vb_handle = ctx.virtual_branches();
     let remote_names = repo.remote_names();
+    let mut workspace_target_ref_name = None;
     let stacks = {
-        if let Some(workspace_ref) = repo.try_find_reference("refs/heads/gitbutler/workspace")? {
+        if let Some(workspace_ref) = repo.try_find_reference(WORKSPACE_REF_NAME)? {
             // Let's get this here for convenience, and hope this isn't ever called by a writer (or there will be a deadlock).
             let meta = ctx.meta()?;
-            let mut cache = ctx.cache.get_cache_mut()?;
+            workspace_target_ref_name = meta.workspace(workspace_ref.name())?.target_ref.clone();
             let info = but_workspace::ref_info(
                 workspace_ref,
                 &meta,
@@ -73,7 +75,6 @@ pub fn list_branches(
                     traversal: but_graph::init::Options::limited(),
                     expensive_commit_info: false,
                 },
-                &mut cache,
             )?;
             info.stacks
                 .into_iter()
@@ -85,7 +86,15 @@ pub fn list_branches(
     };
 
     branches.extend(stacks.iter().map(|s| GroupBranch::Virtual(s.clone())));
-    let mut branches = combine_branches(branches, &repo, vb_handle.get_default_target()?)?;
+    let target_ref_name = if let Some(target_ref_name) = workspace_target_ref_name {
+        target_ref_name
+    } else {
+        ctx.persisted_default_target()?
+            .branch
+            .to_string()
+            .try_into()?
+    };
+    let mut branches = combine_branches(branches, &repo, target_ref_name.as_ref())?;
 
     // Apply the filter
     branches.retain(|branch| !has_filter || matches_all(branch, filter));
@@ -149,6 +158,18 @@ pub fn list_branches(
     Ok(branches)
 }
 
+fn configured_workspace_target(
+    ctx: &Context,
+    repo: &gix::Repository,
+) -> Result<Option<(gix::refs::FullName, gix::ObjectId)>> {
+    let Some(workspace_ref) = repo.try_find_reference(WORKSPACE_REF_NAME)? else {
+        return Ok(None);
+    };
+    let meta = ctx.meta()?;
+    let workspace = meta.workspace(workspace_ref.name())?;
+    Ok(workspace.target_ref.clone().zip(workspace.target_commit_id))
+}
+
 fn matches_all(branch: &BranchListing, filter: BranchListingFilter) -> bool {
     let mut conditions = vec![];
     if let Some(applied) = filter.applied {
@@ -167,16 +188,17 @@ fn matches_all(branch: &BranchListing, filter: BranchListingFilter) -> bool {
 fn combine_branches(
     group_branches: Vec<GroupBranch>,
     repo: &gix::Repository,
-    target_branch: Target,
+    target_ref_name: &gix::refs::FullNameRef,
 ) -> Result<Vec<BranchListing>> {
     let remotes = repo.remote_names();
     let packed = repo.refs.cached_packed_buffer()?;
+    let target_branch_identity = target_identity_from_ref_name(target_ref_name, &remotes)?;
 
     // Group branches by identity
     let mut groups: HashMap<BranchIdentity, Vec<GroupBranch>> = HashMap::new();
     for branch in group_branches {
         // Skip the target branch, like 'main' or 'master'
-        if branch.is_remote_branch(&target_branch.branch) {
+        if branch.is_remote_branch(target_ref_name) {
             continue;
         }
 
@@ -200,7 +222,7 @@ fn combine_branches(
                 repo,
                 packed.as_ref().map(|p| &***p),
                 &remotes,
-                &target_branch,
+                &target_branch_identity,
             );
             match res {
                 Ok(branch_entry) => branch_entry,
@@ -217,6 +239,25 @@ fn combine_branches(
         .collect())
 }
 
+/// Derive the target branch identity while tolerating stale target remotes.
+///
+/// Branch listing should keep working when GitButler's stored target points to a
+/// preserved remote-tracking ref like `refs/remotes/origin/main`, even if the
+/// matching remote has since been removed or renamed in `.git/config`. When the
+/// remote is configured, keep using it so remote names containing slashes remain
+/// unambiguous.
+fn target_identity_from_ref_name(
+    target_ref_name: &gix::refs::FullNameRef,
+    remotes: &BTreeSet<Cow<'_, BStr>>,
+) -> Result<BranchIdentity> {
+    if let Ok(identity) = target_ref_name.identity(remotes) {
+        return Ok(identity);
+    }
+    let (_remote, short_name) = extract_remote_name_and_short_name(target_ref_name, remotes)
+        .context("failed to derive target branch identity from target ref")?;
+    Ok(short_name.as_bstr().try_into()?)
+}
+
 /// Converts a group of branches with the same identity into a single branch entry
 fn branch_group_to_branch(
     identity: &BranchIdentity,
@@ -224,7 +265,7 @@ fn branch_group_to_branch(
     repo: &gix::Repository,
     packed: Option<&gix::refs::packed::Buffer>,
     remotes: &BTreeSet<Cow<'_, BStr>>,
-    target: &Target,
+    target_branch_identity: &BranchIdentity,
 ) -> Result<Option<BranchListing>> {
     let (local_branches, remote_branches, mut vbranches) =
         group_branches
@@ -251,7 +292,7 @@ fn branch_group_to_branch(
                 .identity(remotes)
                 .as_deref()
                 .ok()
-                .is_some_and(|identity| identity == target.branch.branch())
+                .is_some_and(|identity| identity == &**target_branch_identity)
         })
     {
         return Ok(None);
@@ -476,7 +517,7 @@ impl GroupBranch<'_> {
     }
 
     /// Determines if the branch is a remote branch by ref name
-    fn is_remote_branch(&self, ref_name: &RemoteRefname) -> bool {
+    fn is_remote_branch(&self, ref_name: &gix::refs::FullNameRef) -> bool {
         if let GroupBranch::Remote(branch) = self {
             ref_name == branch.name()
         } else {
@@ -519,12 +560,13 @@ but_schemars::register_sdk_type!(BranchListingFilter);
 /// This also combines the concept of a remote, local and virtual branch in order to provide a unified interface for the UI
 /// Branch entry is not meant to contain all the data a branch can have (e.g. full commit history, all files and diffs, etc.).
 /// It is intended a summary that can be quickly retrieved and displayed in the UI.
-/// For more detailed information, each branch can be queried individually for it's `BranchData`.
+/// For more detailed information, each branch can be queried individually for its `BranchData`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct BranchListing {
     /// The `identity` of the branch (e.g. `main`, `feature/branch`), excluding the remote name.
+    #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
     pub name: BranchIdentity,
     /// This is a list of remotes that this branch can be found on (e.g. `origin`, `upstream` etc.),
     /// by collecting remotes from all local branches with the same identity that have a tracking setup.
@@ -554,8 +596,7 @@ but_schemars::register_sdk_type!(BranchListing);
 /// Represents a "commit author" or "signature", based on the data from the git history
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "export-schema", serde(rename = "BranchAuthor"))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename = "BranchAuthor", rename_all = "camelCase")]
 pub struct Author {
     /// The name of the author as configured in the git config
     #[cfg_attr(feature = "export-schema", schemars(with = "Option<String>"))]
@@ -625,15 +666,22 @@ pub fn get_branch_listing_details(
     let branches = list_branches(ctx, None, Some(branch_names))?;
 
     let (default_target_current_upstream_commit_id, default_target_seen_at_last_update) = {
-        let target = ctx
-            .virtual_branches()
-            .get_default_target()
-            .context("failed to get default target")?;
-        let target_branch_name = &target.branch.fullname();
-        let target_branch_name = target_branch_name.as_str();
-        let mut target_branch = repo.find_reference(target_branch_name)?;
-
-        (target_branch.peel_to_commit()?.id, target.sha)
+        if let Some((target_ref_name, target_base_oid)) = configured_workspace_target(ctx, &repo)? {
+            (
+                repo.find_reference(target_ref_name.as_ref())?
+                    .peel_to_commit()?
+                    .id,
+                target_base_oid,
+            )
+        } else {
+            let default_target = ctx.persisted_default_target()?;
+            (
+                repo.find_reference(&default_target.branch.to_string())?
+                    .peel_to_commit()?
+                    .id,
+                default_target.sha,
+            )
+        }
     };
 
     let mut enriched_branches = Vec::new();
@@ -788,9 +836,11 @@ pub fn get_branch_listing_details(
 
 /// Represents a fat struct with all the data associated with a branch
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct BranchListingDetails {
     /// The name of the branch (e.g. `main`, `feature/branch`), excluding the remote name
+    #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
     pub name: BranchIdentity,
     /// The number of lines added within the branch
     /// Since the virtual branch, local branch and the remote one can have different number of lines removed,
@@ -820,4 +870,45 @@ pub struct BranchListingDetails {
     pub authors: Vec<Author>,
     /// The branch may or may not have a virtual branch associated with it.
     pub stack: Option<StackReference>,
+}
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(BranchListingDetails);
+
+#[cfg(test)]
+mod tests {
+    use super::target_identity_from_ref_name;
+    use std::borrow::Cow;
+
+    use bstr::ByteSlice;
+
+    fn remote_names(names: &[&str]) -> gix::remote::Names<'static> {
+        names
+            .iter()
+            .map(|name| Cow::Owned(name.as_bytes().as_bstr().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn target_identity_from_remote_ref_without_configured_remote() -> anyhow::Result<()> {
+        let remote_names = remote_names(&["origin"]);
+        let ref_name: gix::refs::FullName = "refs/remotes/non-existing/feature".try_into()?;
+
+        assert_eq!(
+            target_identity_from_ref_name(ref_name.as_ref(), &remote_names)?.to_string(),
+            "feature"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn target_identity_preserves_configured_nested_remote() -> anyhow::Result<()> {
+        let remote_names = remote_names(&["nested/remote"]);
+        let ref_name: gix::refs::FullName = "refs/remotes/nested/remote/feature/a".try_into()?;
+
+        assert_eq!(
+            target_identity_from_ref_name(ref_name.as_ref(), &remote_names)?.to_string(),
+            "feature/a"
+        );
+        Ok(())
+    }
 }

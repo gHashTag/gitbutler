@@ -16,10 +16,15 @@ use gix::validate::reference::name_partial;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 use crate::{
     StackBranch, VirtualBranchesHandle,
     heads::{add_head, get_head, remove_head},
     stack_branch::remote_reference,
+    target::{default_target_base_oid, default_target_push_remote_name},
 };
 
 // this is the struct for the virtual branch data that is stored in our data
@@ -126,6 +131,10 @@ impl From<Stack> for virtual_branches_legacy_types::Stack {
 /// The first patches are in the beginning of the list and the most recent patches are at the end of the list (top of the stack)
 /// Similarly, heads that point to earlier commits are first in the order, and the last head always points to the most recent patch.
 /// If there are multiple heads that point to the same patch, the `add` and `update` operations can specify the intended order.
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 impl Stack {
     /// The name of the stack, defined as the name of the first head (branch) in the stack.
     /// The usage of this is discouraged
@@ -158,9 +167,7 @@ impl Stack {
         if let Some(branch) = self.heads.last() {
             branch.head_oid(&repo)
         } else {
-            let vb_state = VirtualBranchesHandle::new(ctx.project_data_dir());
-            let default_target = vb_state.get_default_target()?;
-            Ok(default_target.sha)
+            default_target_base_oid(ctx)
         }
     }
 
@@ -190,7 +197,15 @@ impl Stack {
     ) -> Result<Self> {
         let state = branch_state(ctx);
         let repo = ctx.repo.get()?;
-        let name = Stack::new_name(&repo, &state, upstream.clone(), name, true)?;
+        let push_remote_name = default_target_push_remote_name(ctx)?;
+        let name = Stack::new_name(
+            &repo,
+            &state,
+            &push_remote_name,
+            upstream.clone(),
+            name,
+            true,
+        )?;
         let stack_branch = Stack::create_stack_branch(&repo, head, name.clone())?;
         Ok(Self {
             id: StackId::generate(),
@@ -210,7 +225,8 @@ impl Stack {
     ) -> Result<Self> {
         let state = branch_state(ctx);
         let repo = ctx.repo.get()?;
-        let name = Stack::new_name(&repo, &state, None, name, false)?;
+        let push_remote_name = default_target_push_remote_name(ctx)?;
+        let name = Stack::new_name(&repo, &state, &push_remote_name, None, name, false)?;
         let stack_branch = Stack::create_stack_branch(&repo, head, name.clone())?;
         Ok(Self {
             id: StackId::generate(),
@@ -261,10 +277,9 @@ impl Stack {
     }
 
     pub fn merge_base_plumbing(&self, ctx: &Context) -> Result<gix::ObjectId> {
-        let virtual_branch_state = VirtualBranchesHandle::new(ctx.project_data_dir());
-        let target = virtual_branch_state.get_default_target()?;
+        let target_base_oid = default_target_base_oid(ctx)?;
         let repo = ctx.repo.get()?;
-        let merge_base = repo.merge_base(self.head_oid(ctx)?, target.sha)?;
+        let merge_base = repo.merge_base(self.head_oid(ctx)?, target_base_oid)?;
         Ok(merge_base.detach())
     }
 
@@ -287,6 +302,7 @@ impl Stack {
     fn new_name(
         repo: &gix::Repository,
         state: &VirtualBranchesHandle,
+        push_remote_name: &str,
         upstream: Option<RemoteRefname>,
         fallback: String,
         allow_duplicate_refs: bool,
@@ -296,7 +312,8 @@ impl Stack {
         } else {
             fallback
         };
-        let name = Stack::next_available_name(repo, state, name, allow_duplicate_refs)?;
+        let name =
+            Stack::next_available_name(repo, state, push_remote_name, name, allow_duplicate_refs)?;
         validate_name(&name, state)?;
         Ok(name)
     }
@@ -316,6 +333,7 @@ impl Stack {
     pub fn next_available_name(
         repo: &gix::Repository,
         state: &VirtualBranchesHandle,
+        push_remote_name: &str,
         mut name: String,
         allow_duplicate_refs: bool,
     ) -> Result<String> {
@@ -325,7 +343,7 @@ impl Stack {
             } else {
                 patch_reference_exists(state, name)?
                     || local_reference_exists(repo, name)?
-                    || remote_reference_exists(repo, state, name)?
+                    || remote_reference_exists(repo, push_remote_name, name)?
             })
         };
         while is_duplicate(&name)? {
@@ -373,12 +391,7 @@ impl Stack {
         let patches = self.stack_patches(ctx, true)?;
         validate_name(new_head.name(), &state)?;
         let repo = ctx.repo.get()?;
-        validate_target(
-            new_head.head_oid(&repo)?,
-            &repo,
-            self.head_oid(ctx)?,
-            &state,
-        )?;
+        validate_target(new_head.head_oid(&repo)?, &repo, self.head_oid(ctx)?, ctx)?;
         let updated_heads = add_head(self.heads.clone(), new_head, preceding_head, patches, &repo)?;
         self.heads = updated_heads;
         state.set_stack(self.clone())
@@ -542,8 +555,15 @@ impl Stack {
                 head.pr_number = None;
             }
 
-            let new_name =
-                Stack::new_name(repo, &state, self.upstream.clone(), self.name(), false)?;
+            let push_remote_name = default_target_push_remote_name(ctx)?;
+            let new_name = Stack::new_name(
+                repo,
+                &state,
+                &push_remote_name,
+                self.upstream.clone(),
+                self.name(),
+                false,
+            )?;
             let new_branch = Stack::create_stack_branch(repo, self.head_oid(ctx)?, new_name)?;
             self.heads.push(new_branch);
         }
@@ -559,7 +579,7 @@ impl Stack {
         self.ensure_initialized()?;
         let (_, reference) = get_head(&self.heads, &branch_name)?;
         let oid = reference.head_oid(&*ctx.repo.get()?)?;
-        let remote_name = branch_state(ctx).get_default_target()?.push_remote_name();
+        let remote_name = default_target_push_remote_name(ctx)?;
         let upstream_refname =
             RemoteRefname::from_str(&reference.remote_reference(remote_name.as_str()))?;
         Ok(PushDetails {
@@ -690,7 +710,7 @@ pub struct PatchReferenceUpdate {
     pub name: Option<String>,
 }
 
-/// Push details to be supplied to `RepoActionsExt`'s `push` method.
+/// Push details to be supplied to the git context extension trait's `push` method.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PushDetails {
     /// The commit that is being pushed.
@@ -719,12 +739,12 @@ fn validate_target(
     reference: gix::ObjectId,
     repo: &gix::Repository,
     stack_head: gix::ObjectId,
-    state: &VirtualBranchesHandle,
+    ctx: &Context,
 ) -> Result<()> {
     use gix::prelude::ObjectIdExt as _;
 
-    let default_target = state.get_default_target()?;
-    let merge_base = repo.merge_base(stack_head, default_target.sha)?.detach();
+    let target_base_oid = default_target_base_oid(ctx)?;
+    let merge_base = repo.merge_base(stack_head, target_base_oid)?.detach();
     let mut stack_commits = stack_head
         .attach(repo)
         .ancestors()
@@ -747,6 +767,10 @@ fn validate_target(
 ///  - unique within all stacks
 ///  - not the same as any existing local git reference (it is permitted for the name to match an existing remote reference)
 ///  - not including the `refs/heads/` prefix
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 fn validate_name(name: &str, state: &VirtualBranchesHandle) -> Result<()> {
     if name.starts_with("refs/heads") {
         return Err(anyhow!("Stack head name cannot start with 'refs/heads'"));
@@ -761,14 +785,26 @@ fn validate_name(name: &str, state: &VirtualBranchesHandle) -> Result<()> {
     Ok(())
 }
 
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 fn branch_state_from_project_data_dir(project_data_dir: &Path) -> VirtualBranchesHandle {
     VirtualBranchesHandle::new(project_data_dir)
 }
 
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 fn branch_state(ctx: &Context) -> VirtualBranchesHandle {
     branch_state_from_project_data_dir(&ctx.project_data_dir())
 }
 
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 fn patch_reference_exists(state: &VirtualBranchesHandle, name: &str) -> Result<bool> {
     Ok(state
         .list_stacks_in_workspace()?
@@ -787,12 +823,9 @@ fn local_reference_exists(repo: &gix::Repository, name: &str) -> Result<bool> {
 
 fn remote_reference_exists(
     repo: &gix::Repository,
-    state: &VirtualBranchesHandle,
+    push_remote_name: &str,
     name: &String,
 ) -> Result<bool> {
-    let remote_ref = remote_reference(
-        name,
-        state.get_default_target()?.push_remote_name().as_str(),
-    );
+    let remote_ref = remote_reference(name, push_remote_name);
     local_reference_exists(repo, &remote_ref)
 }

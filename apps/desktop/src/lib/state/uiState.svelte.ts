@@ -36,7 +36,10 @@ export type RejectionReason =
 
 export type StackSelection = {
 	branchName?: string;
+	/** The primary selected commit (drives the preview pane). */
 	commitId?: string;
+	/** All selected commit IDs (for multi-select). When undefined, only `commitId` is selected. */
+	commitIds?: string[];
 	upstream?: boolean;
 	previewOpen: boolean;
 	codegen?: boolean;
@@ -67,6 +70,7 @@ export type ExclusiveAction =
 			stackId: string | undefined;
 			branchName: string | undefined;
 			parentCommitId?: string;
+			insertBelow?: boolean;
 	  }
 	| {
 			type: "edit-commit-message";
@@ -83,8 +87,14 @@ export type ExclusiveAction =
 			branchName: string;
 	  };
 
+export type StackBusyState = {
+	commitId?: string;
+	stackIds?: string[];
+};
+
 export type ProjectUiState = {
 	exclusiveAction: ExclusiveAction | undefined;
+	stackBusy: StackBusyState | undefined;
 	branchesToPoll: string[];
 	selectedClaudeSession: { stackId: string; head: string } | undefined;
 	thinkingLevel: ThinkingLevel;
@@ -199,6 +209,7 @@ export class UiState {
 	/** Properties scoped to a specific project. */
 	readonly project = this.buildScopedProps<ProjectUiState>(this.scopesCache.projects, {
 		exclusiveAction: undefined,
+		stackBusy: undefined,
 		branchesToPoll: [],
 		selectedClaudeSession: undefined,
 		thinkingLevel: "normal",
@@ -389,3 +400,22 @@ export type WritableReactive<T> = {
 export type WritableReactiveStore<T extends DefaultConfig> = {
 	[K in keyof T]: WritableReactive<T[K]>;
 };
+
+/**
+ * Sets the `stackBusy` state while running `fn`, and clears it afterwards.
+ * Used to show a busy spinner on commits and block interaction on affected
+ * stacks during operations like squash, move, uncommit, etc.
+ */
+export async function withStackBusy(
+	uiState: UiState,
+	projectId: string,
+	opts: { commitId?: string; stackIds?: string[] },
+	fn: () => Promise<void>,
+) {
+	uiState.project(projectId).stackBusy.set({ commitId: opts.commitId, stackIds: opts.stackIds });
+	try {
+		await fn();
+	} finally {
+		uiState.project(projectId).stackBusy.set(undefined);
+	}
+}

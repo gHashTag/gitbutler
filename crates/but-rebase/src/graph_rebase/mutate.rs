@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use but_core::RefMetadata;
 use petgraph::{Direction, visit::EdgeRef};
 use serde::{Deserialize, Serialize};
@@ -186,6 +186,18 @@ impl ToCommitSelector for gix::Id<'_> {
     }
 }
 
+impl ToSelector for gix::ObjectId {
+    fn to_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
+        editor.select_commit(*self)
+    }
+}
+
+impl ToSelector for gix::Id<'_> {
+    fn to_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
+        editor.select_commit(self.detach())
+    }
+}
+
 impl ToReferenceSelector for &gix::refs::FullNameRef {
     fn to_reference_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
         editor.select_reference(self)
@@ -194,6 +206,18 @@ impl ToReferenceSelector for &gix::refs::FullNameRef {
 
 impl ToReferenceSelector for gix::refs::FullName {
     fn to_reference_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
+        editor.select_reference(self.as_ref())
+    }
+}
+
+impl ToSelector for &gix::refs::FullNameRef {
+    fn to_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
+        editor.select_reference(self)
+    }
+}
+
+impl ToSelector for gix::refs::FullName {
+    fn to_selector(&self, editor: &Editor<impl RefMetadata>) -> Result<Selector> {
         editor.select_reference(self.as_ref())
     }
 }
@@ -250,6 +274,46 @@ impl<M: RefMetadata> Editor<'_, '_, M> {
         None
     }
 
+    /// Returns all direct children of `target` together with their edge order.
+    ///
+    /// Children are represented as incoming edges into `target` in the step graph.
+    pub fn direct_children(&self, target: impl ToSelector) -> Result<Vec<(Selector, usize)>> {
+        let target = self.history.normalize_selector(target.to_selector(self)?)?;
+        Ok(self
+            .graph
+            .edges_directed(target.id, Direction::Incoming)
+            .map(|edge| {
+                (
+                    Selector {
+                        id: edge.source(),
+                        revision: self.history.current_revision(),
+                    },
+                    edge.weight().order,
+                )
+            })
+            .collect())
+    }
+
+    /// Returns all direct parents of `target` together with their edge order.
+    ///
+    /// Parents are represented as outgoing edges from `target` in the step graph.
+    pub fn direct_parents(&self, target: impl ToSelector) -> Result<Vec<(Selector, usize)>> {
+        let target = self.history.normalize_selector(target.to_selector(self)?)?;
+        Ok(self
+            .graph
+            .edges_directed(target.id, Direction::Outgoing)
+            .map(|edge| {
+                (
+                    Selector {
+                        id: edge.target(),
+                        revision: self.history.current_revision(),
+                    },
+                    edge.weight().order,
+                )
+            })
+            .collect())
+    }
+
     /// Replaces the node that the function was pointing to.
     ///
     /// Returns the replaced step.
@@ -275,9 +339,9 @@ impl<M: RefMetadata> Editor<'_, '_, M> {
     /// the `skip_reconnect_step` is set to true.
     ///
     /// Returns an error when:
-    /// - `parents_to_disconnect` is `SelectorSet::None`
-    /// - `parents_to_disconnect` contains any parent that is not a direct parent of `target.parent`
-    /// - `children_to_disconnect` contains any child that is not a direct parent of `target.child`
+    /// - `parents_to_disconnect` is `SelectorSet::None` and `skip_reconnect_step` is false.
+    /// - `parents_to_disconnect` contains any parent that is not a direct parent of `target.parent`.
+    /// - `children_to_disconnect` contains any child that is not a direct parent of `target.child`.
     pub fn disconnect_segment_from<C, P>(
         &mut self,
         target: SegmentDelimiter<C, P>,
@@ -310,9 +374,13 @@ impl<M: RefMetadata> Editor<'_, '_, M> {
         let parents_to_disconnect = match parents_to_disconnect {
             SelectorSet::All => None,
             SelectorSet::None => {
-                return Err(anyhow!(
-                    "Invalid parents to disconnect: SelectorSet::None is not allowed"
-                ));
+                if skip_reconnect_step {
+                    Some(Vec::new())
+                } else {
+                    return Err(anyhow!(
+                        "Invalid parents to disconnect: SelectorSet::None is not allowed"
+                    ));
+                }
             }
             SelectorSet::Some(parents) => Some(
                 parents
@@ -674,6 +742,87 @@ impl<M: RefMetadata> Editor<'_, '_, M> {
                 })
             }
         }
+    }
+
+    /// Add an edge to the graph with a desired order.
+    ///
+    /// Bails if there is already an edge from the child to the parent with the
+    /// same order.
+    pub fn add_edge(
+        &mut self,
+        child: impl ToSelector,
+        parent: impl ToSelector,
+        desired_order: usize,
+    ) -> Result<()> {
+        let child = self.history.normalize_selector(child.to_selector(self)?)?;
+        let parent = self.history.normalize_selector(parent.to_selector(self)?)?;
+
+        if cfg!(debug_assertions) {
+            let mut seen = HashSet::from([parent.id]);
+            let mut tips = vec![parent.id];
+
+            while let Some(tip) = tips.pop() {
+                for parent in self
+                    .graph
+                    .edges_directed(tip, Direction::Outgoing)
+                    .map(|e| e.target())
+                {
+                    if seen.insert(parent) {
+                        tips.push(parent);
+                    }
+                }
+            }
+
+            if seen.contains(&child.id) {
+                bail!("BUG: Add edge introduces a cycle");
+            }
+        }
+
+        if self
+            .graph
+            .edges_directed(child.id, Direction::Outgoing)
+            .any(|edge| edge.weight().order == desired_order)
+        {
+            bail!("An edge with desired order {desired_order} already exists");
+        }
+
+        self.graph.add_edge(
+            child.id,
+            parent.id,
+            Edge {
+                order: desired_order,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Removes all edges between a child and parent, returning the orders of the removed edges.
+    pub fn remove_edges(
+        &mut self,
+        child: impl ToSelector,
+        parent: impl ToSelector,
+    ) -> Result<Vec<usize>> {
+        let child = self.history.normalize_selector(child.to_selector(self)?)?;
+        let parent = self.history.normalize_selector(parent.to_selector(self)?)?;
+
+        let edges = self
+            .graph
+            .edges_directed(child.id, Direction::Outgoing)
+            .filter_map(|e| (e.target() == parent.id).then_some(e.id()))
+            .collect::<Vec<_>>();
+
+        let mut orders = vec![];
+        for edge in edges {
+            let weight = self
+                .graph
+                .remove_edge(edge)
+                .context("BUG: Failed to remove edge")?;
+
+            orders.push(weight.order);
+        }
+
+        Ok(orders)
     }
 }
 

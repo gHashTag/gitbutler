@@ -1,8 +1,7 @@
 import { mockReduxFulfilled } from "$lib/testing/mockRedux";
 import { reactive } from "@gitbutler/shared/reactiveUtils.svelte";
 import { vi } from "vitest";
-import type { Author, Commit, UpstreamCommit } from "$lib/branches/v3";
-import type { BranchDetails } from "$lib/stacks/stack";
+import type { Author, BranchDetails, Commit, UpstreamCommit } from "@gitbutler/but-sdk";
 
 const MOCK_AUTHOR_A: Author = {
 	name: "Author A",
@@ -16,16 +15,18 @@ const MOCK_COMMIT_A: Commit = {
 	message: "Initial commit message",
 	hasConflicts: false,
 	state: { type: "LocalOnly" },
-	createdAt: BigInt(1672531200000), // Example timestamp
+	createdAt: 1672531200000, // Example timestamp
 	author: MOCK_AUTHOR_A,
+	changeId: "Icommit-a-id",
 	gerritReviewUrl: null,
 };
 
 const MOCK_UPSTREAM_COMMIT_A: UpstreamCommit = {
 	id: "upstream-commit-a-id",
 	message: "Upstream commit message",
-	createdAt: BigInt(1672531200000), // Example timestamp
+	createdAt: 1672531200000, // Example timestamp
 	author: MOCK_AUTHOR_A,
+	changeId: null,
 };
 
 const BRANCH_DETAILS_A: BranchDetails = {
@@ -43,7 +44,7 @@ const BRANCH_DETAILS_A: BranchDetails = {
 	baseCommit: "base-commit-a",
 	isRemoteHead: false,
 	linkedWorktreeId: null,
-	lastUpdatedAt: BigInt(1672531200000),
+	lastUpdatedAt: 1672531200000,
 };
 
 export function getStackServiceMock() {
@@ -89,7 +90,6 @@ export function getStackServiceMock() {
 	StackServiceMock.prototype.updateStackOrder = [vi.fn(), reactive(() => mockReduxFulfilled({}))];
 	StackServiceMock.prototype.pushStack = [vi.fn(), reactive(() => mockReduxFulfilled({}))];
 	StackServiceMock.prototype.createCommit = [vi.fn(), reactive(() => mockReduxFulfilled({}))];
-	StackServiceMock.prototype.createCommitLegacy = [vi.fn(), reactive(() => mockReduxFulfilled({}))];
 	StackServiceMock.prototype.updateCommitMessage = [
 		vi.fn(),
 		reactive(() => mockReduxFulfilled({})),
@@ -114,10 +114,9 @@ export function getStackServiceMock() {
 		vi.fn(),
 		reactive(() => mockReduxFulfilled({})),
 	];
+	StackServiceMock.prototype.commitMove = vi.fn();
 	StackServiceMock.prototype.reorderStack = [vi.fn(), reactive(() => mockReduxFulfilled({}))];
 	StackServiceMock.prototype.reorderStackMutation = vi.fn();
-	StackServiceMock.prototype.moveCommit = [vi.fn(), reactive(() => mockReduxFulfilled({}))];
-	StackServiceMock.prototype.moveCommitMutation = vi.fn();
 	StackServiceMock.prototype.integrateUpstreamCommits = vi.fn();
 	StackServiceMock.prototype.legacyUnapplyLines = vi.fn();
 	StackServiceMock.prototype.legacyUnapplyHunk = vi.fn();
@@ -130,7 +129,6 @@ export function getStackServiceMock() {
 	StackServiceMock.prototype.squashCommits = vi.fn();
 	StackServiceMock.prototype.squashCommitsMutation = vi.fn();
 	StackServiceMock.prototype.amendCommitMutation = vi.fn();
-	StackServiceMock.prototype.moveCommitFileMutation = vi.fn();
 
 	return StackServiceMock;
 }

@@ -7,9 +7,10 @@
 	import Drawer from "$components/shared/Drawer.svelte";
 	import ReduxResult from "$components/shared/ReduxResult.svelte";
 	import Resizer from "$components/shared/Resizer.svelte";
+	import SashLayer from "$components/shared/SashLayer.svelte";
 	import { computeChangeStatus } from "$lib/files/fileStatus";
 	import FloatingModal from "$lib/floating/FloatingModal.svelte";
-	import { isExecutableStatus, type TreeChange } from "$lib/hunks/change";
+	import { isExecutableStatus } from "$lib/hunks/change";
 	import { DIFF_SERVICE } from "$lib/hunks/diffService.svelte";
 	import { FILE_SELECTION_MANAGER } from "$lib/selection/fileSelectionManager.svelte";
 	import { type SelectionId } from "$lib/selection/key";
@@ -17,9 +18,11 @@
 	import { SETTINGS } from "$lib/settings/userSettings";
 	import { inject } from "@gitbutler/core/context";
 	import { Button, FileViewHeader, HunkDiffSkeleton, Icon, VirtualList } from "@gitbutler/ui";
-	import { FOCUS_MANAGER, type FocusableOptions } from "@gitbutler/ui/focus/focusManager";
+	import { FOCUS_MANAGER } from "@gitbutler/ui/focus/focusManager";
+	import { type FocusableOptions } from "@gitbutler/ui/focus/focusTypes";
 	import { focusable } from "@gitbutler/ui/focus/focusable";
 	import { tick, untrack } from "svelte";
+	import type { TreeChange } from "@gitbutler/but-sdk";
 
 	interface Props {
 		projectId: string;
@@ -125,186 +128,101 @@
 	dragHandleElement={headerElRef}
 	onCancel={onclose}
 >
-	<div class="floating-diff-modal">
-		<!-- Left panel: drag handle + file list -->
-		<div class="left-panel" bind:this={leftPanelEl}>
-			{#if leftPanelEl}
-				<Resizer
-					viewport={leftPanelEl}
-					direction="right"
-					persistId="floating-diff-modal-left-panel-width"
-					minWidth={14}
-					maxWidth={30}
-					defaultValue={15}
-					showBorder
-				/>
-			{/if}
-			<div class="left-header" bind:this={headerElRef}>
-				<div class="drag-handle">
-					<Icon name="drag-square" />
+	<SashLayer>
+		<div class="floating-diff-modal">
+			<!-- Left panel: drag handle + file list -->
+			<div class="left-panel" bind:this={leftPanelEl}>
+				{#if leftPanelEl}
+					<Resizer
+						viewport={leftPanelEl}
+						direction="right"
+						persistId="floating-diff-modal-left-panel-width"
+						minWidth={14}
+						maxWidth={30}
+						defaultValue={15}
+					/>
+				{/if}
+				<div class="left-header" bind:this={headerElRef}>
+					<div class="drag-handle">
+						<Icon name="drag-square" />
+					</div>
+					<ChangedFileStats
+						title="Files changed"
+						bind:mode={listMode}
+						persistId="floating-diff-modal"
+						fileCount={changes.length}
+					/>
 				</div>
-				<ChangedFileStats
-					title="Files changed"
-					bind:mode={listMode}
-					persistId="floating-diff-modal"
-					fileCount={changes.length}
-				/>
+				<div class="file-list" bind:this={fileListEl} use:focusable={{ vertical: true }}>
+					<ChangedFilesContextMenu
+						bind:this={fileListContextMenu}
+						{projectId}
+						{stackId}
+						{selectionId}
+						trigger={fileListEl}
+					/>
+					<AppScrollableContainer>
+						<FileTreeList
+							{changes}
+							{listMode}
+							{selectedIndex}
+							{visibleRange}
+							{getItemFocusableOpts}
+							onFileClick={selectChange}
+							onFileContextMenu={(e, change) => {
+								fileListContextMenu?.open(e, { changes: [change] });
+							}}
+						/>
+					</AppScrollableContainer>
+				</div>
 			</div>
-			<div class="file-list" bind:this={fileListEl} use:focusable={{ vertical: true }}>
+
+			<!-- Right panel: diff area -->
+			<div class="right-panel">
+				{#if allInOneDiff}
+					<div class="floating-actions">
+						<Button kind="ghost" icon="cross" size="tag" onclick={onclose} />
+					</div>
+				{/if}
 				<ChangedFilesContextMenu
-					bind:this={fileListContextMenu}
+					bind:this={contextMenu}
 					{projectId}
 					{stackId}
 					{selectionId}
-					trigger={fileListEl}
+					onclose={() => {
+						activeMenuPath = undefined;
+					}}
 				/>
-				<AppScrollableContainer>
-					<FileTreeList
-						{changes}
-						{listMode}
-						{selectedIndex}
-						{visibleRange}
-						{getItemFocusableOpts}
-						onFileClick={selectChange}
-						onFileContextMenu={(e, change) => {
-							fileListContextMenu?.open(e, { changes: [change] });
-						}}
-					/>
-				</AppScrollableContainer>
-			</div>
-		</div>
-
-		<!-- Right panel: diff area -->
-		<div class="right-panel">
-			{#if allInOneDiff}
-				<div class="floating-actions">
-					<Button kind="ghost" icon="cross" size="tag" onclick={onclose} />
-				</div>
-			{/if}
-			<ChangedFilesContextMenu
-				bind:this={contextMenu}
-				{projectId}
-				{stackId}
-				{selectionId}
-				onclose={() => {
-					activeMenuPath = undefined;
-				}}
-			/>
-			<!-- Diff area (single-file or virtual list depending on user setting) -->
-			<div class="diff-area" bind:this={diffScrollContainer}>
-				{#if !allInOneDiff}
-					<!-- Single-file mode: show selected file with header -->
-					{#if selectedChange}
-						{@const diffQuery = diffService.getDiff(projectId, selectedChange)}
-						<Drawer
-							noshrink
-							stickyHeader
-							collapsable={false}
-							scrollRoot={diffScrollContainer}
-							highlighted={false}
-							{onclose}
-						>
-							{#snippet header()}
-								<FileViewHeader
-									filePath={selectedChange.path}
-									fileStatus={computeChangeStatus(selectedChange)}
-									executable={isExecutableStatus(selectedChange.status)}
-								/>
-							{/snippet}
-
-							{#snippet actions()}
-								<Button
-									kind="ghost"
-									icon="kebab"
-									size="tag"
-									activated={activeMenuPath === selectedChange.path}
-									onclick={async (e) => {
-										if (!contextMenu || !(e.target instanceof HTMLElement)) return;
-										if (activeMenuPath === selectedChange.path) {
-											contextMenu.close();
-											return;
+				<!-- Diff area (single-file or virtual list depending on user setting) -->
+				<div class="diff-area" bind:this={diffScrollContainer}>
+					{#if !allInOneDiff}
+						<!-- Single-file mode: show selected file with header -->
+						{#if selectedChange}
+							{@const diffQuery = diffService.getDiff(projectId, selectedChange)}
+							{@const diffResponse = diffQuery.response}
+							{@const lineChangesStat =
+								diffResponse?.type === "Patch"
+									? {
+											added: diffResponse.subject.linesAdded,
+											removed: diffResponse.subject.linesRemoved,
 										}
-										const changes = await idSelection.treeChanges(projectId, selectionId);
-										if (idSelection.has(selectedChange.path, selectionId) && changes.length > 0) {
-											contextMenu.open(e.target, { changes: changes });
-										} else {
-											contextMenu.open(e.target, { changes: [selectedChange] });
-										}
-										activeMenuPath = selectedChange.path;
-									}}
-								/>
-							{/snippet}
-
-							<ReduxResult {projectId} hideLoading result={diffQuery.result}>
-								{#snippet children(diff)}
-									<UnifiedDiffView
-										{projectId}
-										{stackId}
-										commitId={selectionId.type === "commit" ? selectionId.commitId : undefined}
-										{draggable}
-										change={selectedChange}
-										{diff}
-										{selectable}
-										{selectionId}
-										topPadding
-									/>
-								{/snippet}
-								{#snippet loading()}
-									<div class="loading">
-										<HunkDiffSkeleton />
-									</div>
-								{/snippet}
-							</ReduxResult>
-						</Drawer>
-					{/if}
-				{:else}
-					<!-- All-in-one mode: virtual list of all diffs, file list navigates by scrolling -->
-					<VirtualList
-						bind:this={virtualList}
-						startIndex={selectedIndex}
-						grow
-						items={changes}
-						defaultHeight={102}
-						visibility="scroll"
-						renderDistance={100}
-						getId={(change) => change.path}
-						onVisibleChange={(range) => {
-							visibleRange = range;
-							if (range) {
-								selectedIndex = scrollLock.resolve(range);
-							}
-						}}
-					>
-						{#snippet template(change, index)}
-							{@const diffQuery = diffService.getDiff(projectId, change)}
-							{@const diffData = diffQuery.response}
-							{@const isExecutable = isExecutableStatus(change.status)}
-							{@const patchData = diffData?.type === "Patch" ? diffData.subject : null}
-							{@const isCollapsed = diffExpandedState.get(change.path) ?? false}
+									: undefined}
 							<Drawer
 								noshrink
 								stickyHeader
-								reserveSpaceOnStuck
-								closeButtonPlaceholder
-								closeButtonPlaceholderWidth="1.375rem"
+								collapsable={false}
 								scrollRoot={diffScrollContainer}
-								collapsable
-								defaultCollapsed={isCollapsed}
-								highlighted={allInOneDiff && highlightDiffs && selectedIndex === index}
-								ontoggle={(collapsed) => {
-									diffExpandedState.set(change.path, collapsed);
-								}}
+								highlighted={false}
+								{onclose}
 							>
 								{#snippet header()}
-									<div class="full-width">
-										<FileViewHeader
-											filePath={change.path}
-											fileStatus={computeChangeStatus(change)}
-											linesAdded={patchData?.linesAdded}
-											linesRemoved={patchData?.linesRemoved}
-											executable={isExecutable}
-										/>
-									</div>
+									<FileViewHeader
+										filePath={selectedChange.path}
+										fileStatus={computeChangeStatus(selectedChange)}
+										executable={isExecutableStatus(selectedChange.status)}
+										linesAdded={lineChangesStat?.added}
+										linesRemoved={lineChangesStat?.removed}
+									/>
 								{/snippet}
 
 								{#snippet actions()}
@@ -312,20 +230,21 @@
 										kind="ghost"
 										icon="kebab"
 										size="tag"
-										activated={activeMenuPath === change.path}
+										activated={activeMenuPath === selectedChange.path}
 										onclick={async (e) => {
-											if (!contextMenu || !(e.currentTarget instanceof HTMLElement)) return;
-											if (activeMenuPath === change.path) {
+											const triggerEl = e.currentTarget;
+											if (!contextMenu || !(triggerEl instanceof HTMLElement)) return;
+											if (activeMenuPath === selectedChange.path) {
 												contextMenu.close();
 												return;
 											}
-											const allChanges = await idSelection.treeChanges(projectId, selectionId);
-											if (idSelection.has(change.path, selectionId) && allChanges.length > 0) {
-												contextMenu.open(e.currentTarget, { changes: allChanges });
+											const changes = await idSelection.treeChanges(projectId, selectionId);
+											if (idSelection.has(selectedChange.path, selectionId) && changes.length > 0) {
+												contextMenu.open(triggerEl, { changes: changes });
 											} else {
-												contextMenu.open(e.currentTarget, { changes: [change] });
+												contextMenu.open(triggerEl, { changes: [selectedChange] });
 											}
-											activeMenuPath = change.path;
+											activeMenuPath = selectedChange.path;
 										}}
 									/>
 								{/snippet}
@@ -337,7 +256,7 @@
 											{stackId}
 											commitId={selectionId.type === "commit" ? selectionId.commitId : undefined}
 											{draggable}
-											{change}
+											change={selectedChange}
 											{diff}
 											{selectable}
 											{selectionId}
@@ -351,12 +270,109 @@
 									{/snippet}
 								</ReduxResult>
 							</Drawer>
-						{/snippet}
-					</VirtualList>
-				{/if}
+						{/if}
+					{:else}
+						<!-- All-in-one mode: virtual list of all diffs, file list navigates by scrolling -->
+						<VirtualList
+							bind:this={virtualList}
+							startIndex={selectedIndex}
+							grow
+							items={changes}
+							defaultHeight={102}
+							visibility="scroll"
+							renderDistance={100}
+							getId={(change) => change.path}
+							onVisibleChange={(range) => {
+								visibleRange = range;
+								if (range) {
+									selectedIndex = scrollLock.resolve(range);
+								}
+							}}
+						>
+							{#snippet template(change, index)}
+								{@const diffQuery = diffService.getDiff(projectId, change)}
+								{@const diffData = diffQuery.response}
+								{@const isExecutable = isExecutableStatus(change.status)}
+								{@const patchData = diffData?.type === "Patch" ? diffData.subject : null}
+								{@const isCollapsed = diffExpandedState.get(change.path) ?? false}
+								<Drawer
+									noshrink
+									stickyHeader
+									reserveSpaceOnStuck
+									closeButtonPlaceholder
+									closeButtonPlaceholderWidth="1.375rem"
+									scrollRoot={diffScrollContainer}
+									collapsable
+									defaultCollapsed={isCollapsed}
+									highlighted={allInOneDiff && highlightDiffs && selectedIndex === index}
+									ontoggle={(collapsed) => {
+										diffExpandedState.set(change.path, collapsed);
+									}}
+								>
+									{#snippet header()}
+										<div class="full-width">
+											<FileViewHeader
+												filePath={change.path}
+												fileStatus={computeChangeStatus(change)}
+												linesAdded={patchData?.linesAdded}
+												linesRemoved={patchData?.linesRemoved}
+												executable={isExecutable}
+											/>
+										</div>
+									{/snippet}
+
+									{#snippet actions()}
+										<Button
+											kind="ghost"
+											icon="kebab"
+											size="tag"
+											activated={activeMenuPath === change.path}
+											onclick={async (e) => {
+												const triggerEl = e.currentTarget;
+												if (!contextMenu || !(triggerEl instanceof HTMLElement)) return;
+												if (activeMenuPath === change.path) {
+													contextMenu.close();
+													return;
+												}
+												const allChanges = await idSelection.treeChanges(projectId, selectionId);
+												if (idSelection.has(change.path, selectionId) && allChanges.length > 0) {
+													contextMenu.open(triggerEl, { changes: allChanges });
+												} else {
+													contextMenu.open(triggerEl, { changes: [change] });
+												}
+												activeMenuPath = change.path;
+											}}
+										/>
+									{/snippet}
+
+									<ReduxResult {projectId} hideLoading result={diffQuery.result}>
+										{#snippet children(diff)}
+											<UnifiedDiffView
+												{projectId}
+												{stackId}
+												commitId={selectionId.type === "commit" ? selectionId.commitId : undefined}
+												{draggable}
+												{change}
+												{diff}
+												{selectable}
+												{selectionId}
+												topPadding
+											/>
+										{/snippet}
+										{#snippet loading()}
+											<div class="loading">
+												<HunkDiffSkeleton />
+											</div>
+										{/snippet}
+									</ReduxResult>
+								</Drawer>
+							{/snippet}
+						</VirtualList>
+					{/if}
+				</div>
 			</div>
 		</div>
-	</div>
+	</SashLayer>
 </FloatingModal>
 
 <style>
@@ -376,6 +392,7 @@
 		flex-direction: column;
 		width: 15rem;
 		overflow: hidden;
+		border-right: 1px solid var(--border-2);
 	}
 
 	.left-header {

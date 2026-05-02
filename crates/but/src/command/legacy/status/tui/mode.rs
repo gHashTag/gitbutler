@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bstr::BString;
 use but_core::HunkHeader;
-use but_rebase::graph_rebase::mutate::InsertSide;
+use but_workspace::commit::squash_commits::MessageCombinationStrategy;
 use gitbutler_stack::StackId;
 use ratatui::style::Color;
 use ratatui_textarea::TextArea;
@@ -11,6 +11,7 @@ use crate::{
     CliId,
     command::legacy::status::tui::MessageOnDrop,
     id::{ShortId, UncommittedCliId},
+    theme::Theme,
 };
 
 #[derive(Debug, Default, strum::EnumDiscriminants)]
@@ -20,40 +21,61 @@ pub(super) enum Mode {
     #[default]
     Normal,
     Rub(RubMode),
-    RubButApi(RubMode),
     InlineReword(InlineRewordMode),
     Command(CommandMode),
     Commit(CommitMode),
     Move(MoveMode),
-    Branch,
     Details,
 }
 
 impl Mode {
-    pub(super) fn bg(&self) -> Color {
+    pub(super) fn bg(&self, theme: &'static Theme) -> Color {
+        ModeDiscriminant::from(self).bg(theme)
+    }
+
+    #[expect(dead_code)]
+    pub(super) fn fg(&self, theme: &'static Theme) -> Color {
+        ModeDiscriminant::from(self).fg(theme)
+    }
+}
+
+impl ModeDiscriminant {
+    pub(super) fn bg(self, theme: &'static Theme) -> Color {
         match self {
-            Mode::Normal => Color::DarkGray,
-            Mode::Commit(_) => Color::Green,
-            Mode::Rub(_) | Mode::RubButApi(_) => Color::Blue,
-            Mode::InlineReword(_) => Color::Magenta,
-            Mode::Command(_) => Color::Yellow,
-            Mode::Move(..) => Color::Cyan,
-            Mode::Branch => Color::Red,
-            Mode::Details => Color::Rgb(255, 165, 0), // orange
+            Self::Normal => theme.tui_mode_normal.bg.unwrap_or(Color::DarkGray),
+            Self::Commit => theme.tui_mode_commit.bg.unwrap_or(Color::Green),
+            Self::Rub => theme.tui_mode_rub.bg.unwrap_or(Color::Blue),
+            Self::InlineReword => theme.tui_mode_inline_reword.bg.unwrap_or(Color::Magenta),
+            Self::Command => theme.tui_mode_command.bg.unwrap_or(Color::Yellow),
+            Self::Move => theme.tui_mode_move.bg.unwrap_or(Color::Cyan),
+            Self::Details => theme
+                .tui_mode_details
+                .bg
+                .unwrap_or(Color::Rgb(255, 165, 0) /* orange */),
         }
     }
 
-    pub(super) fn fg(&self) -> Color {
+    pub(super) fn fg(self, theme: &'static Theme) -> Color {
         match self {
-            Mode::Normal => Color::White,
-            Mode::Commit(_)
-            | Mode::Branch
-            | Mode::Details
-            | Mode::Rub(_)
-            | Mode::RubButApi(_)
-            | Mode::InlineReword(_)
-            | Mode::Move(..)
-            | Mode::Command(_) => Color::Black,
+            Self::Normal => theme.tui_mode_normal.fg.unwrap_or(Color::White),
+            Self::Commit => theme.tui_mode_commit.fg.unwrap_or(Color::Black),
+            Self::Rub => theme.tui_mode_rub.fg.unwrap_or(Color::Black),
+            Self::InlineReword => theme.tui_mode_inline_reword.fg.unwrap_or(Color::Black),
+            Self::Command => theme.tui_mode_command.fg.unwrap_or(Color::Black),
+            Self::Move => theme.tui_mode_move.fg.unwrap_or(Color::Black),
+            Self::Details => theme.tui_mode_details.fg.unwrap_or(Color::Black),
+        }
+    }
+
+    pub(super) fn hotbar_string(self) -> &'static str {
+        match self {
+            ModeDiscriminant::Normal => "normal",
+            ModeDiscriminant::Rub => "rub",
+            ModeDiscriminant::InlineReword => "reword",
+            ModeDiscriminant::Command => "command",
+            ModeDiscriminant::Commit => "commit",
+            ModeDiscriminant::Move => "move",
+            ModeDiscriminant::Details => "details",
         }
     }
 }
@@ -62,6 +84,7 @@ impl Mode {
 pub(super) struct RubMode {
     pub(super) source: RubSource,
     pub(super) available_targets: Vec<Arc<CliId>>,
+    pub(super) how_to_combine_messages: MessageCombinationStrategy,
     pub(super) _unlock_details: Option<MessageOnDrop>,
 }
 
@@ -119,6 +142,13 @@ impl InlineRewordMode {
 #[derive(Debug)]
 pub(super) struct CommandMode {
     pub(super) textarea: Box<TextArea<'static>>,
+    pub(super) kind: CommandModeKind,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum CommandModeKind {
+    But,
+    Shell,
 }
 
 #[derive(Debug)]
@@ -128,11 +158,8 @@ pub(super) struct CommitMode {
     ///
     /// Used when committing changes staged to a specific stack
     pub(super) scope_to_stack: Option<StackId>,
-    /// The side to insert the new commit on, relative to the target commit.
-    ///
-    /// Note this is only respected when inserting at a commit. If inserting at a branch we'll
-    /// always use [`InsertSide::Below`].
-    pub(super) insert_side: InsertSide,
+    /// How to compose the commit message.
+    pub(super) message_composer: CommitMessageComposer,
 }
 
 /// A subset of [`CliId`] that supports being committed
@@ -143,6 +170,17 @@ pub(super) enum CommitSource {
     Stack(StackCommitSource),
 }
 
+#[derive(Debug, Copy, Clone, Default)]
+pub(super) enum CommitMessageComposer {
+    /// Open an editor to compose the commit message.
+    #[default]
+    Editor,
+    /// Use an inline editor to compose the commit message.
+    Inline,
+    /// Create the commit with an empty message.
+    Empty,
+}
+
 #[derive(Debug)]
 pub(super) struct UnassignedCommitSource {
     pub(super) id: ShortId,
@@ -150,24 +188,21 @@ pub(super) struct UnassignedCommitSource {
 
 #[derive(Debug)]
 pub(super) struct StackCommitSource {
-    pub(super) id: ShortId,
     pub(super) stack_id: StackId,
 }
 
-impl TryFrom<CliId> for CommitSource {
-    type Error = anyhow::Error;
-
-    fn try_from(id: CliId) -> Result<Self, Self::Error> {
+impl CommitSource {
+    pub(super) fn try_new(id: CliId) -> Option<Self> {
         match id {
-            CliId::Unassigned { id } => Ok(Self::Unassigned(UnassignedCommitSource { id })),
+            CliId::Unassigned { id } => Some(Self::Unassigned(UnassignedCommitSource { id })),
             CliId::Uncommitted(uncommitted_cli_id) => {
-                Ok(Self::Uncommitted(Box::new(uncommitted_cli_id)))
+                Some(Self::Uncommitted(Box::new(uncommitted_cli_id)))
             }
-            CliId::Stack { id, stack_id } => Ok(Self::Stack(StackCommitSource { id, stack_id })),
+            CliId::Stack { stack_id, .. } => Some(Self::Stack(StackCommitSource { stack_id })),
             CliId::PathPrefix { .. }
             | CliId::CommittedFile { .. }
             | CliId::Branch { .. }
-            | CliId::Commit { .. } => anyhow::bail!("cannot commit: {id:?}"),
+            | CliId::Commit { .. } => None,
         }
     }
 }
@@ -190,15 +225,14 @@ impl PartialEq<CliId> for CommitSource {
                 }
             }
             CommitSource::Stack(StackCommitSource {
-                id: id_lhs,
                 stack_id: stack_id_lhs,
             }) => {
                 if let CliId::Stack {
-                    id: id_rhs,
                     stack_id: stack_id_rhs,
+                    ..
                 } = other
                 {
-                    id_lhs == id_rhs && stack_id_lhs == stack_id_rhs
+                    stack_id_lhs == stack_id_rhs
                 } else {
                     false
                 }
@@ -210,7 +244,6 @@ impl PartialEq<CliId> for CommitSource {
 #[derive(Debug)]
 pub(super) struct MoveMode {
     pub(super) source: Arc<MoveSource>,
-    pub(super) insert_side: InsertSide,
 }
 
 /// A subset of [`CliId`] that supports being moved
@@ -225,6 +258,12 @@ pub(super) enum MoveSource {
         id: ShortId,
         stack_id: Option<StackId>,
     },
+}
+
+impl MoveSource {
+    pub(super) fn is_commit(&self) -> bool {
+        matches!(self, Self::Commit { .. })
+    }
 }
 
 impl TryFrom<CliId> for MoveSource {

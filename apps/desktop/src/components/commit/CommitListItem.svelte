@@ -23,18 +23,21 @@
 		lastCommit?: boolean;
 		lastBranch?: boolean;
 		selected?: boolean;
+		/** When true, expand the changed files panel. Defaults to `selected`. */
+		expandChangedFiles?: boolean;
 		opacity?: number;
 		borderTop?: boolean;
 		disableCommitActions?: boolean;
 		active?: boolean;
 		hasConflicts?: boolean;
+		busy?: boolean;
 		disabled?: boolean;
 		editable?: boolean;
 		gerritReviewUrl?: string;
 		reactions?: Reaction[];
 		menu?: Snippet<[{ rightClickTrigger: HTMLElement }]>;
 		changedFiles?: Snippet;
-		onclick?: () => void;
+		onclick?: (event: MouseEvent) => void;
 	};
 
 	type RemoteStatusProps = {
@@ -74,10 +77,12 @@
 		lastCommit,
 		lastBranch,
 		selected,
+		expandChangedFiles,
 		opacity,
 		borderTop,
 		disabled,
 		hasConflicts,
+		busy,
 		active,
 		editable,
 		gerritReviewUrl,
@@ -87,6 +92,8 @@
 		changedFiles,
 		...args
 	}: Props = $props();
+
+	const shouldExpandFiles = $derived(expandChangedFiles ?? selected);
 
 	let container = $state<HTMLDivElement>();
 
@@ -124,7 +131,7 @@
 		class:disabled
 		{onclick}
 		use:focusable={{
-			onAction: () => onclick?.(),
+			onAction: () => onclick?.(new MouseEvent("click")),
 			focusable: true,
 		}}
 	>
@@ -214,13 +221,17 @@
 				{/if}
 			</div>
 
-			{#if !args.disableCommitActions}
+			{#if busy}
+				<div class="commit-busy-spinner">
+					<Icon name="spinner" size={14} />
+				</div>
+			{:else if !args.disableCommitActions}
 				{@render menu?.({ rightClickTrigger: container })}
 			{/if}
 		</div>
 	</div>
 
-	{#if selected && changedFiles}
+	{#if shouldExpandFiles && changedFiles}
 		<div class="changed-files-container">
 			<CommitTimelineNode commitStatus={args.type} hideDot height="0.375rem" />
 			{@render changedFiles()}
@@ -341,6 +352,12 @@
 		display: flex;
 		margin-right: 4px;
 		color: var(--fill-danger-bg);
+	}
+
+	.commit-busy-spinner {
+		display: flex;
+		align-items: center;
+		color: var(--text-2);
 	}
 
 	.commit-row__drag-handle {

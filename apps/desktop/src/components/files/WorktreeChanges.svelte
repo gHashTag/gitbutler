@@ -26,8 +26,8 @@
 	import { isDefined } from "@gitbutler/ui/utils/typeguards";
 	import { untrack, type Snippet } from "svelte";
 	import type { DropzoneHandler } from "$lib/dragging/handler";
-	import type { TreeChange } from "$lib/hunks/change";
 	import type { FileListKeyHandler } from "$lib/selection/fileListController.svelte";
+	import type { TreeChange } from "@gitbutler/but-sdk";
 
 	type Props = {
 		projectId: string;
@@ -162,7 +162,7 @@
 				type: "treeChanges",
 				subject: {
 					changes: treeChanges,
-					assigned_stack_id: stackId ?? null,
+					assignedStackId: stackId ?? null,
 				},
 			},
 			useAi: $aiGenEnabled,

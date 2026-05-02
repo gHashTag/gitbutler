@@ -6,7 +6,6 @@
 	import { isLocalAndRemoteCommit } from "$components/lib";
 	import Drawer from "$components/shared/Drawer.svelte";
 	import ReduxResult from "$components/shared/ReduxResult.svelte";
-	import Resizer from "$components/shared/Resizer.svelte";
 	import { type CommitKey } from "$lib/commits/commit";
 	import { splitMessage } from "$lib/commits/commitMessage";
 	import { rewrapCommitMessage } from "$lib/config/uiFeatureFlags";
@@ -14,12 +13,10 @@
 	import { MODE_SERVICE } from "$lib/mode/modeService";
 	import { showToast } from "$lib/notifications/toasts";
 	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
-	import { UI_STATE } from "$lib/state/uiState.svelte";
+	import { UI_STATE, withStackBusy } from "$lib/state/uiState.svelte";
 	import { ensureValue } from "$lib/utils/validation";
 	import { inject, injectOptional } from "@gitbutler/core/context";
 	import { Button, TestId } from "@gitbutler/ui";
-
-	import type { ComponentProps } from "svelte";
 
 	type Props = {
 		projectId: string;
@@ -30,7 +27,6 @@
 		draggableFiles: boolean;
 		grow?: boolean;
 		clientHeight?: number;
-		resizer?: Partial<ComponentProps<typeof Resizer>>;
 		rounded?: boolean;
 		ontoggle?: (collapsed: boolean) => void;
 		onerror: (err: unknown) => void;
@@ -45,7 +41,6 @@
 		commitKey,
 		grow,
 		clientHeight = $bindable(),
-		resizer,
 		rounded,
 		ontoggle,
 		onerror,
@@ -119,6 +114,7 @@
 			stackId: ensureValue(stackId),
 			commitId: commitKey.commitId,
 			message: commitMessage,
+			dryRun: false,
 		});
 
 		uiState
@@ -129,12 +125,19 @@
 
 	async function handleUncommit() {
 		if (!branchName) return;
-		await stackService.uncommit({
+		const targetStackId = ensureValue(stackId);
+		await withStackBusy(
+			uiState,
 			projectId,
-			stackId: ensureValue(stackId),
-			branchName,
-			commitId: commitKey.commitId,
-		});
+			{ commitId: commitKey.commitId, stackIds: [targetStackId] },
+			async () => {
+				await stackService.uncommit({
+					projectId,
+					stackId: targetStackId,
+					commitIds: [commitKey.commitId],
+				});
+			},
+		);
 	}
 
 	function canEdit() {
@@ -155,7 +158,6 @@
 			bind:clientHeight
 			testId={TestId.CommitDrawer}
 			persistId="commit-view-drawer-{projectId}-{stackId}-{commitKey.commitId}"
-			{resizer}
 			{grow}
 			{rounded}
 			{ontoggle}

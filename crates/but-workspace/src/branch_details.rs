@@ -8,7 +8,7 @@ use gix::{
 use itertools::Itertools;
 
 use crate::{
-    ref_info::function::workspace_data_of_default_workspace_branch,
+    ref_info::workspace_data_of_default_workspace_branch,
     ui,
     ui::{CommitState, PushStatus, UpstreamCommit},
 };
@@ -185,6 +185,9 @@ fn upstream_commits_gix(
         let info = info?;
         let commit = info.id().object()?.into_commit();
         let commit = commit.decode()?;
+        let change_id =
+            but_core::commit::Headers::try_from_commit_headers(|| commit.extra_headers())
+                .and_then(|hdr| hdr.change_id.map(|id| id.to_string()));
         let author: ui::Author = commit.author()?.into();
         let committer: ui::Author = commit.committer()?.into();
         authors.insert(author.clone());
@@ -194,6 +197,7 @@ fn upstream_commits_gix(
             message: commit.message.into(),
             created_at: i128::from(commit.time()?.seconds) * 1000,
             author,
+            change_id,
         });
     }
     Ok(out)
@@ -222,14 +226,17 @@ fn local_commits_gix(
         let committer: ui::Author = commit.committer.to_ref(&mut buf).into();
         authors.insert(author.clone());
         authors.insert(committer);
+        let is_conflicted = commit.is_conflicted();
+        let message = but_core::commit::strip_conflict_markers(commit.message.as_ref());
         out.push(ui::Commit {
             id: info.id,
             parent_ids: commit.parents.iter().cloned().collect(),
-            message: commit.message.clone(),
-            has_conflicts: commit.is_conflicted(),
+            message,
+            has_conflicts: is_conflicted,
             state: CommitState::LocalAndRemote(info.id),
             created_at: i128::from(commit.committer.time.seconds) * 1000,
             author,
+            change_id: commit.change_id().to_string(),
             gerrit_review_url: None,
         });
     }

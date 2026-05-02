@@ -1,12 +1,10 @@
 import { getStackName } from "$lib/stacks/stack";
 import { ensureValue } from "$lib/utils/validation";
-import type { DiffSpec } from "$lib/hunks/hunk";
-import type {
-	CreateCommitRequestWorktreeChanges,
-	RejectionReason,
-	StackService,
-} from "$lib/stacks/stackService.svelte";
+import type { CreateCommitRequestWorktreeChanges } from "$lib/stacks/stackEndpoints";
+import type { StackService } from "$lib/stacks/stackService.svelte";
+import type { RejectionReason } from "$lib/state/uiState.svelte";
 import type { UiState } from "$lib/state/uiState.svelte";
+import type { DiffSpec } from "@gitbutler/but-sdk";
 
 const STUB_COMMIT_MESSAGE = "New commit";
 
@@ -66,6 +64,7 @@ export default class StackMacros {
 			parentId: undefined,
 			message: message ?? STUB_COMMIT_MESSAGE,
 			worktreeChanges,
+			dryRun: false,
 		});
 
 		if (outcome.rejectedChanges.length > 0) {
@@ -100,16 +99,17 @@ export default class StackMacros {
 		branchName: string,
 		changes: DiffSpec[],
 	) {
-		const { replacedCommits } = await this.stackService.moveChangesBetweenCommits({
+		const { workspace } = await this.stackService.moveChangesBetweenCommits({
 			projectId: this.projectId,
 			destinationStackId: destinationStackId,
 			destinationCommitId: destinationCommitId,
 			sourceStackId,
 			sourceCommitId,
 			changes,
+			dryRun: false,
 		});
 
-		const newCommitId = replacedCommits.find(([before]) => before === destinationCommitId)?.[1];
+		const newCommitId = workspace.replacedCommits[destinationCommitId];
 		if (!newCommitId) {
 			// This happened only if something went wrong
 			throw new Error("No new commit id found for the moved changes");

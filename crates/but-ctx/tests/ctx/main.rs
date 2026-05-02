@@ -1,4 +1,5 @@
 use but_ctx::{Context, ProjectHandle};
+use but_path::AppChannel;
 use but_testsupport::{CommandExt as _, git, gix_testtools::tempfile::TempDir, open_repo};
 
 #[test]
@@ -64,15 +65,22 @@ fn project_data_dir_comes_from_git_config() -> anyhow::Result<()> {
     let ctx = Context::from_repo(repo)?;
     assert_eq!(ctx.project_data_dir(), ctx.gitdir.join("gitbutler-custom"));
 
-    let _db = ctx.db.get()?;
+    let db = ctx.db.get_cache()?;
     assert!(
         ctx.project_data_dir().join("but.sqlite").exists(),
         "database should be created in configured project-data directory"
     );
-    let _cache = ctx.cache.get_cache()?;
+
+    let project_cache_path = ctx.project_data_dir().join("but_cache.sqlite");
     assert!(
-        ctx.project_data_dir().join("but_cache.sqlite").exists(),
-        "project cache should be created in configured project-data directory"
+        !project_cache_path.exists(),
+        "cache database isn't present initially"
+    );
+
+    let _cache = db.cache.get()?;
+    assert!(
+        project_cache_path.exists(),
+        "cache database should be created after first access alongside the main database in configured project-data directory"
     );
     Ok(())
 }
@@ -87,28 +95,33 @@ fn sync_context_preserves_project_data_dir() -> anyhow::Result<()> {
     let sync = ctx.to_sync();
     let restored = sync.into_thread_local();
     assert_eq!(ctx.project_data_dir(), restored.project_data_dir());
-    let _cache = restored.cache.get_cache()?;
-    assert!(
-        restored
-            .project_data_dir()
-            .join("but_cache.sqlite")
-            .exists(),
-        "thread-local restoration should still initialize the project cache in the project data dir"
-    );
     Ok(())
 }
 
 #[test]
-fn memory_cache_does_not_create_project_cache_file() -> anyhow::Result<()> {
+fn discover_with_app_channel_uses_requested_project_data_dir() -> anyhow::Result<()> {
     let repo_dir = TempDir::new()?;
-    gix::init(repo_dir.path())?;
-    let repo = open_repo(repo_dir.path())?;
-    let ctx = Context::from_repo(repo)?.with_memory_cache();
+    let repo = gix::init(repo_dir.path())?;
+    let nightly_key =
+        but_project_handle::storage_path_config_key_for_app_channel(AppChannel::Nightly);
+    let dev_key = but_project_handle::storage_path_config_key_for_app_channel(AppChannel::Dev);
+    git(&repo)
+        .args(["config", "--local", nightly_key, "gitbutler-nightly"])
+        .run();
+    git(&repo)
+        .args(["config", "--local", dev_key, "gitbutler-dev"])
+        .run();
 
-    let _cache = ctx.cache.get_cache()?;
-    assert!(
-        !ctx.project_data_dir().join("but_cache.sqlite").exists(),
-        "project cache should remain in-memory"
+    let nightly_ctx = Context::discover_with_app_channel(repo_dir.path(), AppChannel::Nightly)?;
+    assert_eq!(
+        nightly_ctx.project_data_dir(),
+        nightly_ctx.gitdir.join("gitbutler-nightly")
+    );
+
+    let dev_ctx = Context::discover_with_app_channel(repo_dir.path(), AppChannel::Dev)?;
+    assert_eq!(
+        dev_ctx.project_data_dir(),
+        dev_ctx.gitdir.join("gitbutler-dev")
     );
     Ok(())
 }

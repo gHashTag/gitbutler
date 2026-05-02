@@ -5,12 +5,12 @@ import { UiState } from "$lib/state/uiState.svelte";
 import { WorktreeService } from "$lib/worktree/worktreeService.svelte";
 import { InjectionToken } from "@gitbutler/core/context";
 import { get } from "svelte/store";
-import type { Commit } from "$lib/branches/v3";
-import type { HunkAssignment } from "$lib/hunks/hunk";
 import type { ProjectsService } from "$lib/project/projectsService";
 import type RulesService from "$lib/rules/rulesService.svelte";
-import type { Stack, BranchDetails } from "$lib/stacks/stack";
+import type { Stack } from "$lib/stacks/stack";
 import type { EventProperties } from "$lib/state/customHooks.svelte";
+import type { HunkAssignment } from "@gitbutler/but-sdk";
+import type { BranchDetails, Commit } from "@gitbutler/but-sdk";
 import type { FModeManager } from "@gitbutler/ui/focus/fModeManager";
 
 export const COMMIT_ANALYTICS = new InjectionToken<CommitAnalytics>("CommitAnalytics");
@@ -145,9 +145,11 @@ export class CommitAnalytics {
 
 	private getLanesWithAssignments(stacks: Stack[], assignments: HunkAssignment[]): Stack[] {
 		const assignedStacks = new Set<string>();
-		assignments
-			.filter((assignment) => assignment.stackId !== null)
-			.forEach((assignment) => assignedStacks.add(assignment.stackId!));
+		assignments.forEach((assignment) => {
+			if (assignment.stackId !== null) {
+				assignedStacks.add(assignment.stackId);
+			}
+		});
 
 		return stacks.filter((stack) => stack.id && assignedStacks.has(stack.id));
 	}

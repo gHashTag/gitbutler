@@ -36,6 +36,7 @@
 	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
 
 	import { combineResults } from "$lib/state/helpers";
+	import { UI_STATE, withStackBusy } from "$lib/state/uiState.svelte";
 	import { ensureValue } from "$lib/utils/validation";
 	import { inject } from "@gitbutler/core/context";
 	import { TestId } from "@gitbutler/ui";
@@ -43,7 +44,7 @@
 	import { focusable } from "@gitbutler/ui/focus/focusable";
 	import { getTimeAgo } from "@gitbutler/ui/utils/timeAgo";
 	import { isDefined } from "@gitbutler/ui/utils/typeguards";
-	import type { BranchDetails } from "$lib/stacks/stack";
+	import type { BranchDetails } from "@gitbutler/but-sdk";
 
 	interface Props {
 		branchName: string;
@@ -63,6 +64,7 @@
 	const settingsService = inject(SETTINGS_SERVICE);
 	const dropzoneRegistry = inject(DROPZONE_REGISTRY);
 	const dragStateService = inject(DRAG_STATE_SERVICE);
+	const uiState = inject(UI_STATE);
 
 	const projectId = $derived(controller.projectId);
 	const stackId = $derived(controller.stackId);
@@ -88,24 +90,169 @@
 		stackService.upstreamCommits(projectId, stackId, branchName),
 	);
 
-	async function handleCommitClick(commitId: string, upstream: boolean) {
+	/**
+	 * Returns a flat ordered list of all commit IDs in this branch
+	 * (upstream-only first, then local-and-remote), used for Shift+Click range selection.
+	 */
+	function getAllCommitIds(): string[] {
+		const ups = upstreamOnlyCommits.response ?? [];
+		const local = localAndRemoteCommits.response ?? [];
+		return [...ups.map((c) => c.id), ...local.map((c) => c.id)];
+	}
+
+	async function handleCommitClick(commitId: string, upstream: boolean, event?: MouseEvent) {
 		const currentSelection = controller.selection.current;
-		// Toggle: if this exact commit is already selected, clear the selection
-		if (currentSelection?.commitId === commitId && currentSelection?.branchName === branchName) {
-			controller.selection.set(undefined);
+		const isMetaKey = event?.metaKey || event?.ctrlKey;
+		const isShiftKey = event?.shiftKey;
+		const isSameBranch = currentSelection?.branchName === branchName;
+
+		if (isMetaKey) {
+			// Cmd/Ctrl+Click: toggle this commit in/out of multi-selection
+			if (!isSameBranch) {
+				// Clicking in a different branch — start fresh selection here
+				controller.selection.set({
+					branchName,
+					commitId,
+					commitIds: [commitId],
+					upstream,
+					previewOpen: true,
+				});
+			} else {
+				const currentIds = controller.selectedCommitIds;
+				const alreadySelected = currentIds.includes(commitId);
+
+				if (alreadySelected && currentIds.length === 1) {
+					// Deselecting the only selected commit — clear selection
+					controller.selection.set(undefined);
+				} else if (alreadySelected) {
+					const newIds = currentIds.filter((id) => id !== commitId);
+					const newPrimary = newIds[newIds.length - 1]!;
+					controller.selection.set({
+						branchName,
+						commitId: newPrimary,
+						commitIds: newIds,
+						upstream: currentSelection?.upstream ?? upstream,
+						previewOpen: true,
+					});
+				} else {
+					const newIds = [...currentIds, commitId];
+					controller.selection.set({
+						branchName,
+						commitId,
+						commitIds: newIds,
+						upstream,
+						previewOpen: true,
+					});
+				}
+			}
+		} else if (isShiftKey && currentSelection?.commitId && isSameBranch) {
+			// Shift+Click: range select from primary commit to this one
+			const allIds = getAllCommitIds();
+			const anchorIdx = allIds.indexOf(currentSelection.commitId);
+			const targetIdx = allIds.indexOf(commitId);
+
+			if (anchorIdx !== -1 && targetIdx !== -1) {
+				const start = Math.min(anchorIdx, targetIdx);
+				const end = Math.max(anchorIdx, targetIdx);
+				const rangeIds = allIds.slice(start, end + 1);
+				controller.selection.set({
+					branchName,
+					commitId,
+					commitIds: rangeIds,
+					upstream,
+					previewOpen: true,
+				});
+			} else {
+				// Fallback: just select this commit
+				controller.selection.set({ branchName, commitId, upstream, previewOpen: true });
+			}
 		} else {
-			controller.selection.set({ branchName, commitId, upstream, previewOpen: true });
+			// Regular click: toggle single commit (same as before)
+			if (currentSelection?.commitId === commitId && currentSelection?.branchName === branchName) {
+				controller.selection.set(undefined);
+			} else {
+				controller.selection.set({ branchName, commitId, upstream, previewOpen: true });
+			}
 		}
 		controller.clearWorktreeSelection();
 	}
 
 	async function handleUncommit(commitId: string) {
-		await stackService.uncommit({
-			projectId,
-			stackId: ensureValue(stackId),
-			branchName,
-			commitId,
+		const targetStackId = ensureValue(stackId);
+		await withStackBusy(uiState, projectId, { commitId, stackIds: [targetStackId] }, async () => {
+			await stackService.uncommit({
+				projectId,
+				stackId: targetStackId,
+				commitIds: [commitId],
+			});
 		});
+	}
+
+	async function handleUncommitSelected(selectedIds?: string[]) {
+		const targetStackId = ensureValue(stackId);
+		const commitIds = selectedIds ?? controller.selectedCommitIds;
+		if (commitIds.length === 0) return;
+
+		// Filter to only IDs present in this branch to avoid invalid operations.
+		const allIds = getAllCommitIds();
+		const filtered = commitIds.filter((id) => allIds.includes(id));
+		if (filtered.length === 0) return;
+
+		await withStackBusy(uiState, projectId, { stackIds: [targetStackId] }, async () => {
+			await stackService.uncommit({
+				projectId,
+				stackId: targetStackId,
+				commitIds: filtered,
+			});
+		});
+		controller.selection.set(undefined);
+	}
+
+	async function handleSquashSelected(selectedIds?: string[]) {
+		const targetStackId = ensureValue(stackId);
+		const commitIds = selectedIds ?? controller.selectedCommitIds;
+
+		// Filter to only IDs present in this branch to avoid invalid operations.
+		const allIds = getAllCommitIds();
+		const sorted = commitIds
+			.filter((id) => allIds.includes(id))
+			.sort((a, b) => allIds.indexOf(a) - allIds.indexOf(b));
+		if (sorted.length < 2) return;
+		const targetCommitId = sorted[sorted.length - 1]!;
+		const sourceCommitIds = sorted.slice(0, -1);
+
+		await withStackBusy(uiState, projectId, { stackIds: [targetStackId] }, async () => {
+			await stackService.squashCommits({
+				projectId,
+				stackId: targetStackId,
+				sourceCommitIds,
+				targetCommitId,
+			});
+		});
+		controller.selection.set(undefined);
+	}
+
+	/**
+	 * When a commit is part of a multi-selection, build the allCommits array
+	 * for drag data. Returns undefined for single-commit drags.
+	 */
+	function getDragAllCommits(commitId: string): DzCommitData[] | undefined {
+		const selectedIds = controller.selectedCommitIds;
+		if (selectedIds.length <= 1 || !selectedIds.includes(commitId)) return undefined;
+
+		const allCommits = localAndRemoteCommits.response ?? [];
+		return selectedIds
+			.map((id) => {
+				const c = allCommits.find((c) => c.id === id);
+				if (!c) return undefined;
+				return {
+					id: c.id,
+					isRemote: isUpstreamCommit(c),
+					isIntegrated: isLocalAndRemoteCommit(c) && c.state.type === "Integrated",
+					hasConflicts: isLocalAndRemoteCommit(c) && c.hasConflicts,
+				} satisfies DzCommitData;
+			})
+			.filter((c): c is DzCommitData => c !== undefined);
 	}
 
 	function startEditingCommitMessage(commitId: string) {
@@ -150,7 +297,8 @@
 					{#each upstreamOnlyCommits as commit, i (commit.id)}
 						{@const first = i === 0}
 						{@const lastCommit = i === upstreamOnlyCommits.length - 1}
-						{@const selected = commit.id === selectedCommitId && branchName === selectedBranchName}
+						{@const selected =
+							controller.isCommitSelected(commit.id) && branchName === selectedBranchName}
 						{@const commitId = commit.id}
 						{#if !controller.isCommitting}
 							<CommitListItem
@@ -164,9 +312,9 @@
 								{first}
 								{lastCommit}
 								{selected}
-								active={controller.active}
+								active={controller.active && commit.id === selectedCommitId}
 								reactions={commitReactions[commit.id]}
-								onclick={() => handleCommitClick(commit.id, true)}
+								onclick={(e) => handleCommitClick(commit.id, true, e)}
 								disableCommitActions={false}
 								editable={!!stackId}
 							/>
@@ -187,13 +335,15 @@
 				<LazyList items={localAndRemoteCommits} chunkSize={100}>
 					{#snippet template(commit, { first, last })}
 						{@const commitId = commit.id}
-						{@const selected = commit.id === selectedCommitId && branchName === selectedBranchName}
+						{@const selected =
+							controller.isCommitSelected(commit.id) && branchName === selectedBranchName}
 						{#if controller.isCommitting}
 							<!-- Only commits to the base can be `last`, see next `CommitPositionIndicator`. -->
 							<CommitPositionIndicator
 								{commitId}
 								selected={(commitAction?.parentCommitId === commitId ||
 									(first && commitAction?.parentCommitId === undefined)) &&
+									!commitAction?.insertBelow &&
 									commitAction?.branchName === branchName}
 								{first}
 								last={false}
@@ -258,6 +408,7 @@
 												},
 												false,
 												branchName,
+												getDragAllCommits(commitId),
 											)
 										: undefined,
 									dropzoneRegistry,
@@ -269,6 +420,7 @@
 									commitMessage={commit.message}
 									type={commit.state.type}
 									hasConflicts={commit.hasConflicts}
+									busy={controller.busyCommitId === commit.id}
 									diverged={commit.state.type === "LocalAndRemote" &&
 										commit.id !== commit.state.subject}
 									createdAt={commitCreatedAt(commit)}
@@ -279,14 +431,22 @@
 									lastCommit={last}
 									{lastBranch}
 									{selected}
+									expandChangedFiles={commit.id === selectedCommitId &&
+										branchName === selectedBranchName &&
+										controller.selectedCommitIds.length <= 1}
 									{tooltip}
-									active={controller.active}
+									active={controller.active && commit.id === selectedCommitId}
 									reactions={commitReactions[commit.id]}
-									onclick={() => handleCommitClick(commit.id, false)}
+									onclick={(e) => handleCommitClick(commit.id, false, e)}
 									disableCommitActions={false}
 									editable={!!stackId}
 								>
 									{#snippet menu({ rightClickTrigger })}
+										{@const selectedIds = controller.selectedCommitIds}
+										{@const isMultiSelect =
+											selectedIds.length > 1 &&
+											branchName === selectedBranchName &&
+											selectedIds.includes(commitId)}
 										{@const data = {
 											stackId,
 											commitId,
@@ -295,6 +455,13 @@
 											commitUrl: forge.current.commitUrl(commitId),
 											onUncommitClick: () => handleUncommit(commit.id),
 											onEditMessageClick: () => startEditingCommitMessage(commit.id),
+											multiSelect: isMultiSelect
+												? {
+														commitIds: selectedIds,
+														onSquashSelected: () => handleSquashSelected(selectedIds),
+														onUncommitSelected: () => handleUncommitSelected(selectedIds),
+													}
+												: undefined,
 										}}
 										<CommitContextMenu
 											showOnHover
@@ -327,7 +494,7 @@
 														(change) =>
 															!(change.path in (changesResult.conflictEntries?.entries ?? {})),
 													)}
-													stats={changesResult.stats}
+													stats={changesResult.stats ?? undefined}
 													conflictEntries={changesResult.conflictEntries}
 													ancestorMostConflictedCommitId={firstConflictedCommitId}
 													autoselect
@@ -360,18 +527,20 @@
 						)}
 						{#if controller.isCommitting && last}
 							<CommitPositionIndicator
-								commitId={branchDetails.baseCommit}
+								commitId={commit.id}
 								{first}
 								{last}
 								selected={exclusiveAction?.type === "commit" &&
-									exclusiveAction.parentCommitId === branchDetails.baseCommit &&
+									exclusiveAction.parentCommitId === commit.id &&
+									exclusiveAction.insertBelow === true &&
 									commitAction?.branchName === branchName}
 								onclick={() => {
 									controller.projectState.exclusiveAction.set({
 										type: "commit",
 										stackId,
 										branchName,
-										parentCommitId: branchDetails.baseCommit,
+										parentCommitId: commit.id,
+										insertBelow: true,
 									});
 								}}
 							/>

@@ -32,7 +32,8 @@
 	} from "@gitbutler/ui";
 
 	import { tick } from "svelte";
-	import type { AnchorPosition, BranchDetails } from "$lib/stacks/stack";
+	import type { AnchorPosition } from "$lib/stacks/stack";
+	import type { BranchDetails } from "@gitbutler/but-sdk";
 
 	type Props = {
 		projectId: string;
@@ -83,6 +84,7 @@
 	const commits = $derived(allCommits?.response);
 	const branchType = $derived(commits?.at(0)?.state.type || "LocalOnly");
 	const isConflicted = $derived(commits?.some((commit) => commit.hasConflicts) ?? false);
+	const hasCommits = $derived((commits?.length ?? 0) > 0);
 
 	let aiConfigurationValid = $state(false);
 
@@ -100,9 +102,11 @@
 
 		const commits = await getAllCommits();
 		const commitMessages = commits?.map((commit) => commit.message) ?? [];
-		if (commitMessages.length === 0) {
-			throw new Error("There must be commits in the branch before you can generate a branch name");
-		}
+		// The context-menu entry is disabled via `hasCommits` when there are
+		// no commits yet. Guard defensively against a race (freshly-fetched
+		// commits may lag the reactive query) — silently no-op rather than
+		// raising an error toast.
+		if (commitMessages.length === 0) return;
 
 		const prompt = promptService.selectedBranchPrompt(projectId);
 		const newBranchName = await aiService.summarizeBranch({
@@ -216,6 +220,7 @@
 							projectId,
 							relativeTo: { type: "reference", subject: contextData.branch.reference },
 							side: "below",
+							dryRun: false,
 						});
 						close();
 					}}
@@ -244,7 +249,7 @@
 						label="Generate branch name"
 						icon="edit-ai"
 						testId={TestId.BranchHeaderContextMenu_GenerateBranchName}
-						disabled={isReadOnly}
+						disabled={isReadOnly || !hasCommits}
 						onclick={() => {
 							generateBranchName(stackId, branchName);
 							close();

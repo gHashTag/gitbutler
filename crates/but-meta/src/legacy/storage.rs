@@ -216,7 +216,7 @@ fn write_toml(path: &Path, data: &VirtualBranches) -> anyhow::Result<TomlFileSta
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    but_fs::write(path, content.as_bytes())?;
+    but_utils::write(path, content.as_bytes())?;
     // Read from a single file descriptor so mtime/hash come from the same file instance.
     let (bytes, metadata) = read_file_bytes_and_metadata(path)?;
     let mtime_ns = file_mtime_ns(&metadata)?;
@@ -306,7 +306,7 @@ fn legacy_to_snapshot(
     let last_pushed_base_sha = vb.last_pushed_base.map(|oid| oid.to_string());
 
     let mut stacks: Vec<_> = vb.branches.iter().collect();
-    stacks.sort_by_key(|(sid, stack)| (stack.order, sid.to_string()));
+    stacks.sort_by_key(|(sid, stack)| (stack.order, **sid));
 
     let mut out_stacks = Vec::with_capacity(stacks.len());
     let mut out_heads = Vec::new();
@@ -376,7 +376,7 @@ fn legacy_to_snapshot(
     }
 
     let mut out_targets: Vec<_> = vb.branch_targets.iter().collect();
-    out_targets.sort_by_key(|(sid, _)| sid.to_string());
+    out_targets.sort_by_key(|(sid, _)| **sid);
     let branch_targets = out_targets
         .into_iter()
         .map(|(stack_id, target)| {

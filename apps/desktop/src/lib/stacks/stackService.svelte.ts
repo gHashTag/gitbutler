@@ -1,5 +1,4 @@
 import { getBranchNameFromRef } from "$lib/branches/branchUtils";
-import { useNewRebaseEngine } from "$lib/config/uiFeatureFlags";
 import { sortLikeFileTree } from "$lib/files/filetreeV3";
 import { showToast } from "$lib/notifications/toasts";
 import {
@@ -21,28 +20,20 @@ import { type UiState } from "$lib/state/uiState.svelte";
 import { InjectionToken } from "@gitbutler/core/context";
 import { reactive } from "@gitbutler/shared/reactiveUtils.svelte";
 import { isDefined } from "@gitbutler/ui/utils/typeguards";
-import { get } from "svelte/store";
 import type { ReduxError } from "$lib/error/reduxError";
 import type { DefaultForgeFactory } from "$lib/forge/forgeFactory.svelte";
-import type { StackDetails } from "$lib/stacks/stack";
-import type { AppDispatch, BackendApi } from "$lib/state/clientState.svelte";
-import type { HunkAssignment } from "@gitbutler/core/api";
+import type { BackendApi } from "$lib/state/backendApi";
+import type { AppDispatch } from "$lib/state/clientState.svelte";
+import type { AbsorptionTarget, DiffSpec, StackDetails } from "@gitbutler/but-sdk";
 
-export type {
-	BranchParams,
-	BranchPushResult,
-	CreateCommitOutcome,
-	CreateCommitRequest,
-	CreateCommitRequestWorktreeChanges,
-	RejectionReason,
-	RelativeTo,
-	SeriesIntegrationStrategy,
-} from "$lib/stacks/stackEndpoints";
 export { REJECTTION_REASONS } from "$lib/stacks/stackEndpoints";
 
-const PUSH_ERROR_REASONS: Record<string, string> = {
-	["errors.git.authentication"]: "an authentication failure",
-	["errors.git.force_push_protection"]: "force push protection",
+type AmendCommitRequest = {
+	projectId: string;
+	stackId: string;
+	commitId: string;
+	worktreeChanges: DiffSpec[];
+	dryRun: boolean;
 };
 
 export const STACK_SERVICE = new InjectionToken<StackService>("StackService");
@@ -424,10 +415,11 @@ export class StackService {
 			},
 			onError: (commandError: ReduxError) => {
 				const { code, message } = commandError;
-				if (code === "errors.git.force_push_protection") {
+				if (code === "GitForcePushProtection") {
 					throw commandError;
 				}
-				const reason = PUSH_ERROR_REASONS[code ?? ""] ?? "an unforeseen error";
+				const reason =
+					code === "ProjectGitAuth" ? "an authentication failure" : "an unforeseen error";
 				showToast({
 					title: "Git push failed",
 					message: `Your branch cannot be pushed due to ${reason}.\n\nPlease check our [documentation](https://docs.gitbutler.com/troubleshooting/fetch-push)\non fetching and pushing for ways to resolve the problem.`,
@@ -440,19 +432,11 @@ export class StackService {
 	}
 
 	createCommit() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.commitCreate.useMutation();
-		} else {
-			return this.backendApi.endpoints.legacyCreateCommit.useMutation();
-		}
+		return this.backendApi.endpoints.commitCreate.useMutation();
 	}
 
 	get createCommitMutation() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.commitCreate.mutate;
-		} else {
-			return this.backendApi.endpoints.legacyCreateCommit.mutate;
-		}
+		return this.backendApi.endpoints.commitCreate.mutate;
 	}
 
 	filePathsChangedInCommits(projectId: string, commitIds: string[]) {
@@ -570,26 +554,17 @@ export class StackService {
 	}
 
 	get updateCommitMessage() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.updateCommitMessage.useMutation();
-		} else {
-			return this.backendApi.endpoints.legacyUpdateCommitMessage.useMutation();
-		}
+		return this.backendApi.endpoints.updateCommitMessage.useMutation();
 	}
 
 	get newBranch() {
 		return this.backendApi.endpoints.newBranch.useMutation();
 	}
 
-	async uncommit(args: {
-		projectId: string;
-		stackId: string;
-		branchName: string;
-		commitId: string;
-	}) {
+	async uncommit(args: { projectId: string; stackId: string; commitIds: string[] }) {
 		const result = await this.backendApi.endpoints.uncommit.mutate(args);
 		const selection = this.uiState.lane(args.stackId).selection;
-		if (args.commitId === selection.current?.commitId) {
+		if (selection.current?.commitId && args.commitIds.includes(selection.current.commitId)) {
 			selection.set(undefined);
 		}
 		return result;
@@ -607,20 +582,39 @@ export class StackService {
 		return this.backendApi.endpoints.discardChanges.mutate;
 	}
 
-	get moveChangesBetweenCommits() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.commitMoveChangesBetween.mutate;
-		} else {
-			return this.backendApi.endpoints.legacyMoveChangesBetweenCommits.mutate;
-		}
+	async moveChangesBetweenCommits(args: {
+		projectId: string;
+		changes: DiffSpec[];
+		sourceCommitId: string;
+		sourceStackId: string;
+		destinationCommitId: string;
+		destinationStackId: string;
+		dryRun: boolean;
+	}) {
+		return await this.backendApi.endpoints.commitMoveChangesBetween.mutate({
+			projectId: args.projectId,
+			changes: args.changes,
+			sourceCommitId: args.sourceCommitId,
+			destinationCommitId: args.destinationCommitId,
+			dryRun: args.dryRun,
+		});
 	}
 
-	get uncommitChanges() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.commitUncommitChanges.mutate;
-		} else {
-			return this.backendApi.endpoints.legacyUncommitChanges.mutate;
-		}
+	async uncommitChanges(args: {
+		projectId: string;
+		changes: DiffSpec[];
+		commitId: string;
+		stackId: string;
+		assignTo?: string;
+		dryRun: boolean;
+	}) {
+		return await this.backendApi.endpoints.commitUncommitChanges.mutate({
+			projectId: args.projectId,
+			changes: args.changes,
+			commitId: args.commitId,
+			assignTo: args.assignTo,
+			dryRun: args.dryRun,
+		});
 	}
 
 	get stashIntoBranch() {
@@ -673,12 +667,8 @@ export class StackService {
 		return this.backendApi.endpoints.removeBranch.useMutation();
 	}
 
-	get reorderStack() {
-		return this.backendApi.endpoints.reorderStack.mutate;
-	}
-
-	get moveCommit() {
-		return this.backendApi.endpoints.moveCommit.mutate;
+	get commitMove() {
+		return this.backendApi.endpoints.commitMove.mutate;
 	}
 
 	get moveBranch() {
@@ -718,19 +708,27 @@ export class StackService {
 	}
 
 	get amendCommit() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.commitAmend.useMutation();
-		} else {
-			return this.backendApi.endpoints.legacyAmendCommit.useMutation();
-		}
+		const [amendCommit, amendCommitQuery] = this.backendApi.endpoints.commitAmend.useMutation();
+		return [
+			(args: AmendCommitRequest) =>
+				amendCommit({
+					projectId: args.projectId,
+					commitId: args.commitId,
+					worktreeChanges: args.worktreeChanges,
+					dryRun: args.dryRun,
+				}),
+			amendCommitQuery,
+		] as const;
 	}
 
 	get amendCommitMutation() {
-		if (get(useNewRebaseEngine)) {
-			return this.backendApi.endpoints.commitAmend.mutate;
-		} else {
-			return this.backendApi.endpoints.legacyAmendCommit.mutate;
-		}
+		return (args: AmendCommitRequest) =>
+			this.backendApi.endpoints.commitAmend.mutate({
+				projectId: args.projectId,
+				commitId: args.commitId,
+				worktreeChanges: args.worktreeChanges,
+				dryRun: args.dryRun,
+			});
 	}
 
 	/** Squash all the commits in a branch together */
@@ -884,7 +882,7 @@ export class StackService {
 		return this.backendApi.endpoints.absorb.useMutation();
 	}
 
-	async fetchAbsorbPlan(projectId: string, target: HunkAssignment.AbsorptionTarget) {
+	async fetchAbsorbPlan(projectId: string, target: AbsorptionTarget) {
 		return await this.backendApi.endpoints.absorbPlan.fetch({ projectId, target });
 	}
 }

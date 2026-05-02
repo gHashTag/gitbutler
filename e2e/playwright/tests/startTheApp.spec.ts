@@ -1,15 +1,16 @@
 import { GIT_CONFIG_GLOBAL } from "../src/env.ts";
 import { writeToFile } from "../src/file.ts";
 import { getBaseURL, type GitButler, startGitButler } from "../src/setup.ts";
+import { test } from "../src/test.ts";
 import {
 	clickByTestId,
 	fillByTestId,
 	getByTestId,
-	sleep,
+	mockPickDirectory,
 	textEditorFillByTestId,
 	waitForTestId,
 } from "../src/util.ts";
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
 
 let gitbutler: GitButler;
 
@@ -37,11 +38,8 @@ test("should start the application and be able to commit", async ({ page, contex
 	clickByTestId(page, "analytics-continue");
 
 	// Add a local project
-	const fileChooserPromise = page.waitForEvent("filechooser");
-	clickByTestId(page, "add-local-project");
-
-	const fileChooser = await fileChooserPromise;
-	await fileChooser.setFiles(projectPath);
+	await mockPickDirectory(page, projectPath);
+	await clickByTestId(page, "add-local-project");
 
 	// Should see the set target page
 	await waitForTestId(page, "project-setup-page");
@@ -108,11 +106,8 @@ test("no author setup - should start the application and be able to commit", asy
 	clickByTestId(page, "analytics-continue");
 
 	// Add a local project
-	const fileChooserPromise = page.waitForEvent("filechooser");
-	clickByTestId(page, "add-local-project");
-
-	const fileChooser = await fileChooserPromise;
-	await fileChooser.setFiles(projectPath);
+	await mockPickDirectory(page, projectPath);
+	await clickByTestId(page, "add-local-project");
 
 	// Should see the set target page
 	await waitForTestId(page, "project-setup-page");
@@ -124,9 +119,9 @@ test("no author setup - should start the application and be able to commit", asy
 
 	// Should see the author missing modal
 	await waitForTestId(page, "global-modal-author-missing");
-	// Idk why, but someone this fills the input too quickly and... something...
-	// causes it to get unset
-	await sleep(30);
+	// WebKit needs extra time for the modal inputs to become interactive.
+	// Without this, fill() silently fails and the values don't persist.
+	await page.waitForTimeout(200);
 	await fillByTestId(page, "global-modal-author-missing-name-input", "Test User");
 	await fillByTestId(page, "global-modal-author-missing-email-input", "test@example.com");
 	await clickByTestId(page, "global-modal-author-missing-action-button", true);

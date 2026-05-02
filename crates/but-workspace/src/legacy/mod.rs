@@ -1,3 +1,8 @@
+#![expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
+
 use std::path::Path;
 
 use but_ctx::Context;
@@ -14,12 +19,12 @@ pub use head::{
 
 pub mod tree_manipulation;
 // TODO: _v3 versions are specifically for the UI, so import them into `ui` instead.
+#[expect(deprecated, reason = "re-exports stacks_v3 and stack_details_v3")]
 pub use stacks::{
     local_and_remote_commits, stack_branches, stack_details_v3, stack_heads_info, stacks_v3,
 };
 pub use tree_manipulation::{
     MoveChangesResult,
-    move_between_commits::move_changes_between_commits,
     remove_changes_from_commit_in_stack::remove_changes_from_commit_in_stack,
     split_branch::{split_branch, split_into_dependent_branch},
     split_commit::{CommitFiles, CommmitSplitOutcome, split_commit},
@@ -30,12 +35,6 @@ pub mod ui;
 
 /// High level Stack functions that use primitives from this crate (`but-workspace`)
 pub mod stack_ext;
-
-/// Returns the last-seen fork-point that the workspace has with the target branch with which it wants to integrate.
-// TODO: at some point this should be optional, integration branch doesn't have to be defined.
-pub fn common_merge_base_with_target_branch(gb_dir: &Path) -> anyhow::Result<gix::ObjectId> {
-    Ok(VirtualBranchesHandle::new(gb_dir).get_default_target()?.sha)
-}
 
 /// Return a list of commits on the target branch
 /// Starts either from the target branch or from the provided commit id, up to the limit provided.
@@ -55,10 +54,11 @@ pub fn log_target_first_parent(
             commit.parent_ids().next()
         }
         None => {
-            let state = state_handle(&ctx.project_data_dir());
-            let default_target = state.get_default_target()?;
+            let default_target = ctx.persisted_default_target()?;
+            let target_ref_name: gix::refs::FullName =
+                default_target.branch.to_string().try_into()?;
             Some(
-                repo.find_reference(&default_target.branch.to_string())?
+                repo.find_reference(target_ref_name.as_ref())?
                     .peel_to_commit()?
                     .id(),
             )
@@ -74,8 +74,16 @@ pub fn log_target_first_parent(
         if commits.len() == limit {
             break;
         }
-        let commit = commit_info?.id().object()?.into_commit();
-
+        // In shallow repositories, the traversal may hit a commit whose parent
+        // objects are not present locally. Stop rather than propagating the error.
+        let info = match commit_info {
+            Ok(info) => info,
+            Err(_) => break,
+        };
+        let commit = match info.id().object() {
+            Ok(obj) => obj.into_commit(),
+            Err(_) => break,
+        };
         commits.push(commit.try_into()?);
     }
     Ok(commits)

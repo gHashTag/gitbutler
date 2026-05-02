@@ -1,10 +1,9 @@
-import { Code } from "$lib/error/knownErrors";
 import { isReduxError } from "$lib/error/reduxError";
 import { showError } from "$lib/error/showError";
 import { parseRemoteUrl } from "$lib/git/gitUrl";
 import { InjectionToken } from "@gitbutler/core/context";
-import type { BaseBranch } from "$lib/baseBranch/baseBranch";
-import type { BackendApi } from "$lib/state/clientState.svelte";
+import type { BackendApi } from "$lib/state/backendApi";
+import type { BaseBranch } from "@gitbutler/but-sdk";
 
 export const BASE_BRANCH_SERVICE = new InjectionToken<BaseBranchService>("BaseBranchService");
 
@@ -80,18 +79,18 @@ export default class BaseBranchService {
 					return;
 				}
 				const { code } = error;
-				if (code === Code.DefaultTargetNotFound) {
+				if (code === "DefaultTargetNotFound") {
 					// Swallow this error since user should be taken to project setup page
 					return;
 				}
 
-				if (code === Code.ProjectsGitAuth) {
+				if (code === "ProjectGitAuth") {
 					if (action === "auto") return;
 					showError("Failed to authenticate", error.message);
 					return;
 				}
 
-				if (code === Code.Unknown && error.message?.includes("cargo build -p gitbutler-git")) {
+				if (code === "Unknown" && error.message?.includes("cargo build -p gitbutler-git")) {
 					showError("Run `cargo build -p gitbutler-git`", error.message);
 					return;
 				}

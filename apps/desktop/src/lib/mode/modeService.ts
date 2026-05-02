@@ -1,7 +1,5 @@
 import { InjectionToken } from "@gitbutler/core/context";
-import type { BackendApi } from "$lib/state/clientState.svelte";
-
-export type { EditModeMetadata, OutsideWorkspaceMetadata, Mode } from "$lib/mode/modeEndpoints";
+import type { BackendApi } from "$lib/state/backendApi";
 
 export const MODE_SERVICE = new InjectionToken<ModeService>("ModeService");
 
@@ -41,6 +39,14 @@ export class ModeService {
 			{ projectId },
 			{ transform: (response) => response.operatingMode },
 		);
+	}
+
+	/**
+	 * Force-fetch the current mode, bypassing the cache. This updates the
+	 * cache so that reactive subscribers see the new value immediately.
+	 */
+	async fetchMode(projectId: string) {
+		return await this.backendApi.endpoints.headAndMode.fetch({ projectId }, { forceRefetch: true });
 	}
 
 	head(projectId: string) {

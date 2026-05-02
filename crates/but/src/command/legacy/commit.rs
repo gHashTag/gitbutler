@@ -7,15 +7,15 @@ use but_api::{
     diff,
     legacy::{repo, workspace},
 };
-use but_core::{DiffSpec, sync::RepoExclusive, ui::TreeChange};
+use but_core::{DiffSpec, DryRun, sync::RepoExclusive, ui::TreeChange};
 use but_rebase::graph_rebase::mutate::{InsertSide, RelativeTo};
-use colored::Colorize;
 use gitbutler_repo::hooks;
 
 use super::{ShowDiffInEditor, estimate_diff_blob_size};
 use crate::{
     CliId, IdMap,
     command::legacy::status::assignment::{CLIHunkAssignment, FileAssignment},
+    theme::{self, Paint},
     tui,
     utils::{InputOutputChannel, OutputChannel, shorten_object_id},
 };
@@ -65,6 +65,7 @@ pub(crate) fn insert_blank_commit(
                 ctx,
                 RelativeTo::Commit(*oid),
                 insert_side,
+                DryRun::No,
                 guard.write_permission(),
             )?;
             format!("Created blank commit {position_desc} commit {short_oid}")
@@ -78,6 +79,7 @@ pub(crate) fn insert_blank_commit(
                 ctx,
                 RelativeTo::Reference(reference.name),
                 insert_side,
+                DryRun::No,
                 guard.write_permission(),
             )?;
             match insert_side {
@@ -303,6 +305,8 @@ pub(crate) fn commit(
     let mut guard = ctx.exclusive_worktree_access();
     let id_map = IdMap::new_from_context(ctx, None, guard.read_permission())?;
 
+    let t = theme::get();
+
     // Get all stacks using but-api
     let stack_entries = workspace::stacks(ctx, None)?;
     let stacks: Vec<(
@@ -479,6 +483,7 @@ pub(crate) fn commit(
         InsertSide::Below,
         diff_specs,
         final_commit_message,
+        DryRun::No,
         guard.write_permission(),
     )?;
 
@@ -490,8 +495,8 @@ pub(crate) fn commit(
         if let Some(out) = out.for_human() {
             writeln!(
                 out,
-                "{}",
-                "Warning: Some selected changes could not be committed.".yellow()
+                "{} Some selected changes could not be committed.",
+                t.attention.paint("Warning:"),
             )?;
         }
     }
@@ -503,11 +508,10 @@ pub(crate) fn commit(
         };
         writeln!(
             out,
-            "{} {} {} {}",
-            "✓ Created commit".green(),
-            commit_short.magenta(),
-            "on branch".green(),
-            target_branch.name.to_str_lossy().yellow()
+            "{} Created commit {} on branch {}",
+            t.sym().success,
+            t.commit_id.paint(commit_short),
+            t.local_branch.paint(target_branch.name.to_str_lossy()),
         )?;
     } else if let Some(json_out) = out.for_json() {
         let commit_data = serde_json::json!({
@@ -529,7 +533,11 @@ pub(crate) fn commit(
             hooks::HookResult::Failure(error_data) => {
                 // Warn the user but don't fail since the commit is already created
                 if let Some(out) = out.for_human() {
-                    writeln!(out, "\n{}", "Warning: post-commit hook failed:".yellow())?;
+                    writeln!(
+                        out,
+                        "\n{} post-commit hook failed:",
+                        t.attention.paint("Warning:")
+                    )?;
                     writeln!(out, "{}", error_data.error)?;
                 }
             }
@@ -675,10 +683,17 @@ fn prompt_for_stack_selection(
     but_workspace::ui::StackDetails,
 )> {
     use std::fmt::Write;
+
+    let t = theme::get();
     writeln!(inout, "Multiple stacks found. Choose one to commit to:")?;
 
     for (i, (_stack_id, stack_details)) in stacks.iter().enumerate() {
-        writeln!(inout, "  {}. {}", i + 1, stack_details.derived_name.green())?;
+        writeln!(
+            inout,
+            "  {}. {}",
+            i + 1,
+            t.local_branch.paint(&stack_details.derived_name)
+        )?;
     }
 
     let selection: usize = inout

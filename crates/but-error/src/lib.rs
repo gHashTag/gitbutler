@@ -68,7 +68,7 @@
 //!
 //!
 //! assert_eq!(format!("{:#}", a().unwrap_err()),
-//!            "errors.unknown: whatever comes before a `Code` context shows in frontend, so THIS: this didn't work",
+//!            "Unknown: whatever comes before a `Code` context shows in frontend, so THIS: this didn't work",
 //!            "however, that Code also shows up in the error chain in logs - context is just like an Error for anyhow");
 //!
 //! ```
@@ -118,6 +118,7 @@ use std::{borrow::Cow, fmt::Debug};
 ///
 /// In practice, it should match its [frontend counterpart](https://github.com/gitbutlerapp/gitbutler/blob/fa973fd8f1ae8807621f47601803d98b8a9cf348/app/src/lib/backend/ipc.ts#L5).
 #[derive(Debug, Default, Copy, Clone, PartialOrd, PartialEq)]
+#[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 pub enum Code {
     /// Much like a catch-all error code. It shouldn't be attached explicitly unless
     /// a message is provided as well as part of a [`Context`].
@@ -138,29 +139,25 @@ pub enum Code {
     NetworkError,
     ProjectDatabaseIncompatible,
     DefaultTerminalNotFound,
+    /// The user dismissed the macOS admin-privileges prompt when installing
+    /// the `but` CLI. Not a real failure — the frontend swaps it for a
+    /// neutral info toast.
+    CliInstallCancelled,
+    /// The GitHub access token was rejected. Currently only synthesized by
+    /// the frontend when an Octokit response message starts with
+    /// "Not Found -" — kept here so the wire-level `Code` enum is the
+    /// single source of truth for codes the desktop app may surface.
+    GitHubTokenExpired,
 }
+
+#[cfg(feature = "export-schema")]
+but_schemars::register_sdk_type!(Code);
 
 impl std::fmt::Display for Code {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let code = match self {
-            Code::Unknown => "errors.unknown",
-            Code::RepoOwnership => "errors.repo_ownership",
-            Code::Validation => "errors.validation",
-            Code::ProjectGitAuth => "errors.projects.git.auth",
-            Code::DefaultTargetNotFound => "errors.projects.default_target.not_found",
-            Code::CommitSigningFailed => "errors.commit.signing_failed",
-            Code::CommitMergeConflictFailure => "errors.commit.merge_conflict_failure",
-            Code::AuthorMissing => "errors.git.author_missing",
-            Code::ProjectMissing => "errors.projects.missing",
-            Code::BranchNotFound => "errors.branch.notfound",
-            Code::SecretKeychainNotFound => "errors.secret.keychain_notfound",
-            Code::MissingLoginKeychain => "errors.secret.missing_login_keychain",
-            Code::GitForcePushProtection => "errors.git.force_push_protection",
-            Code::NetworkError => "errors.network",
-            Code::ProjectDatabaseIncompatible => "errors.projectdb.migration",
-            Code::DefaultTerminalNotFound => "errors.terminal.not_found",
-        };
-        f.write_str(code)
+        // `Debug` on a unit variant prints just the variant name, which is
+        // the wire-level identifier shared with the frontend.
+        std::fmt::Debug::fmt(self, f)
     }
 }
 

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     commit::types::CommitDiscardResult as EngineCommitDiscardResult,
-    commit::types::CommitUndoResult as EngineCommitUndoResult, json::HexHash,
+    commit::types::UncommitResult as EngineUncommitResult, json::HexHash,
 };
 
 use super::types::{
@@ -18,28 +18,22 @@ use super::types::{
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MoveChangesResult {
-    /// Commits that have been mapped from one thing to another.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after moving changes.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(MoveChangesResult);
 
-impl From<EngineMoveChangesResult> for MoveChangesResult {
-    fn from(value: EngineMoveChangesResult) -> Self {
-        let EngineMoveChangesResult { replaced_commits } = value;
+impl TryFrom<EngineMoveChangesResult> for MoveChangesResult {
+    type Error = anyhow::Error;
 
-        Self {
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+    fn try_from(value: EngineMoveChangesResult) -> Result<Self, Self::Error> {
+        let EngineMoveChangesResult { workspace } = value;
+
+        Ok(Self {
+            workspace: workspace.try_into()?,
+        })
     }
 }
 
@@ -73,27 +67,24 @@ pub struct CommitCreateResult {
     pub new_commit: Option<HexHash>,
     /// Changes that were rejected during commit creation.
     pub rejected_changes: Vec<RejectedChange>,
-    /// Commits that have been replaced as a side-effect of the create/amend.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after the create or amend.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CommitCreateResult);
 
-impl From<EngineCommitCreateResult> for CommitCreateResult {
-    fn from(value: EngineCommitCreateResult) -> Self {
+impl TryFrom<EngineCommitCreateResult> for CommitCreateResult {
+    type Error = anyhow::Error;
+
+    fn try_from(value: EngineCommitCreateResult) -> Result<Self, Self::Error> {
         let EngineCommitCreateResult {
             new_commit,
             rejected_specs,
-            replaced_commits,
+            workspace,
         } = value;
 
-        Self {
+        Ok(Self {
             new_commit: new_commit.map(Into::into),
             rejected_changes: rejected_specs
                 .into_iter()
@@ -103,11 +94,8 @@ impl From<EngineCommitCreateResult> for CommitCreateResult {
                     path_bytes: diff.path,
                 })
                 .collect(),
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+            workspace: workspace.try_into()?,
+        })
     }
 }
 
@@ -119,32 +107,26 @@ pub struct CommitRewordResult {
     /// The new commit ID after rewording.
     #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
     pub new_commit: HexHash,
-    /// Commits that have been replaced as a side-effect of the reword.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after the reword.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CommitRewordResult);
 
-impl From<EngineCommitRewordResult> for CommitRewordResult {
-    fn from(value: EngineCommitRewordResult) -> Self {
+impl TryFrom<EngineCommitRewordResult> for CommitRewordResult {
+    type Error = anyhow::Error;
+
+    fn try_from(value: EngineCommitRewordResult) -> Result<Self, Self::Error> {
         let EngineCommitRewordResult {
             new_commit,
-            replaced_commits,
+            workspace,
         } = value;
 
-        Self {
+        Ok(Self {
             new_commit: new_commit.into(),
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+            workspace: workspace.try_into()?,
+        })
     }
 }
 
@@ -156,32 +138,26 @@ pub struct CommitSquashResult {
     /// The new commit ID after squashing.
     #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
     pub new_commit: HexHash,
-    /// Commits that have been replaced as a side-effect of the squash.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after the squash.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CommitSquashResult);
 
-impl From<EngineCommitSquashResult> for CommitSquashResult {
-    fn from(value: EngineCommitSquashResult) -> Self {
+impl TryFrom<EngineCommitSquashResult> for CommitSquashResult {
+    type Error = anyhow::Error;
+
+    fn try_from(value: EngineCommitSquashResult) -> Result<Self, Self::Error> {
         let EngineCommitSquashResult {
             new_commit,
-            replaced_commits,
+            workspace,
         } = value;
 
-        Self {
+        Ok(Self {
             new_commit: new_commit.into(),
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+            workspace: workspace.try_into()?,
+        })
     }
 }
 
@@ -193,32 +169,26 @@ pub struct CommitInsertBlankResult {
     /// The new blank commit ID.
     #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
     pub new_commit: HexHash,
-    /// Commits that have been replaced as a side-effect of the insertion.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after inserting the blank commit.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CommitInsertBlankResult);
 
-impl From<EngineCommitInsertBlankResult> for CommitInsertBlankResult {
-    fn from(value: EngineCommitInsertBlankResult) -> Self {
+impl TryFrom<EngineCommitInsertBlankResult> for CommitInsertBlankResult {
+    type Error = anyhow::Error;
+
+    fn try_from(value: EngineCommitInsertBlankResult) -> Result<Self, Self::Error> {
         let EngineCommitInsertBlankResult {
             new_commit,
-            replaced_commits,
+            workspace,
         } = value;
 
-        Self {
+        Ok(Self {
             new_commit: new_commit.into(),
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+            workspace: workspace.try_into()?,
+        })
     }
 }
 
@@ -227,28 +197,22 @@ impl From<EngineCommitInsertBlankResult> for CommitInsertBlankResult {
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CommitMoveResult {
-    /// Commits that have been replaced as a side-effect of the move.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after moving the commit.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CommitMoveResult);
 
-impl From<EngineCommitMoveResult> for CommitMoveResult {
-    fn from(value: EngineCommitMoveResult) -> Self {
-        let EngineCommitMoveResult { replaced_commits } = value;
+impl TryFrom<EngineCommitMoveResult> for CommitMoveResult {
+    type Error = anyhow::Error;
 
-        Self {
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+    fn try_from(value: EngineCommitMoveResult) -> Result<Self, Self::Error> {
+        let EngineCommitMoveResult { workspace } = value;
+
+        Ok(Self {
+            workspace: workspace.try_into()?,
+        })
     }
 }
 /// JSON transport type for discarding a commit.
@@ -259,68 +223,57 @@ pub struct CommitDiscardResult {
     /// The commit that was discarded as a result of this operation.
     #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
     pub discarded_commit: HexHash,
-    /// Commits that have been replaced as a side-effect of the commit discard.
-    /// Maps `oldId -> newId`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+    /// Workspace state after discarding the commit.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
 but_schemars::register_sdk_type!(CommitDiscardResult);
 
-impl From<EngineCommitDiscardResult> for CommitDiscardResult {
-    fn from(value: EngineCommitDiscardResult) -> Self {
+impl TryFrom<EngineCommitDiscardResult> for CommitDiscardResult {
+    type Error = anyhow::Error;
+
+    fn try_from(value: EngineCommitDiscardResult) -> Result<Self, Self::Error> {
         let EngineCommitDiscardResult {
-            replaced_commits,
             discarded_commit,
+            workspace,
         } = value;
 
-        Self {
+        Ok(Self {
             discarded_commit: discarded_commit.into(),
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+            workspace: workspace.try_into()?,
+        })
     }
 }
 
-/// JSON transport type for undoing a commit.
+/// JSON transport type for uncommitting one or more commits.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
-pub struct CommitUndoResult {
-    /// The ID of the commit that was undone.
-    #[cfg_attr(feature = "export-schema", schemars(with = "String"))]
-    pub undone_commit: HexHash,
-    /// Commits that were replaced by this operation. Maps `old_id -> new_id`.
-    #[cfg_attr(
-        feature = "export-schema",
-        schemars(with = "std::collections::BTreeMap<String, String>")
-    )]
-    pub replaced_commits: std::collections::BTreeMap<HexHash, HexHash>,
+pub struct UncommitResult {
+    /// The IDs of the commits that were uncommitted.
+    #[cfg_attr(feature = "export-schema", schemars(with = "Vec<String>"))]
+    pub uncommitted_ids: Vec<HexHash>,
+    /// Workspace state after uncommitting.
+    pub workspace: crate::json::WorkspaceState,
 }
 
 #[cfg(feature = "export-schema")]
-but_schemars::register_sdk_type!(CommitUndoResult);
+but_schemars::register_sdk_type!(UncommitResult);
 
-impl From<EngineCommitUndoResult> for CommitUndoResult {
-    fn from(value: EngineCommitUndoResult) -> Self {
-        let EngineCommitUndoResult {
-            undone_commit,
-            replaced_commits,
+impl TryFrom<EngineUncommitResult> for UncommitResult {
+    type Error = anyhow::Error;
+
+    fn try_from(value: EngineUncommitResult) -> Result<Self, Self::Error> {
+        let EngineUncommitResult {
+            uncommitted_ids,
+            workspace,
         } = value;
 
-        Self {
-            undone_commit: undone_commit.into(),
-            replaced_commits: replaced_commits
-                .into_iter()
-                .map(|(old, new)| (old.into(), new.into()))
-                .collect(),
-        }
+        Ok(Self {
+            uncommitted_ids: uncommitted_ids.into_iter().map(Into::into).collect(),
+            workspace: workspace.try_into()?,
+        })
     }
 }
 

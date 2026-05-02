@@ -36,10 +36,6 @@ struct Args {
     /// Disable authentication entirely. DANGEROUS — only use on trusted networks.
     #[arg(long)]
     dangerously_allow_anyone: bool,
-
-    /// Use the staging GitButler API (app.staging.gitbutler.com) instead of production.
-    #[arg(long)]
-    dev: bool,
 }
 
 #[tokio::main]
@@ -56,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // To be able to use the askpass broker when running but-server, it needs to be hooked up to
     // the websocket. As the askpass broker historically hasn't been initialized for but-server,
     // it does not seem worthwhile to hook that up right now.
-    gitbutler_repo_actions::askpass::disable();
+    but_askpass::disable();
 
     let args = Args::parse();
     let config = Config {
@@ -67,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
         origin: args.origin,
         base_path: args.base_path,
         allow_anyone: args.dangerously_allow_anyone,
-        dev: args.dev,
         project_path: None,
         verbose: true,
     };

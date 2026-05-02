@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use but_core::{RepositoryExt, TreeChange, diff::tree_changes};
+use but_core::{RepositoryExt, TreeChange, WORKSPACE_REF_NAME, diff::tree_changes};
 use but_ctx::{
     Context,
     access::{RepoExclusive, RepoShared},
@@ -14,7 +14,14 @@ use but_ctx::{
 use but_meta::virtual_branches_legacy_types;
 use but_oxidize::{ObjectIdExt as _, OidExt};
 use gitbutler_cherry_pick::GixRepositoryExt as _;
-use gitbutler_repo::{SignaturePurpose, commit_without_signature_gix, signature_gix};
+use gitbutler_repo::{
+    SignaturePurpose, commit_ids_excluding_reachable_from_with_graph, commit_without_signature_gix,
+    signature_gix,
+};
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 use gitbutler_stack::{VirtualBranchesHandle, VirtualBranchesState};
 use gix::objs::Write as _;
 use gix::{
@@ -127,10 +134,15 @@ pub trait OplogExt {
         guard: &mut RepoExclusive,
     ) -> Result<gix::ObjectId>;
 
-    /// Returns the diff of the snapshot and it's parent. It only includes the workdir changes.
+    /// Returns the diff showing what this snapshot's operation changed.
     ///
-    /// This is useful to show what has changed in this particular snapshot
-    fn snapshot_diff(&self, sha: gix::ObjectId) -> Result<Vec<TreeChange>>;
+    /// When `child_id` is provided, it is used as the "after" state directly,
+    /// avoiding an O(n) walk from the oplog head to find it.
+    fn snapshot_diff(
+        &self,
+        sha: gix::ObjectId,
+        child_id: Option<gix::ObjectId>,
+    ) -> Result<Vec<TreeChange>>;
 
     /// Gets a specific snapshot by its commit sha.
     fn get_snapshot(&self, sha: gix::ObjectId) -> Result<Snapshot>;
@@ -150,6 +162,7 @@ impl OplogExt for Context {
         details: SnapshotDetails,
         perm: &mut RepoExclusive,
     ) -> Result<gix::ObjectId> {
+        let target = self.persisted_default_target()?.sha;
         let repo = self.repo.get()?;
         commit_snapshot(
             &self.project_data_dir(),
@@ -157,6 +170,7 @@ impl OplogExt for Context {
             snapshot_tree_id,
             details,
             perm,
+            target,
         )
     }
 
@@ -166,9 +180,19 @@ impl OplogExt for Context {
         details: SnapshotDetails,
         perm: &mut RepoExclusive,
     ) -> Result<gix::ObjectId> {
-        let tree_id = prepare_snapshot(self, perm.read_permission())?;
+        let PreparedSnapshot {
+            tree_id,
+            target_base_oid,
+        } = prepare_snapshot_with_target(self, perm.read_permission())?;
         let repo = self.repo.get()?;
-        commit_snapshot(&self.project_data_dir(), &repo, tree_id, details, perm)
+        commit_snapshot(
+            &self.project_data_dir(),
+            &repo,
+            tree_id,
+            details,
+            perm,
+            target_base_oid,
+        )
     }
 
     #[instrument(skip(self), err(Debug))]
@@ -283,19 +307,36 @@ impl OplogExt for Context {
         restore_snapshot(self, snapshot_commit_id, guard)
     }
 
-    fn snapshot_diff(&self, sha: gix::ObjectId) -> Result<Vec<TreeChange>> {
+    fn snapshot_diff(
+        &self,
+        sha: gix::ObjectId,
+        child_id: Option<gix::ObjectId>,
+    ) -> Result<Vec<TreeChange>> {
         let repo = self.clone_repo_for_merging()?;
-        let commit = repo.find_commit(sha)?;
-        let wd_tree_id = tree_from_applied_vbranches(&repo, commit.id, self)?;
 
-        // Handle the case where this is the first snapshot (no parent)
-        let old_wd_tree_id = commit
-            .parent_ids()
-            .next()
-            .map(|parent_id| tree_from_applied_vbranches(&repo, parent_id.detach(), self))
-            .transpose()?;
+        // Each snapshot captures the state BEFORE its operation, so to show what
+        // the operation changed we need to diff this snapshot (before) against the
+        // next snapshot (after the operation ran). The next snapshot is the child
+        // commit — the one whose parent is `sha`.
+        let before_tree_id = tree_from_applied_vbranches(&repo, sha, self)?;
 
-        tree_changes(&repo, old_wd_tree_id, wd_tree_id)
+        let resolved_child = match child_id {
+            Some(id) => Some(id),
+            None => find_oplog_child(&repo, self, sha)?,
+        };
+        let after_tree_id = match resolved_child {
+            Some(child_id) => tree_from_applied_vbranches(&repo, child_id, self)?,
+            None => {
+                // This is the oplog head (most recent snapshot). The operation has
+                // completed but no subsequent snapshot exists yet, so diff against the
+                // current workspace commit tree.
+                let workspace_ref: &gix::refs::FullNameRef = WORKSPACE_REF_NAME.try_into()?;
+                let ws_commit = repo.find_reference(workspace_ref)?.peel_to_commit()?;
+                ws_commit.tree_id()?.detach()
+            }
+        };
+
+        tree_changes(&repo, Some(before_tree_id), after_tree_id)
     }
 
     fn snapshot_workspace_tree(&self, sha: gix::ObjectId) -> Result<gix::ObjectId> {
@@ -423,14 +464,29 @@ fn reset_index_to_tree(ctx: &Context, tree_id: gix::ObjectId) -> Result<()> {
     Ok(())
 }
 
-pub fn prepare_snapshot(ctx: &Context, _shared_access: &RepoShared) -> Result<gix::ObjectId> {
+pub fn prepare_snapshot(ctx: &Context, shared_access: &RepoShared) -> Result<gix::ObjectId> {
+    prepare_snapshot_with_target(ctx, shared_access).map(|prepared| prepared.tree_id)
+}
+
+struct PreparedSnapshot {
+    tree_id: gix::ObjectId,
+    target_base_oid: gix::ObjectId,
+}
+
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
+fn prepare_snapshot_with_target(
+    ctx: &Context,
+    _shared_access: &RepoShared,
+) -> Result<PreparedSnapshot> {
     let repo = ctx.repo.get()?;
     let empty_tree_id = repo.empty_tree().id;
-
     let mut vb_state = VirtualBranchesHandle::new(ctx.project_data_dir());
 
     // grab the target commit
-    let default_target_commit_id = vb_state.get_default_target()?.sha;
+    let default_target_commit_id = ctx.persisted_default_target()?.sha;
     let target_tree_id = repo
         .find_commit(default_target_commit_id)?
         .tree_id()?
@@ -438,6 +494,9 @@ pub fn prepare_snapshot(ctx: &Context, _shared_access: &RepoShared) -> Result<gi
 
     // Create a tree out of the conflicts state if present
     let conflicts_tree_id = write_conflicts_tree(&repo)?;
+
+    let commit_graph_cache = repo.commit_graph_if_enabled()?;
+    let mut graph = repo.revision_graph(commit_graph_cache.as_ref());
 
     // write out the index as a tree to store
     let index_tree_id = write_index_tree(ctx)?;
@@ -463,13 +522,12 @@ pub fn prepare_snapshot(ctx: &Context, _shared_access: &RepoShared) -> Result<gi
         // If the references are out of sync, now is a good time to update them
         stack.sync_heads_with_references(&mut vb_state, &repo).ok();
 
-        for commit_info in stack_head
-            .attach(&repo)
-            .ancestors()
-            .with_hidden(Some(default_target_commit_id))
-            .all()?
-        {
-            let commit_id = commit_info?.id;
+        for commit_id in commit_ids_excluding_reachable_from_with_graph(
+            &repo,
+            stack_head,
+            default_target_commit_id,
+            &mut graph,
+        )? {
             let commit = repo.find_commit(commit_id)?;
             let commit_tree_id = commit.tree_id()?.detach();
             let commit_data_blob_id = repo.write_blob(&commit.data)?;
@@ -504,7 +562,7 @@ pub fn prepare_snapshot(ctx: &Context, _shared_access: &RepoShared) -> Result<gi
     let mut head = repo.head()?;
     if head
         .referent_name()
-        .is_some_and(|name| name.as_bstr() == "refs/heads/gitbutler/workspace")
+        .is_some_and(|name| name.as_bstr() == WORKSPACE_REF_NAME)
     {
         let head_commit = head.peel_to_commit()?;
         let head_tree_id = head_commit.tree_id()?.detach();
@@ -528,7 +586,10 @@ pub fn prepare_snapshot(ctx: &Context, _shared_access: &RepoShared) -> Result<gi
         )?;
     }
 
-    Ok(snapshot_tree.write()?.detach())
+    Ok(PreparedSnapshot {
+        tree_id: snapshot_tree.write()?.detach(),
+        target_base_oid: default_target_commit_id,
+    })
 }
 
 fn commit_snapshot(
@@ -537,6 +598,7 @@ fn commit_snapshot(
     snapshot_tree_id: gix::ObjectId,
     details: SnapshotDetails,
     _exclusive_access: &mut RepoExclusive,
+    target: gix::ObjectId,
 ) -> Result<gix::ObjectId> {
     repo.find_tree(snapshot_tree_id)?;
 
@@ -564,11 +626,18 @@ fn commit_snapshot(
 
     oplog_state.set_oplog_head(snapshot_commit_id)?;
 
-    set_reference_to_oplog(repo.git_dir(), ReflogCommits::new(project_data_dir)?)?;
+    set_reference_to_oplog(
+        repo.git_dir(),
+        ReflogCommits::new(project_data_dir, target)?,
+    )?;
 
     Ok(snapshot_commit_id)
 }
 
+#[expect(
+    deprecated,
+    reason = "VirtualBranchesHandle should be replaced with ctx.workspace_* helpers"
+)]
 fn restore_snapshot(
     ctx: &Context,
     snapshot_commit_id: gix::ObjectId,
@@ -603,7 +672,7 @@ fn restore_snapshot(
         .context("failed to convert virtual_branches tree entry to tree")?;
 
     // walk through all the entries (branches by id)
-    let workspace_ref: &gix::refs::FullNameRef = "refs/heads/gitbutler/workspace".try_into()?;
+    let workspace_ref: &gix::refs::FullNameRef = WORKSPACE_REF_NAME.try_into()?;
     for branch_entry in vb_tree.iter() {
         let branch_entry = branch_entry?;
         let branch_tree = repo
@@ -692,6 +761,7 @@ fn restore_snapshot(
             branch.set_reference_to_head_value(&gix_repo).ok();
         }
     }
+    ctx.invalidate_workspace_cache()?;
 
     // reset the repo index to our index tree
     let index_tree_entry = snapshot_tree
@@ -731,12 +801,14 @@ fn restore_snapshot(
         ],
     };
     let repo = ctx.repo.get()?;
+    let target = ctx.persisted_default_target()?.sha;
     commit_snapshot(
         &ctx.project_data_dir(),
         &repo,
         before_restore_snapshot_tree_id,
         details,
         exclusive_access,
+        target,
     )
 }
 
@@ -825,7 +897,15 @@ fn tree_from_applied_vbranches(
     let snapshot_commit = repo.find_commit(snapshot_commit_id)?;
     let snapshot_tree = snapshot_commit.tree()?;
 
-    // If the `worktree` subtree is available, we should return that instead
+    // Prefer the workspace commit tree over the worktree tree.
+    // The worktree tree captures the entire working directory state (including uncommitted
+    // and untracked files), so diffing consecutive worktree trees shows all file changes
+    // that accumulated between operations — not just what the operation itself changed.
+    // The workspace commit tree only reflects committed branch state, giving accurate diffs.
+    if let Some(tree) = snapshot_tree.lookup_entry_by_path("virtual_branches/workspace/tree")? {
+        return Ok(tree.id().detach());
+    }
+    // Fall back to worktree for older snapshots that don't have a workspace tree.
     if let Some(tree) = snapshot_tree.lookup_entry_by_path("worktree")? {
         return Ok(tree.id().detach());
     }
@@ -882,4 +962,31 @@ fn tree_from_applied_vbranches(
     }
 
     Ok(workdir_tree_id)
+}
+
+/// Walk the oplog from its head to find the child of `target_id` (the commit whose parent is `target_id`).
+/// Returns `None` if `target_id` is the oplog head (no child exists yet).
+fn find_oplog_child(
+    repo: &gix::Repository,
+    ctx: &Context,
+    target_id: gix::ObjectId,
+) -> Result<Option<gix::ObjectId>> {
+    let oplog_state = OplogHandle::new(&ctx.project_data_dir());
+    let Some(head_id) = oplog_state.oplog_head()? else {
+        return Ok(None);
+    };
+    if head_id == target_id {
+        return Ok(None);
+    }
+
+    let mut current = head_id;
+    loop {
+        let commit = repo.find_commit(current)?;
+        let parent_id = commit.parent_ids().next().map(|id| id.detach());
+        match parent_id {
+            Some(pid) if pid == target_id => return Ok(Some(current)),
+            Some(pid) => current = pid,
+            None => return Ok(None),
+        }
+    }
 }

@@ -68,8 +68,6 @@ pub(crate) struct Request {
 pub(crate) struct Extra {
     active_projects: Arc<Mutex<ActiveProjects>>,
     archival: Arc<but_feedback::Archival>,
-    /// When set, restricts project switching to only this project.
-    pinned_project: Option<but_ctx::ProjectHandleOrLegacyProjectId>,
 }
 
 #[derive(Clone)]
@@ -98,7 +96,9 @@ where
     S: Clone + Send + Sync + 'static,
 {
     post(move |Json(params)| async move {
-        let res = f(params);
+        let res = tokio::task::spawn_blocking(move || f(params))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("handler task panicked: {e}")));
         cmd_result_to_json(res)
     })
 }
@@ -115,6 +115,179 @@ where
         let res = f(params).await;
         cmd_result_to_json(res)
     })
+}
+
+/// Like `but_post`, but rejects the request when the server is running in
+/// remote mode (tunnel active). Used for commands that only make sense when
+/// the user is on the same machine as the server, e.g. adding a project from
+/// a local filesystem path.
+fn local_only_post<F, S>(f: F) -> MethodRouter<S, Infallible>
+where
+    F: Fn(serde_json::Value) -> anyhow::Result<serde_json::Value> + Copy + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    post(move |Json(params)| async move {
+        let res = if is_remote() {
+            Err(anyhow::anyhow!(
+                "This action is disabled when but-server is running in remote mode"
+            ))
+        } else {
+            tokio::task::spawn_blocking(move || f(params))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("handler task panicked: {e}")))
+        };
+        cmd_result_to_json(res)
+    })
+}
+
+/// Reports capabilities that depend on how but-server was launched, so the
+/// frontend can hide affordances that would fail on the backend (e.g. "Add
+/// project" when the server is behind a tunnel and the user's filesystem is
+/// not reachable).
+fn server_capabilities(_params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let remote = is_remote();
+    Ok(serde_json::to_value(
+        but_api::platform::ServerCapabilities {
+            is_remote: remote,
+            can_add_projects: !remote,
+        },
+    )?)
+}
+
+/// Opens a native directory picker on the machine running but-server.
+/// Only available in local mode — remote clients cannot trigger a dialog on
+/// the server's display.
+///
+/// `rfd` cannot be used here because but-server is a headless process without
+/// an NSApplication run loop, so on macOS it would panic trying to show a
+/// dialog off the main thread. Instead we shell out to `osascript` (macOS) or
+/// `zenity`/`kdialog` (Linux) which work from any thread and any process.
+async fn pick_directory(_params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    if is_remote() {
+        anyhow::bail!("Native file picker is not available in remote mode");
+    }
+    let path = tokio::task::spawn_blocking(native_pick_directory).await??;
+    match path {
+        Some(p) => Ok(json!({ "path": p })),
+        None => Ok(json!({ "path": null })),
+    }
+}
+
+/// Shell out to a platform-native directory picker.
+fn native_pick_directory() -> anyhow::Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(
+                r#"set theFolder to choose folder with prompt "Select a Git repository"
+return POSIX path of theFolder"#,
+            )
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            // osascript exits with code 1 and "User canceled" on cancel
+            if stderr.contains("User canceled") || stderr.contains("(-128)") {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "osascript directory picker failed (exit {:?}): {}",
+                output.status.code(),
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    &stderr
+                }
+            );
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        // osascript returns paths with a trailing slash — strip it
+        Ok(Some(path.trim_end_matches('/').to_string()))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try zenity first, fall back to kdialog
+        let output = std::process::Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=Select a Git repository",
+            ])
+            .output()
+            .or_else(|_| {
+                std::process::Command::new("kdialog")
+                    .args([
+                        "--getexistingdirectory",
+                        ".",
+                        "--title",
+                        "Select a Git repository",
+                    ])
+                    .output()
+            })?;
+        if !output.status.success() {
+            // zenity exits 1 on cancel, kdialog exits 1 on cancel
+            let code = output.status.code().unwrap_or(-1);
+            if code == 1 {
+                return Ok(None);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "directory picker failed (exit {code}): {}",
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    &stderr
+                }
+            );
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(path))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Use the modern IFileOpenDialog via PowerShell (STA is required for
+        // any Windows Forms/COM dialog). FolderBrowserDialog is directory-only.
+        // The script outputs the selected path on OK, or empty string on cancel.
+        // A non-zero exit means PowerShell itself failed (e.g. Add-Type error).
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-Command",
+                r#"Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select a Git repository'; $f.UseDescriptionForTitle = $true; if ($f.ShowDialog() -eq 'OK') { $f.SelectedPath } else { '' }"#,
+            ])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "PowerShell directory picker failed (exit {:?}): {}",
+                output.status.code(),
+                if stderr.is_empty() {
+                    "unknown error"
+                } else {
+                    &stderr
+                }
+            );
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(path))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        anyhow::bail!("Native file picker is not supported on this platform")
+    }
 }
 
 fn cmd_result_to_json(res: anyhow::Result<serde_json::Value>) -> Json<serde_json::Value> {
@@ -192,9 +365,7 @@ pub struct Config {
     pub base_path: Option<String>,
     /// Disable authentication entirely. DANGEROUS — only use on trusted networks.
     pub allow_anyone: bool,
-    /// Use the staging GitButler API (<https://app.staging.gitbutler.com>) instead of production.
-    pub dev: bool,
-    /// If set, auto-activate this directory's project on startup and prevent switching to others.
+    /// If set, auto-activate this directory's project on startup.
     pub project_path: Option<std::path::PathBuf>,
     /// Show cloudflared output on stderr. Enabled by `-v` in the CLI.
     pub verbose: bool,
@@ -211,6 +382,15 @@ fn allowed_remote_origin() -> Option<&'static str> {
 /// Whether authentication is disabled via --dangerously-allow-anyone.
 pub(crate) fn allow_anyone() -> bool {
     ALLOW_ANYONE.get().copied().unwrap_or(false)
+}
+
+/// Whether but-server is reachable from outside localhost (a tunnel is active).
+///
+/// Used to gate features that only make sense when the user is on the same
+/// machine as the server — notably adding projects, which needs a filesystem
+/// path the user can actually pick from their own machine.
+pub(crate) fn is_remote() -> bool {
+    allowed_remote_origin().is_some()
 }
 
 /// Check if an origin matches the configured remote origin.
@@ -328,12 +508,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         eprintln!("WARNING: --dangerously-allow-anyone is set — authentication is disabled");
     }
 
-    let api_url = if config.dev {
-        "https://app.staging.gitbutler.com"
-    } else {
-        "https://app.gitbutler.com"
-    }
-    .to_owned();
+    let api_url = gitbutler_user::api::default_api_url();
 
     let port: u16 = config
         .port
@@ -409,10 +584,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         cache_dir: app_data_dir.join("cache").clone(),
         logs_dir: app_data_dir.join("logs").clone(),
     });
-    let mut extra = Extra {
+    let extra = Extra {
         active_projects: Arc::new(Mutex::new(ActiveProjects::new())),
         archival,
-        pinned_project: None,
     };
     #[cfg_attr(not(feature = "irc"), allow(unused_mut))]
     let mut app_settings =
@@ -475,30 +649,23 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     #[cfg(feature = "irc")]
     let working_files_broadcast = WorkingFilesBroadcast::new(irc_manager.clone());
 
-    // If a project path was provided, auto-activate that project and pin it.
+    // If a project path was provided, auto-activate that project.
     if let Some(ref project_path) = config.project_path {
         match but_ctx::Context::discover(project_path) {
             Ok(mut ctx) => {
                 but_api::legacy::projects::prepare_project_for_activation(&mut ctx).ok();
-                let project_id = ctx.legacy_project.id.clone();
                 let mut active = extra.active_projects.lock().await;
-                let activated = active
+                if active
                     .set_active(
-                        &mut ctx,
+                        &ctx,
                         &app,
                         app_settings.clone(),
                         #[cfg(feature = "irc")]
                         working_files_broadcast.clone(),
                     )
-                    .is_ok();
-                drop(active);
-                if activated {
-                    extra.pinned_project = Some(project_id);
-                } else {
-                    tracing::warn!(
-                        "Failed to activate project at {}; project switching will not be locked",
-                        project_path.display()
-                    );
+                    .is_err()
+                {
+                    tracing::warn!("Failed to activate project at {}", project_path.display());
                 }
             }
             Err(err) => {
@@ -541,7 +708,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         user.id,
                         api_url,
                     );
-                    Some(Arc::new(auth::AuthState::new(user.id, &api_base, &api_url)))
+                    Some(Arc::new(auth::AuthState::new(user.id, &api_base)))
                 }
                 Ok(None) => {
                     anyhow::bail!(
@@ -568,6 +735,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
 
     let app = Router::new()
+        .route("/server_capabilities", but_post(server_capabilities))
+        .route("/pick_directory", but_post_async(pick_directory))
         .route(
             "/git_remote_branches",
             but_post(legacy::git::git_remote_branches_cmd),
@@ -597,6 +766,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             but_post(diff::commit_details_with_line_stats_cmd),
         )
         .route("/branch_diff", but_post(but_api::branch::branch_diff_cmd))
+        .route("/move_branch", but_post(but_api::branch::move_branch_cmd))
+        .route(
+            "/tear_off_branch",
+            but_post(but_api::branch::tear_off_branch_cmd),
+        )
         .route(
             "/changes_in_worktree",
             but_post(diff::changes_in_worktree_cmd),
@@ -629,20 +803,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             but_post(legacy::workspace::branch_details_cmd),
         )
         .route(
-            "/create_commit_from_worktree_changes",
-            but_post(legacy::workspace::create_commit_from_worktree_changes_cmd),
-        )
-        .route(
-            "/amend_commit_from_worktree_changes",
-            but_post(legacy::workspace::amend_commit_from_worktree_changes_cmd),
-        )
-        .route(
             "/discard_worktree_changes",
             but_post(legacy::workspace::discard_worktree_changes_cmd),
-        )
-        .route(
-            "/move_changes_between_commits",
-            but_post(legacy::workspace::move_changes_between_commits_cmd),
         )
         .route(
             "/split_branch",
@@ -651,10 +813,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route(
             "/split_branch_into_dependent_branch",
             but_post(legacy::workspace::split_branch_into_dependent_branch_cmd),
-        )
-        .route(
-            "/uncommit_changes",
-            but_post(legacy::workspace::uncommit_changes_cmd),
         )
         .route(
             "/stash_into_branch",
@@ -685,13 +843,32 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route("/set_user", but_post(legacy::users::set_user_cmd))
         .route("/delete_user", but_post(legacy::users::delete_user_cmd))
         .route(
+            "/get_login_token",
+            but_post(legacy::users::get_login_token_cmd),
+        )
+        .route(
+            "/login_with_token",
+            but_post(legacy::users::login_with_token_cmd),
+        )
+        .route(
+            "/get_user_profile",
+            but_post(legacy::users::get_user_profile_cmd),
+        )
+        .route(
+            "/update_user_profile",
+            but_post(legacy::users::update_user_profile_cmd),
+        )
+        .route(
             "/update_project",
             but_post(legacy::projects::update_project_cmd),
         )
-        .route("/add_project", but_post(legacy::projects::add_project_cmd))
+        .route(
+            "/add_project",
+            local_only_post(legacy::projects::add_project_cmd),
+        )
         .route(
             "/add_project_best_effort",
-            but_post(legacy::projects::add_project_best_effort_cmd),
+            local_only_post(legacy::projects::add_project_best_effort_cmd),
         )
         .route("/get_project", but_post(legacy::projects::get_project_cmd))
         .route(
@@ -753,18 +930,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             but_post(legacy::virtual_branches::unapply_stack_cmd),
         )
         .route(
-            "/amend_virtual_branch",
-            but_post(legacy::virtual_branches::amend_virtual_branch_cmd),
-        )
-        .route(
-            "/undo_commit",
-            but_post(legacy::virtual_branches::undo_commit_cmd),
-        )
-        .route(
-            "/reorder_stack",
-            but_post(legacy::virtual_branches::reorder_stack_cmd),
-        )
-        .route(
             "/commit_insert_blank",
             but_post(commit::insert_blank::commit_insert_blank_cmd),
         )
@@ -783,22 +948,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .route(
             "/fetch_from_remotes",
             but_post(legacy::virtual_branches::fetch_from_remotes_cmd),
-        )
-        .route(
-            "/move_commit",
-            but_post(legacy::virtual_branches::move_commit_cmd),
-        )
-        .route(
-            "/move_branch_legacy",
-            but_post(legacy::virtual_branches::move_branch_legacy_cmd),
-        )
-        .route(
-            "/tear_off_branch_legacy",
-            but_post(legacy::virtual_branches::tear_off_branch_legacy_cmd),
-        )
-        .route(
-            "/update_commit_message",
-            but_post(legacy::virtual_branches::update_commit_message_cmd),
         )
         .route(
             "/operating_mode",
@@ -996,12 +1145,20 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         )
         .route("/commit_amend", but_post(commit::amend::commit_amend_cmd))
         .route(
+            "/commit_move",
+            but_post(commit::move_commit::commit_move_cmd),
+        )
+        .route(
             "/commit_move_changes_between",
             but_post(commit::move_changes::commit_move_changes_between_cmd),
         )
         .route(
             "/commit_uncommit_changes",
             but_post(commit::uncommit::commit_uncommit_changes_cmd),
+        )
+        .route(
+            "/commit_uncommit",
+            but_post(commit::uncommit::commit_uncommit_cmd),
         )
         .route("/build_type", but_post(platform::build_type_cmd));
 
@@ -1261,7 +1418,7 @@ fn build_csp(remote_origin: Option<&str>, port: u16, script_hashes: &[String]) -
     // Always allow WebSocket to the loopback addresses on this port.
     // `'self'` covers http/https but not the ws/wss scheme change, so without
     // these entries the browser will block /ws in local mode.
-    let mut ws_origins = format!(" ws://localhost:{port} ws://127.0.0.1:{port} ws://[::1]:{port}");
+    let mut ws_origins = format!(" ws://localhost:{port} ws://127.0.0.1:{port}");
 
     // In remote-access mode also allow the wss form of the tunnel origin
     // (https://foo.com → wss://foo.com).

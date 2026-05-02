@@ -16,11 +16,12 @@ use gix::refs::transaction::RefEdit;
 
 use crate::graph_rebase::util::collect_ordered_parents;
 
-use crate::graph_rebase::cherry_pick::PickMode;
+use crate::graph_rebase::cherry_pick::{PickMode, TreeMergeMode};
 pub mod cherry_pick;
 pub mod commit;
 pub mod materialize;
 pub mod mutate;
+pub mod ordering;
 pub(crate) mod util;
 
 /// Utilities for testing
@@ -38,12 +39,6 @@ pub struct Pick {
     /// If this is Some, the commit WILL NOT be picked onto the parents the
     /// graph implies but instead on to the parents listed here.
     pub preserved_parents: Option<Vec<gix::ObjectId>>,
-    /// If set to false, a rebase will fail if this commit results in a
-    /// conflicted state.
-    pub conflictable: bool,
-    /// If set to true, a rebase will fail if not all of the parents (outgoing
-    /// nodes) are references.
-    pub parents_must_be_references: bool,
     /// Controls under what circumstances the commit is cherry-picked.
     pub pick_mode: PickMode,
     /// Controls whether the resulting commit is signed.
@@ -57,6 +52,13 @@ pub struct Pick {
     /// creating a new commit since the the mappings will be non-sensical to the
     /// frontend consumers.
     pub exclude_from_tracking: bool,
+    /// If set to false, the rebase will fail if this commit results in a
+    /// conflicted state. The cherry-pick still runs and creates the
+    /// conflicted commit — this check happens afterwards in [`Editor::rebase`].
+    pub conflictable: bool,
+    /// Controls how parent trees are merged during cherry-pick.
+    /// See [`TreeMergeMode`] for details.
+    pub tree_merge_mode: TreeMergeMode,
 }
 
 impl Pick {
@@ -65,11 +67,11 @@ impl Pick {
         Self {
             id,
             preserved_parents: None,
-            conflictable: true,
-            parents_must_be_references: false,
             pick_mode: PickMode::IfChanged,
             sign_commit: SignCommit::IfSignCommitsEnabled,
             exclude_from_tracking: false,
+            conflictable: true,
+            tree_merge_mode: TreeMergeMode::WithRenames,
         }
     }
 
@@ -88,11 +90,11 @@ impl Pick {
         Self {
             id,
             preserved_parents: None,
-            conflictable: false,
-            parents_must_be_references: true,
             pick_mode: PickMode::IfChanged,
             sign_commit: SignCommit::No,
             exclude_from_tracking: false,
+            conflictable: false,
+            tree_merge_mode: TreeMergeMode::WithoutRenames,
         }
     }
 }
@@ -166,7 +168,14 @@ pub trait ToReferenceSelector {
 }
 
 /// Points to a step in the rebase editor.
-#[derive(Debug, Clone, Copy)]
+///
+/// Hash, PartialEq, and Eq are implemented for this struct. Because selectors
+/// are a pointer to a node in a particular version of the Editor's internal
+/// representation, it means that you can have two selectors that when
+/// normalised point to the same node. If you want to ensure you have just one
+/// selector to a given node, make sure you are working with selectors all
+/// normalised to the latest revision of the Editor.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Selector {
     id: StepGraphIndex,
     revision: usize,
@@ -249,6 +258,14 @@ pub struct SuccessfulRebase<'ws, 'meta, M: RefMetadata> {
 }
 
 impl<'ws, 'meta, M: RefMetadata> SuccessfulRebase<'ws, 'meta, M> {
+    /// Returns the in-memory repository that backs this rebase preview.
+    ///
+    /// This repository may contain objects that have not been persisted yet,
+    /// which makes it suitable for dry-run inspection of [`Self::overlayed_graph`].
+    pub fn repository(&self) -> &gix::Repository {
+        &self.repo
+    }
+
     /// Returns a preview of what the but-graph will look like after
     /// materialization.
     ///
@@ -431,7 +448,10 @@ mod test {
 
     use but_core::commit::SignCommit;
 
-    use crate::graph_rebase::{Pick, cherry_pick::PickMode};
+    use crate::graph_rebase::{
+        Pick,
+        cherry_pick::{PickMode, TreeMergeMode},
+    };
 
     #[test]
     fn workspace_commit_defaults() -> anyhow::Result<()> {
@@ -442,11 +462,11 @@ mod test {
             Pick {
                 id: object_id,
                 preserved_parents: None,
-                conflictable: false,
-                parents_must_be_references: true,
                 pick_mode: PickMode::IfChanged,
                 sign_commit: SignCommit::No,
-                exclude_from_tracking: false
+                exclude_from_tracking: false,
+                conflictable: false,
+                tree_merge_mode: TreeMergeMode::WithoutRenames,
             }
         );
 
@@ -462,11 +482,11 @@ mod test {
             Pick {
                 id: object_id,
                 preserved_parents: None,
-                conflictable: true,
-                parents_must_be_references: false,
                 pick_mode: PickMode::IfChanged,
                 sign_commit: SignCommit::IfSignCommitsEnabled,
-                exclude_from_tracking: false
+                exclude_from_tracking: false,
+                conflictable: true,
+                tree_merge_mode: TreeMergeMode::WithRenames,
             }
         );
 

@@ -41,6 +41,27 @@ pub async fn store_pat(
     })
 }
 
+/// Cache the user profile so it's available offline.
+fn cache_user_profile(
+    account: &GitlabAccountIdentifier,
+    user: &client::AuthenticatedUser,
+    storage: &but_forge_storage::Controller,
+) {
+    let profile = but_forge_storage::settings::CachedProfile {
+        avatar_url: user.avatar_url.clone(),
+        name: user.name.clone(),
+        email: user.email.clone(),
+    };
+    let key = account.cache_key();
+    let existing = storage.cached_profile(&key).ok().flatten();
+    if existing.as_ref() == Some(&profile) {
+        return;
+    }
+    if let Err(err) = storage.set_cached_profile(&key, Some(profile)) {
+        tracing::warn!(?account, "Failed to update cached GitLab profile: {err}");
+    }
+}
+
 /// Fetch the authenticated user data from GitLab and persist the access token. (PAT)
 async fn fetch_and_persist_pat_user_data(
     access_token: &Sensitive<String>,
@@ -51,12 +72,10 @@ async fn fetch_and_persist_pat_user_data(
         .get_authenticated()
         .await
         .context("Failed to get authenticated user")?;
-    token::persist_gl_access_token(
-        &token::GitlabAccountIdentifier::pat(&user.username),
-        access_token,
-        storage,
-    )
-    .context("Failed to persist access token")?;
+    let account_id = token::GitlabAccountIdentifier::pat(&user.username);
+    token::persist_gl_access_token(&account_id, access_token, storage)
+        .context("Failed to persist access token")?;
+    cache_user_profile(&account_id, &user, storage);
     Ok(user)
 }
 
@@ -88,12 +107,10 @@ async fn fetch_and_persist_selfhosted_user_data(
         .get_authenticated()
         .await
         .context("Failed to get authenticated user")?;
-    token::persist_gl_access_token(
-        &token::GitlabAccountIdentifier::selfhosted(&user.username, host),
-        access_token,
-        storage,
-    )
-    .context("Failed to persist access token")?;
+    let account_id = token::GitlabAccountIdentifier::selfhosted(&user.username, host);
+    token::persist_gl_access_token(&account_id, access_token, storage)
+        .context("Failed to persist access token")?;
+    cache_user_profile(&account_id, &user, storage);
     Ok(user)
 }
 
@@ -112,29 +129,56 @@ pub async fn get_gl_user(
         let gl = account
             .client(&access_token)
             .context("Failed to create GitLab client")?;
-        let user = match gl.get_authenticated().await {
-            Ok(user) => user,
+        match gl.get_authenticated().await {
+            Ok(user) => {
+                cache_user_profile(account, &user, storage);
+                Ok(Some(AuthenticatedUser {
+                    access_token,
+                    username: user.username,
+                    name: user.name,
+                    email: user.email,
+                    avatar_url: user.avatar_url,
+                }))
+            }
             Err(client_err) => {
-                println!("Error fetching authenticated user: {client_err:?}");
-                // Check if this is a network error
+                let cache_key = account.cache_key();
+                // Check if this is a network error — return cached data if available.
                 if let Some(reqwest_err) = client_err.downcast_ref::<reqwest::Error>()
                     && is_network_error(reqwest_err)
                 {
+                    match storage.cached_profile(&cache_key) {
+                        Ok(Some(cached)) => {
+                            return Ok(Some(AuthenticatedUser {
+                                access_token,
+                                username: account.username().to_owned(),
+                                avatar_url: cached.avatar_url,
+                                name: cached.name,
+                                email: cached.email,
+                            }));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!("Failed to read cached GitLab profile: {err}");
+                        }
+                    }
                     return Err(client_err.context(but_error::Context::new_static(
                         but_error::Code::NetworkError,
                         "Unable to connect to GitLab.",
                     )));
                 }
-                return Err(client_err.context("Failed to get authenticated user"));
+                // Check if this is an auth error (401/403) — clear cached profile.
+                if let Some(http_err) = client_err.downcast_ref::<client::HttpStatusError>()
+                    && matches!(
+                        http_err.status,
+                        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                    )
+                    && let Err(err) = storage.set_cached_profile(&cache_key, None)
+                {
+                    tracing::warn!("Failed to clear cached GitLab profile: {err}");
+                }
+                Err(client_err.context("Failed to get authenticated user"))
             }
-        };
-        Ok(Some(AuthenticatedUser {
-            access_token,
-            username: user.username,
-            name: user.name,
-            email: user.email,
-            avatar_url: user.avatar_url,
-        }))
+        }
     } else {
         Ok(None)
     }
@@ -205,9 +249,12 @@ pub mod json {
     /// This struct is used for API responses where the access token needs to be
     /// sent as a plain string. Field names are converted to camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-ts", derive(ts_rs::TS))]
+    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
+    #[cfg_attr(
+        feature = "export-schema",
+        schemars(rename = "GitlabAuthStatusResponseSensitive")
+    )]
     #[serde(rename_all = "camelCase")]
-    #[cfg_attr(feature = "export-ts", ts(export, export_to = "./gitlab/index.ts"))]
     pub struct AuthStatusResponseSensitive {
         /// The GitLab access token as a plain string (sensitive data).
         pub access_token: String,
@@ -218,7 +265,6 @@ pub mod json {
         /// The user's email address, if available.
         pub email: Option<String>,
         /// The self-hosted GitLab host, if this is a self-hosted instance.
-        #[serde(skip_serializing_if = "Option::is_none")]
         pub host: Option<String>,
     }
 
@@ -242,14 +288,20 @@ pub mod json {
         }
     }
 
+    #[cfg(feature = "export-schema")]
+    but_schemars::register_sdk_type!(AuthStatusResponseSensitive);
+
     /// Serializable version of [`AuthenticatedUser`] with exposed access token.
     ///
     /// This struct represents an authenticated GitLab user with their credentials
     /// exposed as plain strings for API responses. Field names are converted to camelCase for JSON.
     #[derive(Debug, Serialize)]
-    #[cfg_attr(feature = "export-ts", derive(ts_rs::TS))]
+    #[cfg_attr(feature = "export-schema", derive(schemars::JsonSchema))]
+    #[cfg_attr(
+        feature = "export-schema",
+        schemars(rename = "GitlabAuthenticatedUserSensitive")
+    )]
     #[serde(rename_all = "camelCase")]
-    #[cfg_attr(feature = "export-ts", ts(export, export_to = "./gitlab/index.ts"))]
     pub struct AuthenticatedUserSensitive {
         /// The GitLab access token as a plain string (sensitive data).
         pub access_token: String,
@@ -282,6 +334,9 @@ pub mod json {
             }
         }
     }
+
+    #[cfg(feature = "export-schema")]
+    but_schemars::register_sdk_type!(AuthenticatedUserSensitive);
 }
 
 #[cfg(test)]

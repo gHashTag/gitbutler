@@ -22,7 +22,7 @@
 	import { STACK_SERVICE } from "$lib/stacks/stackService.svelte";
 	import { inject } from "@gitbutler/core/context";
 	import { Button, TestId } from "@gitbutler/ui";
-	import type { BranchDetails } from "$lib/stacks/stack";
+	import type { BranchDetails } from "@gitbutler/but-sdk";
 
 	type Props = {
 		branches: BranchDetails[];
@@ -235,11 +235,8 @@
 
 		&.dropzone-activated {
 			& .assigned-changes-empty {
-				padding: 20px 8px 20px;
 				background-color: var(--bg-1);
-				transition:
-					background-color var(--transition-fast),
-					padding var(--transition-fast);
+				transition: background-color var(--transition-fast);
 			}
 
 			& .assigned-changes-empty__text {

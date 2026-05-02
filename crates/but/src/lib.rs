@@ -34,8 +34,8 @@ use args::{
     metrics, update as update_args, worktree,
 };
 use but_settings::AppSettings;
-use colored::Colorize;
 use gix::date::time::CustomFormat;
+use theme::Paint;
 
 #[cfg(feature = "legacy")]
 use crate::command::legacy::ShowDiffInEditor;
@@ -54,12 +54,22 @@ pub use utils::binary_path::is_executed_as_but;
 mod alias;
 /// A place for all command implementations.
 pub(crate) mod command;
+pub mod theme;
 mod tui;
 
 const CLI_DATE: CustomFormat = gix::date::time::format::ISO8601;
 
 /// Handle `args` which must be what's passed by `std::env::args_os()`.
 pub async fn handle_args(args: impl Iterator<Item = OsString>) -> Result<()> {
+    {
+        let theme = dirs::config_dir()
+            .map(|dir| dir.join("gitbutler").join("but-theme.json"))
+            .filter(|p| p.exists())
+            .and_then(|p| theme::load(&p).ok())
+            .unwrap_or_default();
+        theme::init(theme);
+    }
+
     let args: Vec<_> = args.collect();
 
     // Check if version is requested
@@ -135,6 +145,7 @@ pub async fn handle_args(args: impl Iterator<Item = OsString>) -> Result<()> {
 
     // If no subcommand is provided, but we have source and target, default to rub
     let mut out = OutputChannel::new_with_optional_pager(output_format, use_pager);
+
     match args.cmd.take() {
         None if args.source_or_path.is_some() && args.target.is_some() => {
             // Default to rub when two arguments are provided without a subcommand
@@ -148,15 +159,23 @@ pub async fn handle_args(args: impl Iterator<Item = OsString>) -> Result<()> {
                 .expect("target is checked to be Some in match guard");
             #[cfg(feature = "legacy")]
             {
+                use but_workspace::commit::squash_commits::MessageCombinationStrategy;
+
                 let status_after = args.status_after;
                 let mut ctx = setup::init_ctx(&args, InitCtxOptions::default(), &mut out)?;
                 out.begin_status_after(status_after);
-                let result = command::legacy::rub::handle(&mut ctx, &mut out, source, target)
-                    .context("Rubbed the wrong way.")
-                    .emit_metrics(OneshotMetricsContext::new_if_enabled(
-                        &app_settings,
-                        metrics::CommandName::Rub,
-                    ));
+                let result = command::legacy::rub::handle(
+                    &mut ctx,
+                    &mut out,
+                    source,
+                    target,
+                    MessageCombinationStrategy::KeepBoth,
+                )
+                .context("Rubbed the wrong way.")
+                .emit_metrics(OneshotMetricsContext::new_if_enabled(
+                    &app_settings,
+                    metrics::CommandName::Rub,
+                ));
                 maybe_run_status_after(status_after, &result, &mut ctx, &mut out).await;
                 result.show_root_cause_error_then_exit_without_destructors(out)
             }
@@ -255,7 +274,6 @@ async fn match_subcommand(
             named_tunnel,
             origin,
             dangerously_allow_anyone,
-            dev,
         } => {
             but_server::run(but_server::Config {
                 port: Some(port),
@@ -265,7 +283,6 @@ async fn match_subcommand(
                 origin,
                 base_path: Some("/api".into()),
                 allow_anyone: dangerously_allow_anyone,
-                dev,
                 project_path: Some(args.current_dir.clone()),
                 verbose: args.trace > 0,
             })
@@ -448,22 +465,8 @@ async fn match_subcommand(
                     let ctx = but_ctx::Context::discover(&args.current_dir)?;
                     command::branch::apply(ctx, &branch_name, out)
                 }
-                Some(branch::Subcommands::Move {
-                    branch,
-                    target_branch,
-                    unstack,
-                }) => {
-                    let mut ctx = but_ctx::Context::discover(&args.current_dir)?;
-                    if unstack {
-                        command::branch::tear_off_branch(&mut ctx, &branch, out)
-                    } else {
-                        let target_branch = target_branch.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "`but branch move` requires <TARGET_BRANCH> unless --unstack is used"
-                            )
-                        })?;
-                        command::branch::move_branch(&mut ctx, &branch, &target_branch, out)
-                    }
+                Some(branch::Subcommands::Move { .. }) => {
+                    anyhow::bail!("`but branch move` has been removed. Use `but move` instead.")
                 }
             };
             result.emit_metrics(metrics_ctx)
@@ -528,18 +531,20 @@ async fn match_subcommand(
                                 // For human-readable output, show timestamp and message
                                 println!(
                                     "{} {}",
-                                    "Timestamp:".bold(),
-                                    msg.created_at()
-                                        .format("%Y-%m-%d %H:%M:%S")
-                                        .to_string()
-                                        .cyan()
+                                    theme::get().important.paint("Timestamp:"),
+                                    theme::get().time.paint(
+                                        msg.created_at().format("%Y-%m-%d %H:%M:%S").to_string()
+                                    )
                                 );
                                 match msg.content() {
                                     but_claude::MessagePayload::User(input) => {
                                         println!("{}", input.message);
                                     }
                                     _ => {
-                                        println!("{}", "Not a user input message".red());
+                                        println!(
+                                            "{}",
+                                            theme::get().error.paint("Not a user input message")
+                                        );
                                     }
                                 }
                             }
@@ -585,8 +590,9 @@ async fn match_subcommand(
             writeln!(
                 progress,
                 "{}",
-                "Assuming you meant to check for upstream work, running `but pull --check`"
-                    .yellow()
+                theme::get().attention.paint(
+                    "Assuming you meant to check for upstream work, running `but pull --check`"
+                )
             )?;
             let ctx = setup::init_ctx(&args, InitCtxOptions::default(), out)?;
             command::legacy::pull::handle(&ctx, out, true)
@@ -723,7 +729,7 @@ async fn match_subcommand(
             command::legacy::status::worktree(
                 &mut ctx,
                 out,
-                StatusFlags::all_false(),
+                StatusFlags::for_tui(),
                 StatusRenderMode::Tui(_options),
             )
             .await
@@ -731,6 +737,8 @@ async fn match_subcommand(
         }
         #[cfg(feature = "legacy")]
         Subcommands::Rub { source, target } => {
+            use but_workspace::commit::squash_commits::MessageCombinationStrategy;
+
             let status_after = args.status_after;
             let mut ctx = setup::init_ctx(
                 &args,
@@ -741,9 +749,15 @@ async fn match_subcommand(
                 out,
             )?;
             out.begin_status_after(status_after);
-            let result = command::legacy::rub::handle(&mut ctx, out, &source, &target)
-                .context("Rubbed the wrong way.")
-                .emit_metrics(metrics_ctx);
+            let result = command::legacy::rub::handle(
+                &mut ctx,
+                out,
+                &source,
+                &target,
+                MessageCombinationStrategy::KeepBoth,
+            )
+            .context("Rubbed the wrong way.")
+            .emit_metrics(metrics_ctx);
             maybe_run_status_after(status_after, &result, &mut ctx, out).await;
             result.show_root_cause_error_then_exit_without_destructors(output)
         }
@@ -1156,7 +1170,7 @@ async fn match_subcommand(
                     file,
                     skip_force_push_protection,
                     with_force,
-                    run_hooks,
+                    no_hooks,
                     default,
                     draft,
                 }) => {
@@ -1196,7 +1210,7 @@ async fn match_subcommand(
                         branch,
                         skip_force_push_protection,
                         with_force,
-                        run_hooks,
+                        !no_hooks,
                         default,
                         draft,
                         review_message,
@@ -1458,7 +1472,7 @@ async fn match_subcommand(
         }
         #[cfg(feature = "legacy")]
         Subcommands::Apply { branch_name } => {
-            let mut ctx = setup::init_ctx(
+            let ctx = setup::init_ctx(
                 &args,
                 InitCtxOptions {
                     background_sync: BackgroundSync::Enabled { silent: false },
@@ -1466,12 +1480,48 @@ async fn match_subcommand(
                 },
                 out,
             )?;
-            command::legacy::branch::apply::apply(&mut ctx, &branch_name, out)
+            let branch_name = resolve_legacy_top_level_apply_branch_name(&ctx, &branch_name)?;
+            command::branch::apply(ctx, &branch_name, out)
                 .context("Failed to apply branch.")
                 .emit_metrics(metrics_ctx)
                 .show_root_cause_error_then_exit_without_destructors(output)
         }
     }
+}
+
+/// Resolve a legacy top-level `but apply` branch name to the narrowest directly applicable ref.
+///
+/// This preserves exact-name behavior while restoring the removed alias that lets a bare branch
+/// name map to a unique remote-tracking branch. When multiple remotes provide the same branch
+/// identity, the original input is preserved so the shared apply command keeps its current error.
+#[cfg(feature = "legacy")]
+fn resolve_legacy_top_level_apply_branch_name(
+    ctx: &but_ctx::Context,
+    branch_name: &str,
+) -> Result<String> {
+    let repo = ctx.repo.get()?;
+    if repo.try_find_reference(branch_name)?.is_some() {
+        return Ok(branch_name.to_owned());
+    }
+
+    let mut remote_matches = repo
+        .remote_names()
+        .iter()
+        .filter_map(|remote_name| {
+            let full_name = format!("refs/remotes/{remote_name}/{branch_name}");
+            repo.try_find_reference(&full_name)
+                .transpose()
+                .map(|reference| reference.map(|_| full_name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if remote_matches.len() == 1 {
+        return Ok(remote_matches
+            .pop()
+            .expect("exactly one remote match exists"));
+    }
+
+    Ok(branch_name.to_owned())
 }
 
 fn is_not_in_git_repository_error(err: &anyhow::Error) -> bool {
